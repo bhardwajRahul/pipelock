@@ -56,6 +56,36 @@ func (sw *syncWriter) WriteMessage(msg []byte) error {
 	return nil
 }
 
+// isResponse returns true if msg is a JSON-RPC response (has "result" or "error"
+// field). Messages with only a "method" field (server-initiated requests) return
+// false. A message with both "method" and "result" is treated as a response
+// (security-conservative: if it carries a result payload, validate its ID).
+func isResponse(msg []byte) bool {
+	var probe struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(msg, &probe) != nil {
+		return false
+	}
+	return len(probe.Result) > 0 || len(probe.Error) > 0
+}
+
+// isRequest returns true if msg is a JSON-RPC request (has "method" field and
+// is not a response). Used to guard tracker.Track so only outbound client
+// requests are tracked, not client responses to server-initiated calls.
+func isRequest(msg []byte) bool {
+	var probe struct {
+		Method string          `json:"method"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(msg, &probe) != nil {
+		return false
+	}
+	return probe.Method != "" && len(probe.Result) == 0 && len(probe.Error) == 0
+}
+
 // ForwardScanned reads JSON-RPC 2.0 messages from reader, scans each for prompt
 // injection, and forwards to writer based on the scanner's configured action
 // (warn, block, strip). Scan verdicts are logged to logW.
@@ -63,8 +93,10 @@ func (sw *syncWriter) WriteMessage(msg []byte) error {
 // for poisoning and tracked for drift (rug pull) detection. Tool scanning runs
 // independently of general response scanning so a "block" tool action is never
 // bypassed by a "warn" general action.
+// When tracker is non-nil, response IDs are validated against previously tracked
+// request IDs to prevent confused deputy attacks (unsolicited responses).
 // Returns true if any injection was detected.
-func ForwardScanned(reader transport.MessageReader, writer transport.MessageWriter, logW io.Writer, sc *scanner.Scanner, approver *hitl.Approver, toolCfg *tools.ToolScanConfig) (bool, error) {
+func ForwardScanned(reader transport.MessageReader, writer transport.MessageWriter, logW io.Writer, sc *scanner.Scanner, approver *hitl.Approver, toolCfg *tools.ToolScanConfig, tracker *RequestTracker) (bool, error) {
 	foundInjection := false
 	// lineNum counts non-empty messages, not raw lines. StdioReader skips
 	// empty lines internally, so this is a message index. ScanStream (scan.go)
@@ -82,6 +114,35 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		lineNum++
 
 		verdict := ScanResponse(line, sc)
+
+		// MCP does not use JSON-RPC batch messages (top-level arrays).
+		// A batch from the server is either malformed or an attempt to
+		// bypass per-message ID validation. Fail closed.
+		if len(line) > 0 && line[0] == '[' {
+			_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocked batch JSON-RPC message (not supported by MCP)\n", lineNum)
+			continue
+		}
+
+		// Confused deputy: validate response IDs against tracked requests.
+		// Only check actual responses (have "result" or "error"), not
+		// server-initiated requests (have "method") which use their own IDs.
+		// The Seeded() gate defers validation until the first client request
+		// is tracked. This prevents a race where a fast server response
+		// arrives before ForwardScannedInput tracks the outbound request ID
+		// (concurrent goroutines). The window is not exploitable: before any
+		// client request, no valid request ID exists to hijack.
+		if tracker != nil && tracker.Seeded() && isResponse(line) {
+			rpcID := extractRPCID(line)
+			if rpcID != nil && !tracker.Validate(rpcID) {
+				_, _ = fmt.Fprintf(logW, "pipelock: line %d: confused deputy: unsolicited response ID %s\n",
+					lineNum, string(rpcID))
+				resp := blockResponse(rpcID)
+				if err := writer.WriteMessage(resp); err != nil {
+					return foundInjection, fmt.Errorf("writing confused deputy block: %w", err)
+				}
+				continue
+			}
+		}
 
 		// Tool scanning runs on every response, independent of general scan
 		// verdict. A general scan "warn" must not bypass a tool scan "block".
@@ -447,6 +508,11 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		}
 	}
 
+	// Request tracker for confused deputy protection. Always created so
+	// response ID validation is active regardless of which input scanning
+	// features are enabled.
+	tracker := NewRequestTracker()
+
 	// Forward client input to server stdin (with optional input scanning).
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -456,17 +522,21 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		if inputCfg != nil && inputCfg.Enabled {
 			clientReader := transport.NewStdioReader(clientIn)
 			serverWriter := transport.NewStdioWriter(serverIn)
-			ForwardScannedInput(clientReader, serverWriter, safeLogW, sc, inputCfg.Action, inputCfg.OnParseError, blockedCh, policyCfg, bindingCfg, ks, chainMatcher)
+			ForwardScannedInput(clientReader, serverWriter, safeLogW, sc, inputCfg.Action, inputCfg.OnParseError, blockedCh, policyCfg, bindingCfg, ks, chainMatcher, tracker)
 		} else if policyCfg != nil || bindingCfg != nil || chainMatcher != nil {
 			// Policy checking, session binding, or chain detection enabled but content scanning disabled.
 			// Route through ForwardScannedInput with pass-through content scanning.
 			// Use onParseError="block" (fail-closed) so malformed JSON can't bypass policy.
 			clientReader := transport.NewStdioReader(clientIn)
 			serverWriter := transport.NewStdioWriter(serverIn)
-			ForwardScannedInput(clientReader, serverWriter, safeLogW, sc, config.ActionWarn, config.ActionBlock, blockedCh, policyCfg, bindingCfg, ks, chainMatcher)
+			ForwardScannedInput(clientReader, serverWriter, safeLogW, sc, config.ActionWarn, config.ActionBlock, blockedCh, policyCfg, bindingCfg, ks, chainMatcher, tracker)
 		} else {
-			close(blockedCh)                   // No input scanning — close channel immediately.
-			_, _ = io.Copy(serverIn, clientIn) //nolint:errcheck // broken pipe on server exit is expected
+			// No content scanning, but still route through ForwardScannedInput
+			// so request IDs are tracked for confused deputy protection.
+			// ActionWarn = pass-through, ActionBlock on parse error = fail-closed.
+			clientReader := transport.NewStdioReader(clientIn)
+			serverWriter := transport.NewStdioWriter(serverIn)
+			ForwardScannedInput(clientReader, serverWriter, safeLogW, sc, config.ActionWarn, config.ActionBlock, blockedCh, nil, nil, ks, nil, tracker)
 		}
 	}()
 
@@ -490,7 +560,7 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 
 	// Scan and forward server output to client.
 	serverReader := transport.NewStdioReader(serverOut)
-	_, scanErr := ForwardScanned(serverReader, safeClientOut, safeLogW, sc, approver, fwdToolCfg)
+	_, scanErr := ForwardScanned(serverReader, safeClientOut, safeLogW, sc, approver, fwdToolCfg, tracker)
 
 	// Wait for subprocess to exit.
 	waitErr := cmd.Wait()
