@@ -16,13 +16,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
-	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -195,19 +195,30 @@ Environment passthrough (subprocess mode only):
 				return err
 			}
 
-			// Build registry so _default fallback works the same as HTTP proxy.
-			reg, regErr := proxy.NewAgentRegistry(cfg)
-			if regErr != nil {
-				return fmt.Errorf("agent registry: %w", regErr)
+			// Build edition so _default fallback works the same as HTTP proxy.
+			// Bootstrap scanner is used only for edition init; closed before
+			// rebuilding with the resolved config.
+			bootSC := scanner.New(cfg)
+			ed, edErr := edition.NewEditionFunc(cfg, bootSC)
+			if edErr != nil {
+				bootSC.Close()
+				return fmt.Errorf("edition init: %w", edErr)
 			}
-			defer reg.Close()
+			defer ed.Close()
 
 			// Resolve agent: known name -> that profile, unknown -> error, empty -> _default.
-			resolved := reg.Lookup(agentName)
-			if agentName != "" && resolved.Name != agentName {
-				return fmt.Errorf("unknown agent profile %q", agentName)
+			resolved, found := ed.LookupProfile(agentName)
+			if agentName != "" && !found {
+				// Distinguish truly unknown from known-but-expired.
+				if known := ed.KnownProfiles(); known[agentName] {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: agent profile %q exists but license has expired; using default profile\n", agentName)
+				} else {
+					bootSC.Close()
+					return fmt.Errorf("unknown agent profile %q", agentName)
+				}
 			}
 			cfg = resolved.Config
+			bootSC.Close() // done with bootstrap scanner
 
 			if !cfg.ResponseScanning.Enabled {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: response scanning was disabled in config, enabling with defaults")
@@ -224,6 +235,7 @@ Environment passthrough (subprocess mode only):
 				cfg.MCPInputScanning.Action = config.ActionBlock
 			}
 
+			// Rebuild scanner with the (possibly modified) resolved config.
 			sc := scanner.New(cfg)
 			defer sc.Close()
 
