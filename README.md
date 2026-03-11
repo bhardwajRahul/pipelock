@@ -495,7 +495,7 @@ Canonical metrics, updated each release.
 
 | Metric | Value |
 |--------|-------|
-| Go tests (with `-race`) | 5,350+ |
+| Go tests (with `-race`) | 5,450+ |
 | Statement coverage | 91%+ |
 | Evasion techniques tested | 230+ |
 | Scanner pipeline overhead | ~37μs per URL scan ([performance details](docs/performance.md)) |
@@ -528,5 +528,9 @@ The primary implementation is in the `enterprise/` directory, with build-tag-gat
 code in `cmd/` and `internal/`. These features require a valid enterprise license key.
 
 The open-source core works independently without enterprise features.
+
+Pre-built release artifacts (Homebrew, GitHub releases, Docker images) include enterprise
+code that activates with a valid license key. Building from source with `go install` or the
+repository `Dockerfile` produces a Community-only binary.
 
 See [LICENSE](LICENSE) for the Apache 2.0 text and [enterprise/LICENSE](enterprise/LICENSE) for the ELv2 text.
