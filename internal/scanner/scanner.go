@@ -95,6 +95,8 @@ type compiledPattern struct {
 	re            *regexp.Regexp
 	severity      string
 	exemptDomains []string // domains where this pattern is skipped (wildcard supported)
+	bundle        string   // empty for built-in/config patterns
+	bundleVersion string
 }
 
 // New creates a Scanner from config. Config must be validated first via
@@ -139,6 +141,8 @@ func New(cfg *config.Config) *Scanner {
 			re:            re,
 			severity:      p.Severity,
 			exemptDomains: p.ExemptDomains,
+			bundle:        p.Bundle,
+			bundleVersion: p.BundleVersion,
 		})
 	}
 
@@ -201,7 +205,12 @@ func New(cfg *config.Config) *Scanner {
 			if err != nil {
 				panic(fmt.Sprintf("BUG: response pattern %q failed after validation: %v", p.Name, err))
 			}
-			s.responsePatterns = append(s.responsePatterns, &compiledPattern{name: p.Name, re: re})
+			s.responsePatterns = append(s.responsePatterns, &compiledPattern{
+				name:          p.Name,
+				re:            re,
+				bundle:        p.Bundle,
+				bundleVersion: p.BundleVersion,
+			})
 
 			// Compile optional-whitespace variant: \s+ → \s* so that
 			// "ignoreallpreviousinstructions" (ZW-stripped with no spaces)
@@ -212,7 +221,12 @@ func New(cfg *config.Config) *Scanner {
 			if optRegex != p.Regex {
 				optRe, optErr := regexp.Compile(optRegex)
 				if optErr == nil {
-					s.responseOptSpacePatterns = append(s.responseOptSpacePatterns, &compiledPattern{name: p.Name, re: optRe})
+					s.responseOptSpacePatterns = append(s.responseOptSpacePatterns, &compiledPattern{
+						name:          p.Name,
+						re:            optRe,
+						bundle:        p.Bundle,
+						bundleVersion: p.BundleVersion,
+					})
 				}
 			}
 
@@ -245,7 +259,12 @@ func New(cfg *config.Config) *Scanner {
 			if vfRegex != p.Regex {
 				vfRe, vfErr := regexp.Compile(vfRegex)
 				if vfErr == nil {
-					s.responseVowelFoldPatterns = append(s.responseVowelFoldPatterns, &compiledPattern{name: p.Name, re: vfRe})
+					s.responseVowelFoldPatterns = append(s.responseVowelFoldPatterns, &compiledPattern{
+						name:          p.Name,
+						re:            vfRe,
+						bundle:        p.Bundle,
+						bundleVersion: p.BundleVersion,
+					})
 				}
 			}
 		}

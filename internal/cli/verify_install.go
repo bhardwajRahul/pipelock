@@ -23,6 +23,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"github.com/spf13/cobra"
@@ -204,6 +205,13 @@ func runVerifyInstall(cmd *cobra.Command, configFile string, jsonOut, noColor bo
 	mockHost, _, _ := net.SplitHostPort(mockHostPort)
 	cfg.APIAllowlist = append(cfg.APIAllowlist, mockHost)
 	cfg.FetchProxy.Monitoring.Blocklist = append(cfg.FetchProxy.Monitoring.Blocklist, "malware.example.com")
+
+	// Merge community rule bundles before building the scanner.
+	bundleResult := rules.MergeIntoConfig(cfg, Version)
+	if len(bundleResult.Errors) > 0 {
+		first := bundleResult.Errors[0]
+		return ExitCodeError(2, fmt.Errorf("merging community rules: bundle %s: %s", first.Name, first.Reason))
+	}
 
 	// Build scanner and temp proxy.
 	sc := scanner.New(cfg)

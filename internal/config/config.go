@@ -61,6 +61,13 @@ const (
 	SeverityMedium   = "medium"
 )
 
+// Confidence constants for community rule minimum confidence filtering.
+const (
+	ConfidenceHigh   = "high"
+	ConfidenceMedium = "medium"
+	ConfidenceLow    = "low"
+)
+
 // Origin policy constants for WebSocket proxy.
 const (
 	OriginPolicyRewrite = "rewrite"
@@ -164,6 +171,21 @@ func toSlash(s string) string {
 	return strings.ReplaceAll(s, "\\", "/")
 }
 
+// Rules configures community rule bundle loading.
+type Rules struct {
+	RulesDir            string       `yaml:"rules_dir"`
+	MinConfidence       string       `yaml:"min_confidence"`
+	IncludeExperimental bool         `yaml:"include_experimental"`
+	Disabled            []string     `yaml:"disabled"`
+	TrustedKeys         []TrustedKey `yaml:"trusted_keys"`
+}
+
+// TrustedKey is a named Ed25519 public key for verifying third-party bundles.
+type TrustedKey struct {
+	Name      string `yaml:"name"`
+	PublicKey string `yaml:"public_key"` // 64 lowercase hex chars
+}
+
 // Config is the top-level Pipelock configuration.
 type Config struct {
 	Version               int                     `yaml:"version"`
@@ -197,6 +219,7 @@ type Config struct {
 	ScanAPI               ScanAPI                 `yaml:"scan_api"`
 	AddressProtection     AddressProtection       `yaml:"address_protection"`
 	SeedPhraseDetection   SeedPhraseDetection     `yaml:"seed_phrase_detection"`
+	Rules                 Rules                   `yaml:"rules"`
 	Agents                map[string]AgentProfile `yaml:"agents,omitempty"`
 	LicenseKey            string                  `yaml:"license_key,omitempty"`        // signed license token (from pipelock license issue)
 	LicenseFile           string                  `yaml:"license_file,omitempty"`       // path to file containing the license token (read at startup)
@@ -262,8 +285,10 @@ type ResponseScanning struct {
 
 // ResponseScanPattern is a named regex pattern for detecting prompt injection in responses.
 type ResponseScanPattern struct {
-	Name  string `yaml:"name"`
-	Regex string `yaml:"regex"`
+	Name          string `yaml:"name"`
+	Regex         string `yaml:"regex"`
+	Bundle        string `yaml:"-"` // set by rules loader, not from YAML
+	BundleVersion string `yaml:"-"` // set by rules loader, not from YAML
 }
 
 // ForwardProxy configures HTTP CONNECT and absolute-URI forward proxy support.
@@ -369,6 +394,8 @@ type DLPPattern struct {
 	Regex         string   `yaml:"regex"`
 	Severity      string   `yaml:"severity"`       // critical, high, medium, low
 	ExemptDomains []string `yaml:"exempt_domains"` // domains where this pattern is not enforced
+	Bundle        string   `yaml:"-"`              // set by rules loader, not from YAML
+	BundleVersion string   `yaml:"-"`              // set by rules loader, not from YAML
 }
 
 // AddressProtection configures crypto address poisoning detection.
@@ -1211,6 +1238,11 @@ func (c *Config) ApplyDefaults() {
 			c.AddressProtection.Similarity.SuffixLength = 4
 		}
 	}
+
+	// Community rules defaults
+	if c.Rules.MinConfidence == "" {
+		c.Rules.MinConfidence = ConfidenceMedium
+	}
 }
 
 // mergeDLPPatterns merges default DLP patterns with user-defined patterns.
@@ -1895,6 +1927,52 @@ func (c *Config) Validate() error {
 	for _, cidr := range c.Internal {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("invalid internal CIDR %q: %w", cidr, err)
+		}
+	}
+
+	// Validate community rules config
+	switch c.Rules.MinConfidence {
+	case ConfidenceHigh, ConfidenceMedium, ConfidenceLow:
+		// valid
+	default:
+		return fmt.Errorf("rules: min_confidence %q must be high, medium, or low", c.Rules.MinConfidence)
+	}
+	for i, d := range c.Rules.Disabled {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			return fmt.Errorf("rules: disabled[%d] must be non-empty", i)
+		}
+		c.Rules.Disabled[i] = d
+		if strings.Contains(d, ":") {
+			// Namespaced ID like "community:rule-name" — validate structure.
+			parts := strings.SplitN(d, ":", 2)
+			if parts[0] == "" || parts[1] == "" {
+				return fmt.Errorf("rules: disabled[%d] %q must be bundle:rule or a glob pattern", i, d)
+			}
+			continue
+		}
+		if strings.ContainsAny(d, "*?") {
+			// Glob pattern like "community:*" or "test-*" — valid.
+			continue
+		}
+		return fmt.Errorf("rules: disabled[%d] %q must contain ':' (namespaced) or be a glob pattern with * or ?", i, d)
+	}
+	for i, k := range c.Rules.TrustedKeys {
+		if k.Name == "" {
+			return fmt.Errorf("rules: trusted_keys[%d] name must be non-empty", i)
+		}
+		if len(k.PublicKey) != 64 {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must be exactly 64 hex chars", i, k.Name)
+		}
+		if k.PublicKey != strings.ToLower(k.PublicKey) {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must be lowercase hex", i, k.Name)
+		}
+		decoded, err := hex.DecodeString(k.PublicKey)
+		if err != nil {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key invalid hex: %w", i, k.Name, err)
+		}
+		if len(decoded) != 32 {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must decode to 32 bytes", i, k.Name)
 		}
 	}
 
@@ -2600,6 +2678,9 @@ func Defaults() *Config {
 				PromptInjection: true,
 				ToolCall:        true,
 			},
+		},
+		Rules: Rules{
+			MinConfidence: ConfidenceMedium,
 		},
 	}
 	return cfg

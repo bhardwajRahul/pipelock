@@ -14,6 +14,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/spf13/cobra"
 )
@@ -168,6 +169,13 @@ func runClaudeHook(cmd *cobra.Command, configFile string, exitCodeMode bool) (re
 	if err != nil {
 		return claudeResult(cmd, exitCodeMode, payload.HookEventName, decisionDeny,
 			"pipelock: config error: "+err.Error())
+	}
+
+	// Merge community rules into config before building scanner.
+	// Keep stdout JSON contract intact; warnings go to stderr.
+	bundleResult := rules.MergeIntoConfig(cfg, Version)
+	for _, e := range bundleResult.Errors {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
 	}
 
 	// Build scanner and policy.

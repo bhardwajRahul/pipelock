@@ -21,6 +21,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -137,6 +138,10 @@ func runDiagnose(cmd *cobra.Command, cfg *config.Config, cfgLabel string, jsonOu
 	cfg.FetchProxy.Monitoring.Blocklist = append(cfg.FetchProxy.Monitoring.Blocklist, "malware.example.com")
 
 	// Nop logger avoids writing to stdout, which would corrupt --json output.
+	bundleResult := rules.MergeIntoConfig(cfg, Version)
+	for _, e := range bundleResult.Errors {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+	}
 	sc := scanner.New(cfg)
 	defer sc.Close()
 	logger := audit.NewNop()
@@ -207,6 +212,7 @@ func buildDiagnoseChecks() []diagnoseCheck {
 		{Name: "fetch_hint", Run: checkFetchHint},
 		{Name: "forward_allowed", Run: checkForwardAllowed},
 		{Name: "forward_blocked", Run: checkForwardBlocked},
+		{Name: "rules", Run: checkRules},
 	}
 }
 
@@ -321,6 +327,36 @@ func checkForwardBlocked(proxyURL, _ string, _ *config.Config) diagnoseResult {
 		return diagnoseResult{Status: statusPass}
 	}
 	return diagnoseResult{Status: statusFail, Detail: fmt.Sprintf("unexpected error (expected 403): %v", err)}
+}
+
+func checkRules(_, _ string, cfg *config.Config) diagnoseResult {
+	rulesDir := rules.ResolveRulesDir(cfg.Rules.RulesDir)
+	result := rules.LoadBundles(rulesDir, rules.LoadOptions{
+		MinConfidence:   cfg.Rules.MinConfidence,
+		TrustedKeys:     cfg.Rules.TrustedKeys,
+		PipelockVersion: Version,
+	})
+
+	if len(result.Loaded) == 0 && len(result.Errors) == 0 {
+		return diagnoseResult{Status: statusSkip, Detail: "no bundles installed"}
+	}
+
+	var detail strings.Builder
+	for _, b := range result.Loaded {
+		_, _ = fmt.Fprintf(&detail, "%s v%s (%d rules)", b.Name, b.Version, b.Rules)
+		if b.Unsigned {
+			detail.WriteString(" [unsigned]")
+		}
+		detail.WriteString("; ")
+	}
+	for _, e := range result.Errors {
+		_, _ = fmt.Fprintf(&detail, "%s: FAILED (%s); ", e.Name, e.Reason)
+	}
+
+	if len(result.Errors) > 0 {
+		return diagnoseResult{Status: statusFail, Detail: detail.String()}
+	}
+	return diagnoseResult{Status: statusPass, Detail: detail.String()}
 }
 
 // connectThroughProxy issues a CONNECT request through the proxy and returns

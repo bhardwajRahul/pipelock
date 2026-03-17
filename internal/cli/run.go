@@ -31,6 +31,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanapi"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
@@ -76,7 +77,7 @@ Examples:
 			}
 			if hasMCPUpstream {
 				u, uErr := url.Parse(mcpUpstream)
-				if uErr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				if uErr != nil || (u.Scheme != "http" && u.Scheme != schemeHTTPS) || u.Host == "" {
 					return fmt.Errorf("invalid --mcp-upstream %q: must be http:// or https:// with a host", mcpUpstream)
 				}
 			}
@@ -144,6 +145,12 @@ Examples:
 			emitter := emit.NewEmitter(instanceID, emitSinks...)
 			defer func() { _ = emitter.Close() }()
 			logger.SetEmitter(emitter)
+
+			// Merge community rule bundles before building the scanner.
+			bundleResult := rules.MergeIntoConfig(cfg, Version)
+			for _, e := range bundleResult.Errors {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
 
 			// Set up scanner, metrics, kill switch, and proxy
 			sc := scanner.New(cfg)
@@ -316,6 +323,10 @@ Examples:
 								// startup, not parsed from YAML. Always preserve the
 								// old value until restart.
 								newCfg.LicenseExpiresAt = oldCfg.LicenseExpiresAt
+							}
+							reloadBundleResult := rules.MergeIntoConfig(newCfg, Version)
+							for _, e := range reloadBundleResult.Errors {
+								cmd.PrintErrf("WARNING: config reload: bundle %s: %s\n", e.Name, e.Reason)
 							}
 							newSc := scanner.New(newCfg)
 							p.Reload(newCfg, newSc)
@@ -574,6 +585,7 @@ Examples:
 					toolCfg = &tools.ToolScanConfig{
 						Action:      cfg.MCPToolScanning.Action,
 						DetectDrift: cfg.MCPToolScanning.DetectDrift,
+						ExtraPoison: rules.ConvertToolPoison(bundleResult.ToolPoison),
 					}
 				}
 				var policyCfg *policy.Config

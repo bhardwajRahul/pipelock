@@ -456,6 +456,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			patternNames := dlpMatchNames(bodyResult.DLPMatches)
+			bundleRules := dlpBundleRules(bodyResult.DLPMatches)
 			reason := bodyResult.Reason
 			if reason == "" {
 				reason = fmt.Sprintf("request body contains secret: %s", strings.Join(patternNames, ", "))
@@ -465,7 +466,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			// A request can trigger both DLP and address findings simultaneously.
 			if len(bodyResult.DLPMatches) > 0 {
 				p.metrics.RecordBodyDLP(action, agentLabel)
-				p.logger.LogBodyDLP(r.Method, targetURL, action, clientIP, requestID, agent, len(bodyResult.DLPMatches), patternNames)
+				p.logger.LogBodyDLP(r.Method, targetURL, action, clientIP, requestID, agent, len(bodyResult.DLPMatches), patternNames, bundleRules)
 			}
 			if len(bodyResult.AddressFindings) > 0 {
 				for _, f := range bodyResult.AddressFindings {
@@ -608,6 +609,39 @@ func dlpMatchNames(matches []scanner.TextDLPMatch) []string {
 		names[i] = m.PatternName
 	}
 	return names
+}
+
+// dlpBundleRules extracts bundle provenance from DLP matches.
+// Returns nil when no matches originate from a community bundle,
+// so the audit logger omits the field for built-in patterns.
+func dlpBundleRules(matches []scanner.TextDLPMatch) []audit.BundleRuleHit {
+	var hits []audit.BundleRuleHit
+	for _, m := range matches {
+		if m.Bundle != "" {
+			hits = append(hits, audit.BundleRuleHit{
+				RuleID:        m.PatternName,
+				Bundle:        m.Bundle,
+				BundleVersion: m.BundleVersion,
+			})
+		}
+	}
+	return hits
+}
+
+// responseBundleRules extracts bundle provenance from response scan matches.
+// Returns nil when no matches originate from a community bundle.
+func responseBundleRules(matches []scanner.ResponseMatch) []audit.BundleRuleHit {
+	var hits []audit.BundleRuleHit
+	for _, m := range matches {
+		if m.Bundle != "" {
+			hits = append(hits, audit.BundleRuleHit{
+				RuleID:        m.PatternName,
+				Bundle:        m.Bundle,
+				BundleVersion: m.BundleVersion,
+			})
+		}
+	}
+	return hits
 }
 
 // removeHopByHopHeaders strips RFC 7230 section 6.1 hop-by-hop headers
