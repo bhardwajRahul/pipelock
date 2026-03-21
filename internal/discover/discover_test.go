@@ -107,11 +107,36 @@ func TestConfigPathsContainExpectedClients(t *testing.T) {
 		clients[p.Client] = true
 	}
 
-	expected := []string{"claude-code", "claude-desktop", "cursor", "vscode", "cline", "continue"}
+	expected := []string{"claude-code", "claude-desktop", "cursor", "vscode", "cline", "continue", "junie"}
 	for _, c := range expected {
 		if !clients[c] {
 			t.Errorf("missing expected client %q", c)
 		}
+	}
+}
+
+func TestConfigPathsJunieUserLevel(t *testing.T) {
+	home := t.TempDir()
+	paths := configPaths(home)
+	found := false
+	for _, p := range paths {
+		if p.Client == "junie" {
+			found = true
+			if p.Key != "mcpServers" {
+				t.Errorf("junie key = %q, want 'mcpServers'", p.Key)
+			}
+			if p.Scope != "user" {
+				t.Errorf("junie scope = %q, want 'user'", p.Scope)
+			}
+			// Path must be derived from the home argument, not cwd.
+			want := filepath.Join(home, ".junie", "mcp", "mcp.json")
+			if p.Path != want {
+				t.Errorf("junie path = %q, want %q", p.Path, want)
+			}
+		}
+	}
+	if !found {
+		t.Error("junie not found in paths")
 	}
 }
 
