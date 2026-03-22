@@ -33,6 +33,10 @@ type LaunchConfig struct {
 	// sandbox.filesystem YAML section.
 	Policy *Policy
 
+	// Strict enables strict containment: error on missing layers,
+	// private /dev/shm mount, clone3 blocked.
+	Strict bool
+
 	// ExtraEnv contains additional KEY=VALUE pairs to pass to the child.
 	ExtraEnv []string
 
@@ -49,7 +53,7 @@ type LaunchConfig struct {
 //
 // For simple cases, use LaunchSandboxed which calls Start automatically.
 func PrepareSandboxCmd(cfg LaunchConfig) (*exec.Cmd, error) {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != osLinux {
 		return nil, fmt.Errorf("%w: sandbox requires Linux", ErrUnavailable)
 	}
 
@@ -88,6 +92,9 @@ func PrepareSandboxCmd(cfg LaunchConfig) (*exec.Cmd, error) {
 		"__PIPELOCK_SANDBOX_WORKSPACE=" + cfg.Workspace,
 		"__PIPELOCK_SANDBOX_COMMAND=" + strings.Join(cfg.Command, "\x1f"),
 	}
+	if cfg.Strict {
+		cmd.Env = append(cmd.Env, strictEnvKey+"=1")
+	}
 	if len(cfg.ExtraEnv) > 0 {
 		cmd.Env = append(cmd.Env, "__PIPELOCK_SANDBOX_EXTRA_ENV="+strings.Join(cfg.ExtraEnv, "\x1f"))
 	}
@@ -102,10 +109,15 @@ func PrepareSandboxCmd(cfg LaunchConfig) (*exec.Cmd, error) {
 	}
 
 	// Create child in new user + network namespace.
+	// Strict mode adds CLONE_NEWNS (mount namespace) for private /dev/shm.
+	cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET)
+	if cfg.Strict {
+		cloneFlags |= syscall.CLONE_NEWNS
+	}
 	uid := os.Getuid()
 	gid := os.Getgid()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
+		Cloneflags: cloneFlags,
 		UidMappings: []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: uid, Size: 1},
 		},
@@ -137,12 +149,4 @@ func LaunchSandboxed(cfg LaunchConfig) (*exec.Cmd, error) {
 func CleanupChildSandboxDir(childPID int) {
 	dir := fmt.Sprintf("/tmp/pipelock-sandbox-%d", childPID)
 	_ = os.RemoveAll(dir)
-}
-
-// CleanupSandboxCmd removes the sandbox temp directory associated with a cmd.
-// On Linux, delegates to CleanupChildSandboxDir using the process PID.
-func CleanupSandboxCmd(cmd *exec.Cmd) {
-	if cmd.Process != nil {
-		CleanupChildSandboxDir(cmd.Process.Pid)
-	}
 }

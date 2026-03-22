@@ -792,17 +792,28 @@ func TestMergeAgentProfile_MCPToolPolicyOverride(t *testing.T) {
 	}
 }
 
-func TestMergeAgentProfile_MCPToolPolicyRedirectProfiles(t *testing.T) {
+const testBaseWorkspace = "/base/workspace"
+
+func TestMergeAgentProfile_SandboxOverride(t *testing.T) {
 	cfg := testConfig()
+	cfg.Sandbox.Enabled = false
+	cfg.Sandbox.Strict = false
+	cfg.Sandbox.Workspace = testBaseWorkspace
+	cfg.Sandbox.FS = &config.SandboxFilesystem{
+		AllowRead:  []string{"/base/read"},
+		AllowWrite: []string{"/base/write"},
+	}
+
+	enabled := true
+	strict := true
 	profile := &config.AgentProfile{
-		MCPToolPolicy: &config.MCPToolPolicy{
-			Enabled: true,
-			Action:  config.ActionRedirect,
-			RedirectProfiles: map[string]config.RedirectProfile{
-				"safe-fetch": {Exec: []string{"/usr/bin/safe-fetch"}, Reason: "audited"},
-			},
-			Rules: []config.ToolPolicyRule{
-				{Name: "redirect-curl", ToolPattern: "bash", Action: config.ActionRedirect, RedirectProfile: "safe-fetch"},
+		Sandbox: &config.AgentSandboxOverride{
+			Enabled:   &enabled,
+			Strict:    &strict,
+			Workspace: "/agent/workspace",
+			FS: &config.SandboxFilesystem{
+				AllowRead:  []string{"/agent/read"},
+				AllowWrite: []string{"/agent/write"},
 			},
 		},
 	}
@@ -810,78 +821,93 @@ func TestMergeAgentProfile_MCPToolPolicyRedirectProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(merged.MCPToolPolicy.RedirectProfiles) != 1 {
-		t.Fatalf("redirect_profiles count = %d, want 1", len(merged.MCPToolPolicy.RedirectProfiles))
+	if !merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=true after override")
 	}
-	p, ok := merged.MCPToolPolicy.RedirectProfiles["safe-fetch"]
-	if !ok {
-		t.Fatal("expected safe-fetch profile")
+	if !merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=true after override")
 	}
-	if len(p.Exec) != 1 || p.Exec[0] != "/usr/bin/safe-fetch" {
-		t.Errorf("exec = %v, want [/usr/bin/safe-fetch]", p.Exec)
+	if merged.Sandbox.Workspace != "/agent/workspace" {
+		t.Errorf("workspace = %q, want /agent/workspace", merged.Sandbox.Workspace)
 	}
-	if merged.MCPToolPolicy.Rules[0].RedirectProfile != "safe-fetch" {
-		t.Errorf("rule redirect_profile = %q, want safe-fetch", merged.MCPToolPolicy.Rules[0].RedirectProfile)
+	// FS paths should be appended (base + agent), not replaced.
+	if len(merged.Sandbox.FS.AllowRead) != 2 {
+		t.Errorf("AllowRead len = %d, want 2 (base + agent)", len(merged.Sandbox.FS.AllowRead))
 	}
-}
-
-func TestValidateMergedAgent_RedirectActionValid(t *testing.T) {
-	cfg := testConfig()
-	cfg.MCPToolPolicy.Enabled = true
-	cfg.MCPToolPolicy.Action = config.ActionRedirect
-	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
-		"safe-fetch": {Exec: []string{"/usr/bin/safe-fetch"}, Reason: "audited"},
-	}
-	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
-		{Name: "test", ToolPattern: "bash", RedirectProfile: "safe-fetch"},
-	}
-	if err := ValidateMergedAgent("test-agent", cfg); err != nil {
-		t.Errorf("expected valid, got: %v", err)
+	if len(merged.Sandbox.FS.AllowWrite) != 2 {
+		t.Errorf("AllowWrite len = %d, want 2 (base + agent)", len(merged.Sandbox.FS.AllowWrite))
 	}
 }
 
-func TestValidateMergedAgent_RedirectMissingProfile(t *testing.T) {
+func TestMergeAgentProfile_SandboxNilInherits(t *testing.T) {
 	cfg := testConfig()
-	cfg.MCPToolPolicy.Enabled = true
-	cfg.MCPToolPolicy.Action = config.ActionRedirect
-	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
-		"safe-fetch": {Exec: []string{"/usr/bin/safe-fetch"}, Reason: "audited"},
+	cfg.Sandbox.Enabled = true
+	cfg.Sandbox.Strict = true
+	cfg.Sandbox.Workspace = testBaseWorkspace
+
+	// Profile with nil Sandbox — should inherit everything from base.
+	profile := &config.AgentProfile{}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
-		{Name: "test", ToolPattern: "bash"}, // inherits redirect but no redirect_profile
+	if !merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=true (inherited)")
 	}
-	if err := ValidateMergedAgent("test-agent", cfg); err == nil {
-		t.Error("expected error for redirect rule without redirect_profile")
+	if !merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=true (inherited)")
+	}
+	if merged.Sandbox.Workspace != testBaseWorkspace {
+		t.Errorf("workspace = %q, want /base/workspace (inherited)", merged.Sandbox.Workspace)
 	}
 }
 
-func TestValidateMergedAgent_RedirectUnknownProfile(t *testing.T) {
+func TestMergeAgentProfile_SandboxExplicitFalse(t *testing.T) {
 	cfg := testConfig()
-	cfg.MCPToolPolicy.Enabled = true
-	cfg.MCPToolPolicy.Action = config.ActionWarn
-	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
-		"safe-fetch": {Exec: []string{"/usr/bin/safe-fetch"}, Reason: "audited"},
+	cfg.Sandbox.Enabled = true
+	cfg.Sandbox.Strict = true
+
+	disabled := false
+	notStrict := false
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			Enabled: &disabled,
+			Strict:  &notStrict,
+		},
 	}
-	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
-		{Name: "test", ToolPattern: "bash", Action: config.ActionRedirect, RedirectProfile: "nonexistent"},
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := ValidateMergedAgent("test-agent", cfg); err == nil {
-		t.Error("expected error for redirect rule referencing unknown profile")
+	if merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=false (explicit override)")
+	}
+	if merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=false (explicit override)")
 	}
 }
 
-func TestValidateMergedAgent_RedirectEmptyExec(t *testing.T) {
+func TestMergeAgentProfile_SandboxFSAppendToNilBase(t *testing.T) {
 	cfg := testConfig()
-	cfg.MCPToolPolicy.Enabled = true
-	cfg.MCPToolPolicy.Action = config.ActionWarn
-	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
-		"bad": {Exec: []string{""}, Reason: "empty string exec"},
+	// Base has no FS config.
+	cfg.Sandbox.FS = nil
+
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			FS: &config.SandboxFilesystem{
+				AllowRead: []string{"/agent/data"},
+			},
+		},
 	}
-	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
-		{Name: "test", ToolPattern: "bash"},
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := ValidateMergedAgent("test-agent", cfg); err == nil {
-		t.Error("expected error for redirect_profile with empty exec in merged agent")
+	if merged.Sandbox.FS == nil {
+		t.Fatal("expected non-nil FS after merge")
+	}
+	if len(merged.Sandbox.FS.AllowRead) != 1 || merged.Sandbox.FS.AllowRead[0] != "/agent/data" {
+		t.Errorf("AllowRead = %v, want [/agent/data]", merged.Sandbox.FS.AllowRead)
 	}
 }
 

@@ -33,6 +33,10 @@ type StandaloneLaunchConfig struct {
 	// Policy overrides the default sandbox policy.
 	Policy *Policy
 
+	// Strict enables strict containment: error on missing layers,
+	// private /dev/shm mount, clone3 blocked, subreaper enabled.
+	Strict bool
+
 	// ExtraEnv contains additional KEY=VALUE pairs to pass to the child.
 	ExtraEnv []string
 
@@ -138,6 +142,9 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		"__PIPELOCK_SANDBOX_COMMAND=" + strings.Join(cfg.Command, "\x1f"),
 		"__PIPELOCK_SANDBOX_SOCKET=" + socketPath,
 	}
+	if cfg.Strict {
+		cmd.Env = append(cmd.Env, strictEnvKey+"=1")
+	}
 	if len(cfg.ExtraEnv) > 0 {
 		cmd.Env = append(cmd.Env, "__PIPELOCK_SANDBOX_EXTRA_ENV="+strings.Join(cfg.ExtraEnv, "\x1f"))
 	}
@@ -149,10 +156,14 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		cmd.Env = append(cmd.Env, "__PIPELOCK_SANDBOX_POLICY="+policyJSON)
 	}
 
+	cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET)
+	if cfg.Strict {
+		cloneFlags |= syscall.CLONE_NEWNS // mount namespace for private /dev/shm
+	}
 	uid := os.Getuid()
 	gid := os.Getgid()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
+		Cloneflags: cloneFlags,
 		UidMappings: []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: uid, Size: 1},
 		},
@@ -161,6 +172,15 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		},
 		Pdeathsig: syscall.SIGTERM,
 		Setpgid:   true,
+	}
+
+	// Strict mode: become subreaper so orphaned grandchildren are
+	// adopted by us instead of PID 1. This lets us reap them after
+	// the main child exits, even if they called setsid().
+	if cfg.Strict {
+		if err := SetChildSubreaper(); err != nil {
+			return fmt.Errorf("enable subreaper: %w", err)
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -176,12 +196,16 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 
+	// Strict mode: reap orphaned descendants adopted by subreaper.
+	// Best-effort: use timeout-based drain (existing behavior).
+	if cfg.Strict {
+		ReapOrphans()
+	}
+
 	// Close listener to prevent new connections.
 	_ = unixLn.Close()
 
-	// Wait for proxy goroutines to drain with a timeout. Detached
-	// grandchildren (setsid) escape process group kill and can hold
-	// bridge connections open indefinitely. The timeout prevents a hang.
+	// Wait for proxy goroutines to drain.
 	const proxyDrainTimeout = 5 * time.Second
 	done := make(chan struct{})
 	go func() {
@@ -190,10 +214,7 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	}()
 	select {
 	case <-done:
-		// Clean drain.
 	case <-time.After(proxyDrainTimeout):
-		// Detached descendants holding connections. Force exit — the OS
-		// will clean up the TCP connections when the process exits.
 	}
 
 	// Clean up child's sandbox temp dir.

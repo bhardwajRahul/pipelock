@@ -1,7 +1,7 @@
 // Copyright 2026 Josh Waldrep
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !(linux || darwin)
+//go:build !linux
 
 package sandbox
 
@@ -20,6 +20,7 @@ type LaunchConfig struct {
 	Command   []string
 	Workspace string
 	Policy    *Policy
+	Strict    bool
 	ExtraEnv  []string
 	Stdin     io.Reader
 	Stdout    io.Writer
@@ -32,6 +33,7 @@ type StandaloneLaunchConfig struct {
 	Command      []string
 	Workspace    string
 	Policy       *Policy
+	Strict       bool
 	ExtraEnv     []string
 	ProxyHandler func(conn net.Conn)
 }
@@ -51,8 +53,5 @@ func LaunchStandalone(_ StandaloneLaunchConfig) error {
 	return fmt.Errorf("%w: requires linux", ErrUnavailable)
 }
 
-// CleanupChildSandboxDir is a no-op on unsupported platforms.
+// CleanupChildSandboxDir is a no-op on non-Linux platforms.
 func CleanupChildSandboxDir(_ int) {}
-
-// CleanupSandboxCmd is a no-op on unsupported platforms.
-func CleanupSandboxCmd(_ *exec.Cmd) {}

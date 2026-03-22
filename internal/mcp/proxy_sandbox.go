@@ -33,7 +33,15 @@ import (
 // This function requires Linux kernel primitives (user namespaces) and is
 // integration-tested via subprocess tests. It cannot be unit-tested without
 // a real sandbox environment.
-func RunProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, clientIn io.Reader, clientOut io.Writer, logW io.Writer, sc *scanner.Scanner, approver *hitl.Approver, inputCfg *InputScanConfig, toolCfg *tools.ToolScanConfig, policyCfg *policy.Config, ks *killswitch.Controller, chainMatcher *chains.Matcher, auditLogger *audit.Logger, cee *CEEDeps, store session.Store, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics) error {
+// RunProxyWithSandbox runs an MCP proxy with a sandboxed child process.
+// The optional strict parameter enables subreaper for orphan cleanup.
+func RunProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, clientIn io.Reader, clientOut io.Writer, logW io.Writer, sc *scanner.Scanner, approver *hitl.Approver, inputCfg *InputScanConfig, toolCfg *tools.ToolScanConfig, policyCfg *policy.Config, ks *killswitch.Controller, chainMatcher *chains.Matcher, auditLogger *audit.Logger, cee *CEEDeps, store session.Store, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics, strict ...bool) error {
+	isStrict := len(strict) > 0 && strict[0]
+	if isStrict {
+		if err := sandbox.SetChildSubreaper(); err != nil {
+			return fmt.Errorf("strict mode: failed to set child subreaper: %w", err)
+		}
+	}
 	var rec session.Recorder
 	if store != nil {
 		rec = store.GetOrCreate(session.NextInvocationKey("mcp-stdio"))
@@ -130,7 +138,12 @@ func RunProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, clientIn io.
 	// Clean up sandbox child and temp dir.
 	if sandboxCmd.Process != nil {
 		_ = sandboxCmd.Process.Signal(os.Kill)
-		sandbox.CleanupSandboxCmd(sandboxCmd)
+		sandbox.CleanupChildSandboxDir(sandboxCmd.Process.Pid)
+	}
+
+	// Strict: reap orphaned descendants adopted by subreaper.
+	if isStrict {
+		sandbox.ReapOrphans()
 	}
 
 	// Drain with timeout — detached descendants can hold pipes open.

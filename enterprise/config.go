@@ -203,6 +203,20 @@ func ValidateAgents(cfg *config.Config) error {
 				return fmt.Errorf("agent %q: rate_limit.max_data_per_minute must be >= 0", name)
 			}
 		}
+
+		// Validate sandbox filesystem paths (reject empty entries).
+		if profile.Sandbox != nil && profile.Sandbox.FS != nil {
+			for _, p := range profile.Sandbox.FS.AllowRead {
+				if p == "" {
+					return fmt.Errorf("agent %q: sandbox filesystem allow_read contains empty path", name)
+				}
+			}
+			for _, p := range profile.Sandbox.FS.AllowWrite {
+				if p == "" {
+					return fmt.Errorf("agent %q: sandbox filesystem allow_write contains empty path", name)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -353,6 +367,27 @@ func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*conf
 		// replaces the entire base section, consistent with rate_limit
 		// and session_profiling behavior.
 		merged.MCPToolPolicy = *profile.MCPToolPolicy
+	}
+
+	if profile.Sandbox != nil {
+		// Selective merge: override non-nil fields, append filesystem paths.
+		if profile.Sandbox.Enabled != nil {
+			merged.Sandbox.Enabled = *profile.Sandbox.Enabled
+		}
+		if profile.Sandbox.Strict != nil {
+			merged.Sandbox.Strict = *profile.Sandbox.Strict
+		}
+		if profile.Sandbox.Workspace != "" {
+			merged.Sandbox.Workspace = profile.Sandbox.Workspace
+		}
+		if profile.Sandbox.FS != nil {
+			// Append per-agent paths to the base policy (never replace).
+			if merged.Sandbox.FS == nil {
+				merged.Sandbox.FS = &config.SandboxFilesystem{}
+			}
+			merged.Sandbox.FS.AllowRead = append(merged.Sandbox.FS.AllowRead, profile.Sandbox.FS.AllowRead...)
+			merged.Sandbox.FS.AllowWrite = append(merged.Sandbox.FS.AllowWrite, profile.Sandbox.FS.AllowWrite...)
+		}
 	}
 
 	return merged, nil

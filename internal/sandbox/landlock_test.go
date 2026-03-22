@@ -1,8 +1,6 @@
 // Copyright 2026 Josh Waldrep
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build linux
-
 package sandbox
 
 import (
@@ -16,8 +14,6 @@ import (
 	"syscall"
 	"testing"
 )
-
-const osLinux = "linux"
 
 // Landlock tests use subprocess execution because Landlock restrictions are
 // permanent and inherited. We cannot apply Landlock in the test process
