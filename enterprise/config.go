@@ -204,6 +204,11 @@ func ValidateAgents(cfg *config.Config) error {
 			}
 		}
 
+		// Validate trusted_domains in agent profile (same rules as top-level).
+		if err := config.ValidateTrustedDomains(profile.TrustedDomains, fmt.Sprintf("agent %q trusted_domains", name)); err != nil {
+			return err
+		}
+
 		// Validate sandbox filesystem paths (reject empty entries).
 		if profile.Sandbox != nil && profile.Sandbox.FS != nil {
 			for _, p := range profile.Sandbox.FS.AllowRead {
@@ -327,6 +332,9 @@ func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*conf
 	if profile.APIAllowlist != nil {
 		merged.APIAllowlist = profile.APIAllowlist // replace
 	}
+	if profile.TrustedDomains != nil {
+		merged.TrustedDomains = profile.TrustedDomains // replace
+	}
 	if profile.RateLimit != nil {
 		// Wholesale replacement: setting rate_limit on an agent replaces
 		// both fields, so explicit zero means "unlimited" (no inherited limit).
@@ -395,6 +403,10 @@ func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*conf
 
 // ValidateMergedAgent validates a merged agent config.
 func ValidateMergedAgent(name string, cfg *config.Config) error {
+	// Validate trusted_domains inherited or overridden by the agent profile.
+	if err := config.ValidateTrustedDomains(cfg.TrustedDomains, fmt.Sprintf("agent %q trusted_domains", name)); err != nil {
+		return err
+	}
 	if cfg.Mode == config.ModeStrict && len(cfg.APIAllowlist) == 0 {
 		return fmt.Errorf("agent %q: strict mode requires at least one domain in api_allowlist", name)
 	}

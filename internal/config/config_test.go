@@ -893,6 +893,97 @@ func TestValidateReload_SubdomainExclusionsReduced_NoWarning(t *testing.T) {
 	}
 }
 
+func TestValidate_TrustedDomains_Valid(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"localhost", "*.internal.corp"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected validation to pass, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_BareWildcard(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"*"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for bare wildcard in trusted_domains")
+	}
+	if !strings.Contains(err.Error(), "bare wildcard") {
+		t.Errorf("error should mention bare wildcard, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_OverBroad(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"*.com"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for over-broad wildcard *.com in trusted_domains")
+	}
+	if !strings.Contains(err.Error(), "concrete domain") {
+		t.Errorf("error should mention concrete domain, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_URL(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"https://localhost"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for URL in trusted_domains")
+	}
+	if !strings.Contains(err.Error(), "not a URL") {
+		t.Errorf("error should mention URL, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_Normalized(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"  LocalHost  "}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected validation to pass, got: %v", err)
+	}
+	if cfg.TrustedDomains[0] != "localhost" {
+		t.Errorf("expected normalized entry, got %q", cfg.TrustedDomains[0])
+	}
+}
+
+func TestValidateReload_TrustedDomainsExpanded(t *testing.T) {
+	old := Defaults()
+	old.TrustedDomains = []string{"localhost"}
+	updated := Defaults()
+	updated.TrustedDomains = []string{"localhost", "*.internal.corp"}
+
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == "trusted_domains" {
+			found = true
+			if !strings.Contains(w.Message, "*.internal.corp") {
+				t.Errorf("warning should name the added domain, got: %s", w.Message)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected warning when trusted_domains is expanded")
+	}
+}
+
+func TestValidateReload_TrustedDomainsUnchanged_NoWarning(t *testing.T) {
+	old := Defaults()
+	old.TrustedDomains = []string{"localhost"}
+	updated := Defaults()
+	updated.TrustedDomains = []string{"localhost"}
+
+	warnings := ValidateReload(old, updated)
+	for _, w := range warnings {
+		if w.Field == "trusted_domains" {
+			t.Errorf("unexpected warning for unchanged trusted_domains: %s", w.Message)
+		}
+	}
+}
+
 func TestLoad_PresetYAMLFiles(t *testing.T) {
 	// Find the project root configs/ directory
 	// Tests run from the package dir, so go up two levels
@@ -8837,5 +8928,52 @@ reverse_proxy:
 	}
 	if cfg.ReverseProxy.Upstream != testRevProxyUpstream {
 		t.Fatalf("expected upstream %s, got %q", testRevProxyUpstream, cfg.ReverseProxy.Upstream)
+	}
+}
+
+func TestValidate_TrustedDomains_Empty(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{""}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for empty trusted_domains entry")
+	}
+	if !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("error should mention empty, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_HostPort(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"localhost:8080"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for host:port in trusted_domains")
+	}
+	if !strings.Contains(err.Error(), "not a URL") {
+		t.Errorf("error should mention URL/host:port, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_NonPrefixWildcard(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"api.*.example.com"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for non-prefix wildcard in trusted_domains")
+	}
+	if !strings.Contains(err.Error(), "only exact hosts") {
+		t.Errorf("error should mention supported patterns, got: %v", err)
+	}
+}
+
+func TestValidate_TrustedDomains_TrailingDot(t *testing.T) {
+	cfg := Defaults()
+	cfg.TrustedDomains = []string{"example.com."}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected validation to pass, got: %v", err)
+	}
+	if cfg.TrustedDomains[0] != "example.com" {
+		t.Errorf("expected trailing dot stripped, got %q", cfg.TrustedDomains[0])
 	}
 }

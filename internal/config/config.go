@@ -286,6 +286,7 @@ type Config struct {
 	LicenseFile           string                  `yaml:"license_file,omitempty"`       // path to file containing the license token (read at startup)
 	LicensePublicKey      string                  `yaml:"license_public_key,omitempty"` // hex-encoded Ed25519 public key for license verification (dev builds only)
 	Internal              []string                `yaml:"internal"`
+	TrustedDomains        []string                `yaml:"trusted_domains"` // domains exempt from SSRF internal-IP check (wildcard supported)
 
 	// LicenseExpiresAt is the Unix timestamp of the license expiry, populated
 	// by EnforceLicenseGate(). Zero means perpetual. Used for runtime expiry
@@ -746,6 +747,7 @@ type AgentProfile struct {
 	Budget           BudgetConfig          `yaml:"budget,omitempty"`
 	AllowedAddresses []string              `yaml:"allowed_addresses,omitempty"` // per-agent crypto address allowlist (enterprise, additive with global)
 	Sandbox          *AgentSandboxOverride `yaml:"sandbox,omitempty"`           // per-agent sandbox overrides (Pro, gated by FeatureAgents)
+	TrustedDomains   []string              `yaml:"trusted_domains,omitempty"`   // per-agent SSRF-exempt domains (replace, not merge)
 }
 
 // AgentDLP controls DLP pattern merging for agent profiles.
@@ -1475,6 +1477,38 @@ func mergeResponsePatterns(includeDefaults *bool, user, defaults []ResponseScanP
 	}
 	merged = append(merged, user...)
 	return merged
+}
+
+// ValidateTrustedDomains validates and normalizes a slice of trusted domain
+// entries. Each entry is lowercased, trimmed, and checked for: empty values,
+// URL/host:port formats, bare wildcards, over-broad wildcards (e.g. *.com),
+// non-prefix wildcards, and trailing dots. The slice is modified in-place
+// with normalized values. The label parameter identifies the config section
+// for error messages (e.g. "trusted_domains" or "agent \"foo\" trusted_domains").
+func ValidateTrustedDomains(domains []string, label string) error {
+	for i, raw := range domains {
+		d := strings.TrimSpace(strings.ToLower(raw))
+		if d == "" {
+			return fmt.Errorf("%s[%d] is empty", label, i)
+		}
+		if strings.Contains(d, "://") || strings.Contains(d, "/") || strings.Contains(d, ":") {
+			return fmt.Errorf("%s[%d] %q: use a hostname pattern, not a URL or host:port", label, i, raw)
+		}
+		if d == "*" {
+			return fmt.Errorf("%s[%d]: bare wildcard disables all SSRF protection", label, i)
+		}
+		if strings.HasPrefix(d, "*.") {
+			// Wildcard must target a concrete domain (*.com is too broad).
+			if strings.Count(d[2:], ".") < 1 {
+				return fmt.Errorf("%s[%d] %q: wildcard must target a concrete domain like *.example.com", label, i, raw)
+			}
+		} else if strings.ContainsAny(d, "*?[]") {
+			return fmt.Errorf("%s[%d] %q: only exact hosts and *.example.com wildcards are supported", label, i, raw)
+		}
+		// Normalize: store lowercase, trimmed.
+		domains[i] = strings.TrimSuffix(d, ".")
+	}
+	return nil
 }
 
 // Validate checks the config for errors. Must be called after ApplyDefaults.
@@ -2235,6 +2269,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate trusted_domains entries.
+	if err := ValidateTrustedDomains(c.TrustedDomains, "trusted_domains"); err != nil {
+		return err
+	}
+
 	// Validate community rules config
 	switch c.Rules.MinConfidence {
 	case ConfidenceHigh, ConfidenceMedium, ConfidenceLow:
@@ -2577,6 +2616,17 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 			Message: fmt.Sprintf("subdomain entropy exclusions added: %s — entropy detection coverage reduced", strings.Join(added, ", ")),
 		})
 	}
+
+	// Trusted domains expanded (SSRF protection scope reduced)
+	if added := passthroughDomainsAdded(old.TrustedDomains, updated.TrustedDomains); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "trusted_domains",
+			Message: fmt.Sprintf("trusted domains added: %s — SSRF internal-IP check bypassed for these hosts", strings.Join(added, ", ")),
+		})
+	}
+	// TODO: emit reload warnings for agent-scoped trusted_domains (enterprise profiles).
+	// Agent profiles live in the enterprise package, so diffing them here would require
+	// either a hook or moving the diff logic into the enterprise reload path.
 
 	// Request body scanning disabled
 	if old.RequestBodyScanning.Enabled && !updated.RequestBodyScanning.Enabled {
@@ -3169,7 +3219,7 @@ func Defaults() *Config {
 				{Name: "Credential Solicitation", Regex: `(?is)\b(send|provide|paste|return|include|supply|submit|share)\b.{0,80}\b(password|passwd|token|api[_ -]?key|secret|credential|private[_ -]?key|ssh[_ -]?key|session[_ -]?cookie)\b`},
 				{Name: "Credential Path Directive", Regex: `(?is)\b(read|get|fetch|retrieve|cat|copy|extract|open)\b.{0,80}(\.ssh[/\\]|\.aws[/\\]credentials|\.env\b|\.npmrc\b|\.pypirc\b|\.netrc\b|\bid_rsa\b|\bid_ed25519\b|\bkubeconfig\b)`},
 				{Name: "Auth Material Requirement", Regex: `(?is)\bto\s+(complete|continue|finish|proceed|verify)\b.{0,80}\b(authentication|credential|token|api[_ -]?key|private[_ -]?key|ssh[_ -]?key)\b.{0,40}\b(required|needed|necessary|must be)\b`},
-				{Name: "Memory Persistence Directive", Regex: `(?is)\b(save|store|remember|retain|persist|record|cache)\b.{0,40}\b(this|these|that|it|the)\b.{0,60}\b(for future|for later|across sessions?|next session|future tasks?|subsequent)\b`},
+				{Name: "Memory Persistence Directive", Regex: `(?is)\b(save|store|remember|retain|persist|record|cache)\b.{0,40}\b(this|these|that|it|the)\b.{0,60}\b(for future|for later|across sessions?|next session|next time|future tasks?|subsequent|permanently|from now on|going forward|in all future)\b`},
 				{Name: "Preference Poisoning", Regex: `(?is)\b(from now on|always|going forward|in future)\b.{0,80}\b(prefer|prioritize|trust|choose|use|default to)\b.{0,60}\b(this tool|that tool|my tool|the external|the remote)\b`},
 				{Name: "Silent Credential Handling", Regex: `(?is)\b(do not|don'?t|never)\s+(mention|display|show|tell|reveal|log|report)\b.{0,100}\b(password|token|secret|credential|private[_ -]?key|api[_ -]?key)\b`},
 			},
