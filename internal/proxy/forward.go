@@ -158,9 +158,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// so session profiling tracks the domain but neither escalation signals nor
 		// clean-decay fire. Blocked exempt traffic is score-neutral.
 		if isAdaptiveExempt(host, cfg.AdaptiveEnforcement.ExemptDomains) {
-			p.recordSessionActivity(clientIP, agent, host, requestID, true, 0, cfg, p.logger, true)
+			p.recordSessionActivity(clientIP, agent, host, requestID, scanner.Result{Allowed: true}, cfg, p.logger, true)
 		} else {
-			p.recordSessionActivity(clientIP, agent, host, requestID, false, 0.9, cfg, p.logger, false)
+			p.recordSessionActivity(clientIP, agent, host, requestID, scanner.Result{Allowed: false, Score: 0.9}, cfg, p.logger, false)
 		}
 		p.metrics.RecordTunnelBlocked(agentLabel)
 		http.Error(w, "CONNECT blocked: header DLP match", http.StatusForbidden)
@@ -171,17 +171,21 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// signals (SignalBlock) fire even for blocked requests. Pass deferClean=true
 	// so a warn-only header or CEE finding on the same CONNECT request does not
 	// get offset by a clean decay from the URL stage.
-	sr := p.recordSessionActivity(clientIP, agent, host, requestID, result.Allowed, result.Score, cfg, p.logger, true)
-	hasFinding := !result.Allowed || connectHeaderHadFinding
+	sr := p.recordSessionActivity(clientIP, agent, host, requestID, result, cfg, p.logger, true)
+	hasFinding := (!result.Allowed && !result.IsProtective()) || connectHeaderHadFinding
 
 	if !result.Allowed {
+		status := http.StatusForbidden
+		if result.Scanner == scanner.ScannerRateLimit {
+			status = http.StatusTooManyRequests
+		}
 		if cfg.EnforceEnabled() {
 			p.logger.LogBlocked(http.MethodConnect, target, result.Scanner, result.Reason, clientIP, requestID, agent)
 			p.metrics.RecordTunnelBlocked(agentLabel)
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
-			http.Error(w, "CONNECT blocked: "+result.Reason, http.StatusForbidden)
+			http.Error(w, "CONNECT blocked: "+result.Reason, status)
 			return
 		}
 		// Audit mode: base action is "warn". Adaptive escalation may upgrade to block.
@@ -196,7 +200,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordAdaptiveUpgrade(baseAction, effectiveAction, session.EscalationLabel(sr.Level))
 			p.logger.LogBlocked(http.MethodConnect, target, result.Scanner, result.Reason+" (escalated)", clientIP, requestID, agent)
 			p.metrics.RecordTunnelBlocked(agentLabel)
-			http.Error(w, "CONNECT blocked: "+result.Reason+" (escalated)", http.StatusForbidden)
+			http.Error(w, "CONNECT blocked: "+result.Reason+" (escalated)", status)
 			return
 		}
 		p.logger.LogAnomaly(http.MethodConnect, target, result.Scanner,
@@ -529,23 +533,27 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// signals (SignalBlock) fire even for blocked requests. Pass deferClean=true
 	// so later request/response findings on the same round trip do not get
 	// offset by an early clean decay from the URL stage.
-	sr := p.recordSessionActivity(clientIP, agent, r.URL.Hostname(), requestID, result.Allowed, result.Score, cfg, p.logger, true)
+	sr := p.recordSessionActivity(clientIP, agent, r.URL.Hostname(), requestID, result, cfg, p.logger, true)
 
 	forwardSessionKey := ceeSessionKey(agent, clientIP)
 	var forwardRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
 		forwardRec = sm.GetOrCreate(forwardSessionKey)
 	}
-	hasFinding := !result.Allowed
+	hasFinding := !result.Allowed && !result.IsProtective()
 
 	if !result.Allowed {
+		status := http.StatusForbidden
+		if result.Scanner == scanner.ScannerRateLimit {
+			status = http.StatusTooManyRequests
+		}
 		if cfg.EnforceEnabled() {
 			p.logger.LogBlocked(r.Method, targetURL, result.Scanner, result.Reason, clientIP, requestID, agent)
 			p.metrics.RecordBlocked(r.URL.Hostname(), result.Scanner, time.Since(start), agentLabel)
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
-			http.Error(w, "blocked: "+result.Reason, http.StatusForbidden)
+			http.Error(w, "blocked: "+result.Reason, status)
 			return
 		}
 		// Audit mode: base action is "warn". Adaptive escalation may upgrade to block.
@@ -560,7 +568,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordAdaptiveUpgrade(baseAction, effectiveAction, session.EscalationLabel(sr.Level))
 			p.logger.LogBlocked(r.Method, targetURL, result.Scanner, result.Reason+" (escalated)", clientIP, requestID, agent)
 			p.metrics.RecordBlocked(r.URL.Hostname(), result.Scanner, time.Since(start), agentLabel)
-			http.Error(w, "blocked: "+result.Reason+" (escalated)", http.StatusForbidden)
+			http.Error(w, "blocked: "+result.Reason+" (escalated)", status)
 			return
 		}
 		p.logger.LogAnomaly(r.Method, targetURL, result.Scanner,

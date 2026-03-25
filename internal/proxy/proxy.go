@@ -536,7 +536,7 @@ func newTLSInterceptTransport(
 // Returns a SessionResult with Blocked set when the request should be rejected
 // due to a session anomaly in block mode, and Level set to the current
 // escalation level for downstream use by UpgradeAction().
-func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID string, resultAllowed bool, resultScore float64, cfg *config.Config, log *audit.Logger, deferClean bool) SessionResult {
+func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID string, result scanner.Result, cfg *config.Config, log *audit.Logger, deferClean bool) SessionResult {
 	sm := p.sessionMgrPtr.Load()
 	if sm == nil || !cfg.SessionProfiling.Enabled {
 		return SessionResult{}
@@ -567,12 +567,15 @@ func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID strin
 			ClientIP:  clientIP,
 			RequestID: requestID,
 		}
-		if !resultAllowed {
+		if result.IsProtective() {
+			// Score-neutral: no escalation signal, no clean decay.
+			// A rate-limited request proves nothing about threat posture.
+		} else if !result.Allowed {
 			if decide.RecordEscalation(sess, session.SignalBlock, ep) {
 				// Update block_all flag so RecordRequest stops refreshing lastActivity.
 				sess.SetBlockAll(decide.UpgradeAction("", sess.EscalationLevel(), &adaptiveCfg) == config.ActionBlock)
 			}
-		} else if resultScore > 0 {
+		} else if result.Score > 0 {
 			if decide.RecordEscalation(sess, session.SignalNearMiss, ep) {
 				sess.SetBlockAll(decide.UpgradeAction("", sess.EscalationLevel(), &adaptiveCfg) == config.ActionBlock)
 			}
@@ -872,7 +875,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// so RecordClean is NOT applied inside recordSessionActivity: header DLP,
 	// CEE, and response scanning may still find something after this point, and
 	// a clean decay before those stages would incorrectly counteract a later signal.
-	sr := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, result.Allowed, result.Score, cfg, log, true)
+	sr := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, result, cfg, log, true)
 
 	// Look up the live session recorder for Fix 4+5: use EscalationLevel() at
 	// each enforcement point (not the snapshot in sr.Level) so mid-request CEE
@@ -891,7 +894,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// detected something for this request. RecordClean is only applied at the
 	// end when no finding was detected. A near-miss (scored but allowed) counts
 	// as a finding to prevent inadvertent score decay.
-	hasFinding := !result.Allowed || (result.Score > 0 && result.Allowed)
+	hasFinding := (!result.Allowed && !result.IsProtective()) || (result.Score > 0 && result.Allowed)
 
 	if !result.Allowed {
 		if cfg.EnforceEnabled() {
@@ -925,7 +928,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordAdaptiveUpgrade(baseAction, effectiveAction, session.EscalationLabel(sr.Level))
 			log.LogBlocked("GET", displayURL, result.Scanner, result.Reason+" (escalated)", clientIP, requestID, agent)
 			p.metrics.RecordBlocked(parsed.Hostname(), result.Scanner, time.Since(start), agentLabel)
-			writeJSON(w, http.StatusForbidden, FetchResponse{
+			escalatedStatus := http.StatusForbidden
+			if result.Scanner == scanner.ScannerRateLimit {
+				escalatedStatus = http.StatusTooManyRequests
+			}
+			writeJSON(w, escalatedStatus, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,

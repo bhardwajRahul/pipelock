@@ -151,17 +151,21 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Session profiling: record BEFORE the enforce-mode early return so adaptive
 	// signals (SignalBlock) fire even for blocked requests. Pass deferClean=true
 	// so header DLP findings on the same handshake don't get offset by early decay.
-	sr := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, result.Allowed, result.Score, cfg, log, true)
-	wsHasFinding := !result.Allowed
+	sr := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, result, cfg, log, true)
+	wsHasFinding := !result.Allowed && !result.IsProtective()
 
 	if !result.Allowed {
+		status := http.StatusForbidden
+		if result.Scanner == scanner.ScannerRateLimit {
+			status = http.StatusTooManyRequests
+		}
 		if cfg.EnforceEnabled() {
 			log.LogBlocked("WS", targetURL, result.Scanner, result.Reason, clientIP, requestID, agent)
 			p.metrics.RecordWSBlocked()
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
-			http.Error(w, "WebSocket blocked: "+result.Reason, http.StatusForbidden)
+			http.Error(w, "WebSocket blocked: "+result.Reason, status)
 			return
 		}
 		// Audit mode: base action is "warn". Adaptive escalation may upgrade to block.
@@ -176,7 +180,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordAdaptiveUpgrade(baseAction, effectiveAction, session.EscalationLabel(sr.Level))
 			log.LogBlocked("WS", targetURL, result.Scanner, result.Reason+" (escalated)", clientIP, requestID, agent)
 			p.metrics.RecordWSBlocked()
-			http.Error(w, "WebSocket blocked: "+result.Reason+" (escalated)", http.StatusForbidden)
+			http.Error(w, "WebSocket blocked: "+result.Reason+" (escalated)", status)
 			return
 		}
 		log.LogAnomaly("WS", targetURL, result.Scanner,
@@ -227,7 +231,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if blocked, reason := p.dlpScanWSHeaders(r.Context(), fwdHeaders, sc); blocked {
 		wsHasFinding = true
 		// Record session activity so adaptive enforcement sees header-DLP hits.
-		headerSR := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, false, 0.9, cfg, log, false)
+		headerSR := p.recordSessionActivity(clientIP, agent, parsed.Hostname(), requestID, scanner.Result{Allowed: false, Score: 0.9}, cfg, log, false)
 		if cfg.EnforceEnabled() {
 			log.LogWSBlocked(targetURL, audit.DirectionClientToServer, audit.ScannerDLP, reason, clientIP, requestID)
 			p.metrics.RecordWSBlocked()
