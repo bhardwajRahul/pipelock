@@ -20,9 +20,45 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	session "github.com/luckyPipewrench/pipelock/internal/session"
 )
+
+// recoverer is an optional interface for sessions that support autonomous
+// time-based de-escalation. Implemented by proxy.SessionState but not part
+// of session.Recorder to avoid interface churn on mocks and tests.
+type recoverer interface {
+	TryAutoRecover(blockAllCheck func(int) bool) (bool, int, int)
+}
+
+// tryRecoverSession attempts autonomous de-escalation on the session recorder.
+// No-op if rec does not implement recoverer or adaptive enforcement is disabled.
+func tryRecoverSession(rec session.Recorder, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics) {
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return
+	}
+	r, ok := rec.(recoverer)
+	if !ok {
+		return
+	}
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+	if changed, from, to := r.TryAutoRecover(blockAllCheck); changed {
+		fromLabel := session.EscalationLabel(from)
+		toLabel := session.EscalationLabel(to)
+		if m != nil {
+			m.RecordSessionAutoDeescalation(fromLabel, toLabel)
+			if from > 0 {
+				m.SetAdaptiveSessionLevel(fromLabel, -1)
+			}
+			if to > 0 {
+				m.SetAdaptiveSessionLevel(toLabel, 1)
+			}
+		}
+	}
+}
 
 // methodToolsCall is the JSON-RPC method for MCP tool invocations.
 const methodToolsCall = "tools/call"
@@ -542,6 +578,13 @@ func ForwardScannedInput(
 				}
 				continue
 			}
+		}
+
+		// On-entry de-escalation: recover sessions stuck at block_all.
+		// Runs before any per-message action so both clean and non-clean
+		// messages benefit from recovery.
+		if rec != nil {
+			tryRecoverSession(rec, adaptiveCfg, m)
 		}
 
 		verdict := ScanRequest(line, sc, action, onParseError)

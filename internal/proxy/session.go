@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/session"
 )
@@ -136,38 +137,18 @@ func pruneDomainWindow(entries []domainEntry, domain string, windowCutoff, now t
 // re-escalate.
 const maxLevelDuration = 5 * time.Minute
 
-// tryDeescalate checks if the session has been at its current escalation
-// level for longer than maxLevelDuration and drops one level if so.
-// Caller must hold s.mu.
-func (s *SessionState) tryDeescalate(now time.Time) {
-	if s.escalationLevel > 0 && !s.lastEscalation.IsZero() && now.Sub(s.lastEscalation) > maxLevelDuration {
-		s.escalationLevel--
-		s.lastEscalation = now
-		// Halve the threshold to match the lower level (inverse of the
-		// doubling on escalation).
-		if s.currentThreshold > 0 {
-			s.currentThreshold /= 2
-		}
-		// Reset score to half the current threshold so the session doesn't
-		// immediately re-escalate from accumulated points.
-		s.threatScore = s.currentThreshold / 2
-		// Clear block_all flag — the proxy will re-evaluate on next escalation.
-		// This allows RecordRequest to resume refreshing lastActivity.
-		s.atBlockAll = false
-	}
-}
+// deescalationCheckInterval is how often the background sweep checks all
+// sessions for time-based de-escalation. Runs independently of traffic so
+// idle sessions recover even when no requests arrive.
+const deescalationCheckInterval = 30 * time.Second
 
 // RecordSignal adds a threat signal to the session's score.
 // Returns (escalated, fromLevel, toLevel) if threshold was crossed.
+// Time-based recovery is handled exclusively by TryAutoRecover, not here.
 // Caller must hold no locks on SessionState.
 func (s *SessionState) RecordSignal(sig session.SignalType, threshold float64) (bool, string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	now := time.Now()
-
-	// Time-based de-escalation before recording the new signal.
-	s.tryDeescalate(now)
 
 	points := session.SignalPoints[sig]
 	s.threatScore += points
@@ -180,7 +161,7 @@ func (s *SessionState) RecordSignal(sig session.SignalType, threshold float64) (
 	if s.currentThreshold > 0 && s.threatScore >= s.currentThreshold {
 		oldLevel := s.escalationLevel
 		s.escalationLevel++
-		s.lastEscalation = now
+		s.lastEscalation = time.Now()
 		// Double the threshold to prevent oscillation
 		s.currentThreshold *= 2
 
@@ -193,15 +174,9 @@ func (s *SessionState) RecordSignal(sig session.SignalType, threshold float64) (
 }
 
 // RecordClean decays the threat score for a clean request (no signals).
-// Also checks the de-escalation timer so sessions at block_all can
-// recover via clean traffic — without this, a session stuck at critical
-// would never de-escalate because RecordSignal is never called for
-// clean requests.
 func (s *SessionState) RecordClean(decayRate float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.tryDeescalate(time.Now())
 
 	s.threatScore -= decayRate
 	if s.threatScore < 0 {
@@ -224,6 +199,38 @@ func (s *SessionState) BlockAll() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.atBlockAll
+}
+
+// TryAutoRecover checks whether the session has been at its current
+// escalation level for longer than maxLevelDuration and drops one level
+// if so. It takes a blockAllCheck callback that recomputes atBlockAll
+// from live config so custom configs with block_all at lower escalation
+// levels work correctly. This is the sole time-based recovery path.
+//
+// Returns (changed, fromLevel, toLevel). The caller is responsible for
+// emitting metrics/logs when changed is true.
+func (s *SessionState) TryAutoRecover(blockAllCheck func(int) bool) (bool, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.escalationLevel <= 0 || s.lastEscalation.IsZero() {
+		return false, 0, 0
+	}
+	if time.Since(s.lastEscalation) <= maxLevelDuration {
+		return false, 0, 0
+	}
+
+	from := s.escalationLevel
+	s.escalationLevel--
+	s.lastEscalation = time.Now()
+
+	if s.currentThreshold > 0 {
+		s.currentThreshold /= 2
+	}
+	s.threatScore = s.currentThreshold / 2
+	s.atBlockAll = blockAllCheck(s.escalationLevel)
+
+	return true, from, s.escalationLevel
 }
 
 // ThreatScore returns the current threat score (thread-safe).
@@ -258,15 +265,17 @@ type SessionManager struct {
 	ipDomains       map[string][]domainEntry
 	ipBurstCooldown map[string]time.Time // per-IP burst cooldown timestamps
 
-	cfgPtr  atomic.Pointer[config.SessionProfiling]
-	metrics *metrics.Metrics // nil-safe; used for gauge/counter updates
-	done    chan struct{}
-	closed  sync.Once
+	cfgPtr         atomic.Pointer[config.SessionProfiling]
+	adaptiveCfgPtr atomic.Pointer[config.AdaptiveEnforcement]
+	metrics        *metrics.Metrics // nil-safe; used for gauge/counter updates
+	done           chan struct{}
+	closed         sync.Once
 }
 
 // NewSessionManager creates a session manager with background cleanup.
 // The metrics parameter is optional (nil disables gauge/counter updates).
-func NewSessionManager(cfg *config.SessionProfiling, m *metrics.Metrics) *SessionManager {
+// The adaptiveCfg parameter is optional (nil when adaptive enforcement is disabled).
+func NewSessionManager(cfg *config.SessionProfiling, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics) *SessionManager {
 	sm := &SessionManager{
 		sessions:        make(map[string]*SessionState),
 		ipDomains:       make(map[string][]domainEntry),
@@ -275,8 +284,10 @@ func NewSessionManager(cfg *config.SessionProfiling, m *metrics.Metrics) *Sessio
 		done:            make(chan struct{}),
 	}
 	sm.cfgPtr.Store(cfg)
+	sm.adaptiveCfgPtr.Store(adaptiveCfg)
 
 	go sm.cleanupLoop()
+	go sm.deescalationLoop()
 	return sm
 }
 
@@ -365,9 +376,28 @@ func (sm *SessionManager) RecordIPDomain(clientIP, domain string, cfg *config.Se
 
 // UpdateConfig swaps the session manager's config pointer so that TTL,
 // capacity, threshold, and cleanup interval changes take effect on the
-// next operation.
-func (sm *SessionManager) UpdateConfig(cfg *config.SessionProfiling) {
+// next operation. Pass nil for adaptiveCfg to clear adaptive enforcement
+// (e.g., when it is disabled via hot reload).
+func (sm *SessionManager) UpdateConfig(cfg *config.SessionProfiling, adaptiveCfg *config.AdaptiveEnforcement) {
 	sm.cfgPtr.Store(cfg)
+	sm.adaptiveCfgPtr.Store(adaptiveCfg)
+
+	// Recompute atBlockAll for all sessions from the new adaptive config.
+	// This handles three cases:
+	// 1. Adaptive disabled → clear all flags
+	// 2. block_all matrix changed → recompute per session level
+	// 3. No change → flags stay the same (recompute is idempotent)
+	sm.mu.RLock()
+	for _, sess := range sm.sessions {
+		if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+			sess.SetBlockAll(false)
+		} else {
+			level := sess.EscalationLevel()
+			isBlockAll := decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+			sess.SetBlockAll(isBlockAll)
+		}
+	}
+	sm.mu.RUnlock()
 }
 
 // Close stops the cleanup goroutine.
@@ -447,6 +477,99 @@ func (sm *SessionManager) cleanup() {
 		}
 		sm.metrics.SetSessionsActive(float64(len(sm.sessions)))
 	}
+}
+
+// deescalationLoop runs periodic de-escalation checks on all sessions.
+// Unlike cleanupLoop, this uses a fixed interval (not config-driven)
+// because recovery timing is a security property, not a tuning knob.
+func (sm *SessionManager) deescalationLoop() {
+	ticker := time.NewTicker(deescalationCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.done:
+			return
+		case <-ticker.C:
+			sm.sweepDeescalation()
+		}
+	}
+}
+
+// sweepDeescalation checks all sessions for time-based de-escalation.
+// This is the primary recovery mechanism for the deny-spiral bug: it runs
+// independently of traffic so idle sessions recover even with no requests.
+func (sm *SessionManager) sweepDeescalation() {
+	adaptiveCfg := sm.adaptiveCfgPtr.Load()
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return
+	}
+
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+
+	sm.mu.RLock()
+	sessions := make([]*SessionState, 0, len(sm.sessions))
+	for _, sess := range sm.sessions {
+		sessions = append(sessions, sess)
+	}
+	sm.mu.RUnlock()
+
+	for _, sess := range sessions {
+		changed, from, to := sess.TryAutoRecover(blockAllCheck)
+		if changed && sm.metrics != nil {
+			fromLabel := session.EscalationLabel(from)
+			toLabel := session.EscalationLabel(to)
+			// Only emit gauge updates if the session is still live in the map.
+			// Cleanup may have evicted and already decremented its gauge.
+			sm.mu.RLock()
+			_, stillLive := sm.sessions[sess.key]
+			sm.mu.RUnlock()
+			if stillLive {
+				sm.metrics.RecordSessionAutoDeescalation(fromLabel, toLabel)
+				if from > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(fromLabel, -1)
+				}
+				if to > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(toLabel, 1)
+				}
+			}
+		}
+	}
+}
+
+// trySessionRecovery attempts time-based de-escalation on a session and emits
+// metrics if recovery fires. Returns (changed, fromLabel, toLabel) for callers
+// that need to log the transition. No-op when adaptive enforcement is disabled,
+// the session is nil, or the session is not a *SessionState.
+func trySessionRecovery(rec session.Recorder, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics) (bool, string, string) {
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return false, "", ""
+	}
+	ss, ok := rec.(*SessionState)
+	if !ok || ss == nil {
+		return false, "", ""
+	}
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+	changed, from, to := ss.TryAutoRecover(blockAllCheck)
+	if !changed {
+		return false, "", ""
+	}
+	fromLabel := session.EscalationLabel(from)
+	toLabel := session.EscalationLabel(to)
+	if m != nil {
+		m.RecordSessionAutoDeescalation(fromLabel, toLabel)
+		if from > 0 {
+			m.SetAdaptiveSessionLevel(fromLabel, -1)
+		}
+		if to > 0 {
+			m.SetAdaptiveSessionLevel(toLabel, 1)
+		}
+	}
+	return true, fromLabel, toLabel
 }
 
 // storeAdapter wraps SessionManager to implement session.Store.

@@ -226,6 +226,13 @@ func scanHTTPInput(msg []byte, logW io.Writer, sessionKey, auditSessionKey strin
 		}
 	}
 
+	// On-entry de-escalation: recover sessions stuck at block_all.
+	// Runs before any per-message action so both clean and non-clean
+	// messages benefit from recovery.
+	if rec != nil {
+		tryRecoverSession(rec, adaptiveCfg, m)
+	}
+
 	// Determine input scanning parameters.
 	action := config.ActionWarn
 	onParseError := config.ActionBlock

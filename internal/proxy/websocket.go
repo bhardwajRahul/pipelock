@@ -518,6 +518,15 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 			return
 		}
 
+		// On-entry de-escalation for long-lived WebSocket connections.
+		if changed, fromLabel, toLabel := trySessionRecovery(r.rec, &r.cfg.AdaptiveEnforcement, r.proxy.metrics); changed {
+			sessionKey := r.clientIP
+			if r.agent != "" && r.agent != agentAnonymous {
+				sessionKey = r.agent + "|" + r.clientIP
+			}
+			log.LogAdaptiveEscalation(sessionKey, fromLabel, toLabel, r.clientIP, r.requestID, r.rec.ThreatScore())
+		}
+
 		// block_all check: if the session has escalated to a level with
 		// block_all=true, close the WebSocket immediately. This prevents
 		// clean frames from flowing after escalation during long-lived connections.
@@ -833,6 +842,15 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "kill switch active")
 			blocked = true
 			return
+		}
+
+		// On-entry de-escalation for long-lived WebSocket connections.
+		if changed, fromLabel, toLabel := trySessionRecovery(r.rec, &r.cfg.AdaptiveEnforcement, r.proxy.metrics); changed {
+			sessionKey := r.clientIP
+			if r.agent != "" && r.agent != agentAnonymous {
+				sessionKey = r.agent + "|" + r.clientIP
+			}
+			log.LogAdaptiveEscalation(sessionKey, fromLabel, toLabel, r.clientIP, r.requestID, r.rec.ThreatScore())
 		}
 
 		// block_all check: if the session has escalated to a level with

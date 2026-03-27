@@ -490,6 +490,21 @@ func newInterceptHandler(
 			}
 		}
 
+		// On-entry de-escalation for intercepted CONNECT requests.
+		var interceptMetrics *metrics.Metrics
+		if p != nil {
+			interceptMetrics = p.metrics
+		}
+		if changed, fromLabel, toLabel := trySessionRecovery(rec, &cfg.AdaptiveEnforcement, interceptMetrics); changed {
+			sessionKey := clientIP
+			if agent != "" && agent != agentAnonymous {
+				sessionKey = agent + "|" + clientIP
+			}
+			if logger != nil {
+				logger.LogAdaptiveEscalation(sessionKey, fromLabel, toLabel, clientIP, requestID, rec.ThreatScore())
+			}
+		}
+
 		// block_all enforcement: deny ALL traffic (including clean) when the
 		// session is at an escalation level with block_all=true.
 		if rec != nil && decide.UpgradeAction("", recEscalationLevel(rec), &cfg.AdaptiveEnforcement) == config.ActionBlock {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/session"
@@ -26,6 +27,13 @@ const (
 	testDomainBurst   = "domain_burst"
 	testLevelNormal   = "normal"
 	testLevelElevated = "elevated"
+	testLevelHigh     = "high"
+	testLevelCritical = "critical"
+	testClient        = "test-client"
+
+	// Prometheus metric/label names used across gauge assertions.
+	metricAdaptiveSessions = "pipelock_adaptive_sessions_current"
+	metricLabelLevel       = "level"
 )
 
 func testSessionConfig() *config.SessionProfiling {
@@ -43,7 +51,7 @@ func testSessionConfig() *config.SessionProfiling {
 
 func TestSessionManager_GetOrCreate(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	s1 := sm.GetOrCreate("192.168.1.1")
@@ -65,7 +73,7 @@ func TestSessionManager_GetOrCreate(t *testing.T) {
 func TestSessionManager_DomainBurst(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -94,7 +102,7 @@ func TestSessionManager_DomainBurst(t *testing.T) {
 func TestSessionManager_DomainBurst_RepeatedDomainNoTrigger(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -117,7 +125,7 @@ func TestSessionManager_DomainBurst_WindowExpiry(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
 	cfg.WindowMinutes = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -147,7 +155,7 @@ func TestSessionManager_DomainBurst_WindowExpiry(t *testing.T) {
 func TestSessionManager_MaxSessions(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sm.GetOrCreate("1.1.1.1")
@@ -167,7 +175,7 @@ func TestSessionManager_MaxSessions(t *testing.T) {
 func TestSessionManager_MaxSessions_EvictsOldestIdle(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 2
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	// Create two sessions
@@ -199,7 +207,7 @@ func TestSessionManager_TTLEviction(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.SessionTTLMinutes = 1
 	cfg.CleanupIntervalSeconds = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -220,7 +228,7 @@ func TestSessionManager_TTLEviction(t *testing.T) {
 func TestSessionManager_TTLEviction_ActiveNotEvicted(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.SessionTTLMinutes = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sm.GetOrCreate(testClientIP) // fresh, within TTL
@@ -234,7 +242,7 @@ func TestSessionManager_TTLEviction_ActiveNotEvicted(t *testing.T) {
 
 func TestSessionManager_Concurrent(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	var wg sync.WaitGroup
@@ -256,7 +264,7 @@ func TestSessionManager_Concurrent(t *testing.T) {
 
 func TestSessionManager_Close(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	sm.Close()
 	// Double close should not panic
 	sm.Close()
@@ -264,7 +272,7 @@ func TestSessionManager_Close(t *testing.T) {
 
 func TestSessionState_ThreatScore(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -290,7 +298,7 @@ func TestSessionState_ThreatScore(t *testing.T) {
 
 func TestSessionState_ScoreNeverNegative(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -304,7 +312,7 @@ func TestSessionState_ScoreNeverNegative(t *testing.T) {
 
 func TestSessionState_Escalation(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -343,7 +351,7 @@ func TestSessionState_Escalation(t *testing.T) {
 
 func TestSessionState_EscalationThresholdDoubles(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -369,7 +377,7 @@ func TestSessionState_EscalationThresholdDoubles(t *testing.T) {
 
 func TestSessionState_EscalationSticky(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -395,7 +403,7 @@ func TestSessionState_EscalationSticky(t *testing.T) {
 
 func TestSessionState_EntropyBudgetSignal(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -408,7 +416,7 @@ func TestSessionState_EntropyBudgetSignal(t *testing.T) {
 
 func TestSessionState_FragmentDLPSignal(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -421,7 +429,7 @@ func TestSessionState_FragmentDLPSignal(t *testing.T) {
 
 func TestSessionState_EntropySignals_Escalation(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -453,7 +461,7 @@ func TestSessionState_EntropySignals_Escalation(t *testing.T) {
 
 func TestSessionState_DomainAnomalySignal(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -466,7 +474,7 @@ func TestSessionState_DomainAnomalySignal(t *testing.T) {
 
 func TestSessionState_LastActivity(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -502,12 +510,12 @@ func adaptiveElevatedGaugeValue(t *testing.T, m *metrics.Metrics) float64 {
 		t.Fatalf("gather metrics: %v", err)
 	}
 	for _, fam := range fams {
-		if fam.GetName() != "pipelock_adaptive_sessions_current" {
+		if fam.GetName() != metricAdaptiveSessions {
 			continue
 		}
 		for _, metric := range fam.GetMetric() {
 			for _, lbl := range metric.GetLabel() {
-				if lbl.GetName() == "level" && lbl.GetValue() == testLevelElevated {
+				if lbl.GetName() == metricLabelLevel && lbl.GetValue() == testLevelElevated {
 					return metric.GetGauge().GetValue()
 				}
 			}
@@ -520,7 +528,7 @@ func TestSessionManager_Metrics_EvictOnCapacity(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 2
 	m := metrics.New()
-	sm := NewSessionManager(cfg, m)
+	sm := NewSessionManager(cfg, nil, m)
 	defer sm.Close()
 
 	sm.GetOrCreate("a")
@@ -539,7 +547,7 @@ func TestSessionManager_Metrics_CleanupSetsGauge(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.SessionTTLMinutes = 1
 	m := metrics.New()
-	sm := NewSessionManager(cfg, m)
+	sm := NewSessionManager(cfg, nil, m)
 	defer sm.Close()
 
 	// Create 3 sessions, backdate 2 past TTL
@@ -567,7 +575,7 @@ func TestSessionManager_Metrics_CleanupSetsGauge(t *testing.T) {
 func TestSessionManager_NilMetrics(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sm.GetOrCreate("a")
@@ -579,7 +587,7 @@ func TestSessionManager_NilMetrics(t *testing.T) {
 func TestSessionManager_IPDomainBurst(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	ip := testClientIP
@@ -611,7 +619,7 @@ func TestSessionManager_IPDomainBurst(t *testing.T) {
 func TestSessionManager_IPDomainBurst_HeaderRotation(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	ip := testClientIP
@@ -653,7 +661,7 @@ func TestSessionManager_IPDomainBurst_HeaderRotation(t *testing.T) {
 func TestSessionManager_IPDomainBurst_RepeatedDomainNoTrigger(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	ip := testClientIP
@@ -676,7 +684,7 @@ func TestSessionManager_IPDomainBurst_WindowExpiry(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
 	cfg.WindowMinutes = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	ip := testClientIP
@@ -708,7 +716,7 @@ func TestSessionManager_IPDomainBurst_WindowExpiry(t *testing.T) {
 func TestSessionManager_IPDomainBurst_DifferentIPs(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 3
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	// Two different IPs each access 2 domains: neither should trigger (below 3)
@@ -741,7 +749,7 @@ func TestSessionManager_IPDomainBurst_DifferentIPs(t *testing.T) {
 func TestEscalationLabel_HighLevel(t *testing.T) {
 	// Levels beyond the defined range clamp to the last label ("critical").
 	label := session.EscalationLabel(5)
-	if label != "critical" {
+	if label != testLevelCritical {
 		t.Errorf("expected critical, got %s", label)
 	}
 
@@ -752,7 +760,7 @@ func TestEscalationLabel_HighLevel(t *testing.T) {
 	if got := session.EscalationLabel(1); got != testLevelElevated {
 		t.Errorf("expected elevated, got %s", got)
 	}
-	if got := session.EscalationLabel(2); got != "high" {
+	if got := session.EscalationLabel(2); got != testLevelHigh {
 		t.Errorf("expected high, got %s", got)
 	}
 }
@@ -760,7 +768,7 @@ func TestEscalationLabel_HighLevel(t *testing.T) {
 func TestSessionManager_IPDomainCleanup_PartialExpiry(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.WindowMinutes = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	// Add 2 domains, backdate only 1
@@ -788,7 +796,7 @@ func TestSessionManager_IPDomainCleanup_PartialExpiry(t *testing.T) {
 func TestSessionManager_IPDomainCleanup(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.WindowMinutes = 1
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sm.RecordIPDomain(testClientIP, "a.com", cfg)
@@ -823,7 +831,7 @@ func TestSessionManager_Cleanup_EscalatedGaugeDecrement(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.SessionTTLMinutes = 1
 	m := metrics.New()
-	sm := NewSessionManager(cfg, m)
+	sm := NewSessionManager(cfg, nil, m)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -867,7 +875,7 @@ func TestSessionManager_EvictOldest_EscalatedGaugeDecrement(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 2
 	m := metrics.New()
-	sm := NewSessionManager(cfg, m)
+	sm := NewSessionManager(cfg, nil, m)
 	defer sm.Close()
 
 	// Create and escalate the first session.
@@ -931,7 +939,7 @@ func TestProxy_SessionStore_Disabled(t *testing.T) {
 // session.Store that delegates GetOrCreate to the underlying SessionManager.
 func TestSessionManager_AsStore(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	store := sm.AsStore()
@@ -970,14 +978,14 @@ func TestProxy_SessionStore_Enabled(t *testing.T) {
 
 func TestSessionState_TimeBasedDeescalation(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
 
-	// Escalate to level 1 (threshold 5, +3 block = 3, +3 block = 6 → escalate)
+	// Escalate to level 1 (threshold 5, +3 block = 3, +3 block = 6 -> escalate)
 	sess.RecordSignal(session.SignalBlock, 5.0) // +3, total 3
-	sess.RecordSignal(session.SignalBlock, 5.0) // +3, total 6 → escalate to 1
+	sess.RecordSignal(session.SignalBlock, 5.0) // +3, total 6 -> escalate to 1
 
 	if sess.EscalationLevel() != 1 {
 		t.Fatalf("expected level 1, got %d", sess.EscalationLevel())
@@ -988,10 +996,13 @@ func TestSessionState_TimeBasedDeescalation(t *testing.T) {
 	sess.lastEscalation = time.Now().Add(-maxLevelDuration - time.Second)
 	sess.mu.Unlock()
 
-	// Next signal should trigger de-escalation first, then evaluate.
-	// A near-miss (+1) shouldn't re-escalate (threshold is now 5 after halving from 10).
-	sess.RecordSignal(session.SignalNearMiss, 5.0)
+	// TryAutoRecover is now the sole time-based recovery path.
+	blockAllCheck := func(level int) bool { return level >= 3 }
+	changed, _, _ := sess.TryAutoRecover(blockAllCheck)
 
+	if !changed {
+		t.Fatal("expected TryAutoRecover to de-escalate after max dwell time")
+	}
 	if sess.EscalationLevel() != 0 {
 		t.Errorf("expected de-escalation to level 0 after max dwell time, got %d", sess.EscalationLevel())
 	}
@@ -999,15 +1010,15 @@ func TestSessionState_TimeBasedDeescalation(t *testing.T) {
 
 func TestSessionState_CriticalDeescalation(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
 
 	// Escalate to critical (level 3) by sending many signals.
-	// Use threshold 5.0; each block = +3. After 2 blocks (6 pts) → level 1.
-	// Threshold doubles to 10. 2 more blocks (6 pts, total 12) → level 2.
-	// Threshold doubles to 20. 3 more blocks (9 pts, total 21) → level 3.
+	// Use threshold 5.0; each block = +3. After 2 blocks (6 pts) -> level 1.
+	// Threshold doubles to 10. 2 more blocks (6 pts, total 12) -> level 2.
+	// Threshold doubles to 20. 3 more blocks (9 pts, total 21) -> level 3.
 	for range 7 {
 		sess.RecordSignal(session.SignalBlock, 5.0)
 	}
@@ -1017,14 +1028,18 @@ func TestSessionState_CriticalDeescalation(t *testing.T) {
 		t.Fatalf("expected critical (level 3+), got %d", level)
 	}
 
-	// Simulate time passing — de-escalate one level.
+	// Simulate time passing -- de-escalate one level via TryAutoRecover.
 	sess.mu.Lock()
 	levelBefore := sess.escalationLevel
 	sess.lastEscalation = time.Now().Add(-maxLevelDuration - time.Second)
 	sess.mu.Unlock()
 
-	// Near-miss (+1) should not re-escalate after score reset.
-	sess.RecordSignal(session.SignalNearMiss, 5.0)
+	blockAllCheck := func(lvl int) bool { return lvl >= 3 }
+	changed, _, _ := sess.TryAutoRecover(blockAllCheck)
+
+	if !changed {
+		t.Fatal("expected TryAutoRecover to de-escalate after max dwell time")
+	}
 
 	levelAfter := sess.EscalationLevel()
 	if levelAfter >= levelBefore {
@@ -1032,9 +1047,9 @@ func TestSessionState_CriticalDeescalation(t *testing.T) {
 	}
 }
 
-func TestSessionState_DeescalationViaRecordClean(t *testing.T) {
+func TestSessionState_RecordClean_NoImplicitDeescalation(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -1052,19 +1067,43 @@ func TestSessionState_DeescalationViaRecordClean(t *testing.T) {
 	sess.lastEscalation = time.Now().Add(-maxLevelDuration - time.Second)
 	sess.mu.Unlock()
 
-	// RecordClean (not RecordSignal) should trigger de-escalation.
-	// This is the core death spiral fix: sessions at block_all with only
-	// clean traffic must be able to recover.
+	// RecordClean must NOT de-escalate. Time-based recovery is handled
+	// exclusively by TryAutoRecover (called from on-entry fast paths
+	// and background sweep).
 	sess.RecordClean(0.5)
 
-	if sess.EscalationLevel() >= 3 {
-		t.Errorf("RecordClean should trigger de-escalation from critical, got level %d", sess.EscalationLevel())
+	if sess.EscalationLevel() < 3 {
+		t.Errorf("RecordClean should not implicitly de-escalate; got level %d", sess.EscalationLevel())
+	}
+}
+
+func TestRecordSignal_NoImplicitDeescalation(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+
+	// Push to level 2, set lastEscalation far in the past.
+	sess.mu.Lock()
+	sess.escalationLevel = 2
+	sess.lastEscalation = time.Now().Add(-10 * time.Minute)
+	sess.currentThreshold = 20.0
+	sess.threatScore = 5.0
+	sess.mu.Unlock()
+
+	// RecordSignal should NOT de-escalate anymore. Time-based recovery is
+	// handled exclusively by TryAutoRecover.
+	sess.RecordSignal(session.SignalNearMiss, 5.0)
+
+	if sess.EscalationLevel() < 2 {
+		t.Errorf("RecordSignal should not implicitly de-escalate; got level %d", sess.EscalationLevel())
 	}
 }
 
 func TestSessionState_CriticalNoActivityRefresh(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -1102,7 +1141,7 @@ func TestSessionState_CriticalNoActivityRefresh(t *testing.T) {
 
 func TestSessionState_SubCriticalActivityRefresh(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -1135,7 +1174,7 @@ func TestSessionState_SubCriticalActivityRefresh(t *testing.T) {
 func TestSessionManager_CleanupLoop_DoneStops(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.CleanupIntervalSeconds = 1 // short interval for test speed
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 
 	// Create a session with expired activity.
 	sess := sm.GetOrCreate(testClientIP)
@@ -1156,7 +1195,7 @@ func TestSessionManager_CleanupLoop_RunsCleanup(t *testing.T) {
 	cfg.CleanupIntervalSeconds = 1
 	cfg.SessionTTLMinutes = 0 // immediate expiry
 	m := metrics.New()
-	sm := NewSessionManager(cfg, m)
+	sm := NewSessionManager(cfg, nil, m)
 	defer sm.Close()
 
 	// Create a session that is immediately stale.
@@ -1174,7 +1213,7 @@ func TestSessionManager_CleanupLoop_RunsCleanup(t *testing.T) {
 
 func TestSessionState_SetBlockAll(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -1213,7 +1252,7 @@ func TestSessionManager_IPDomainBurstCooldown(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.DomainBurst = 2
 	cfg.WindowMinutes = 5
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	// First burst: should have score > 0.
@@ -1233,5 +1272,946 @@ func TestSessionManager_IPDomainBurstCooldown(t *testing.T) {
 	}
 	if anomalies2[0].Score != 0 {
 		t.Error("repeat burst in same window should have score 0 (cooldown)")
+	}
+}
+
+// escalateToLevel is a test helper that forces a session to a given
+// escalation level by directly manipulating internal state under lock.
+func escalateToLevel(s *SessionState, level int, lastEsc time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.escalationLevel = level
+	s.lastEscalation = lastEsc
+	s.currentThreshold = 10.0 // arbitrary non-zero threshold
+	s.threatScore = 5.0       // arbitrary mid-range score
+}
+
+func TestSessionState_TryAutoRecover_Expired(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("recover-expired")
+
+	// Place session at level 3, last escalation 6 min ago (beyond 5 min maxLevelDuration).
+	escalateToLevel(sess, 3, time.Now().Add(-6*time.Minute))
+
+	// blockAllCheck returns true for level >= 3, false otherwise.
+	blockAllCheck := func(level int) bool { return level >= 3 }
+
+	changed, from, to := sess.TryAutoRecover(blockAllCheck)
+
+	if !changed {
+		t.Fatal("expected changed=true for expired escalation")
+	}
+	if from != 3 {
+		t.Errorf("expected from=3, got %d", from)
+	}
+	if to != 2 {
+		t.Errorf("expected to=2, got %d", to)
+	}
+	if sess.EscalationLevel() != 2 {
+		t.Errorf("expected escalation level 2, got %d", sess.EscalationLevel())
+	}
+	// Level 2 < 3, so blockAllCheck(2) returns false.
+	if sess.BlockAll() {
+		t.Error("expected atBlockAll=false at level 2")
+	}
+}
+
+func TestSessionState_TryAutoRecover_NotExpired(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("recover-not-expired")
+
+	// Place session at level 3, last escalation only 3 min ago (within 5 min maxLevelDuration).
+	escalateToLevel(sess, 3, time.Now().Add(-3*time.Minute))
+
+	blockAllCheck := func(level int) bool { return level >= 3 }
+
+	changed, _, _ := sess.TryAutoRecover(blockAllCheck)
+
+	if changed {
+		t.Fatal("expected changed=false for non-expired escalation")
+	}
+	if sess.EscalationLevel() != 3 {
+		t.Errorf("expected escalation level still 3, got %d", sess.EscalationLevel())
+	}
+}
+
+func TestSessionState_TryAutoRecover_CustomBlockAllAtLowerLevel(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("recover-custom-blockall")
+
+	// Place session at level 2, last escalation 6 min ago.
+	escalateToLevel(sess, 2, time.Now().Add(-6*time.Minute))
+
+	// Custom config: blockAllCheck returns true for level >= 1.
+	// Even after dropping from 2 to 1, the session is still blocked.
+	blockAllCheck := func(level int) bool { return level >= 1 }
+
+	changed, from, to := sess.TryAutoRecover(blockAllCheck)
+
+	if !changed {
+		t.Fatal("expected changed=true for expired escalation")
+	}
+	if from != 2 {
+		t.Errorf("expected from=2, got %d", from)
+	}
+	if to != 1 {
+		t.Errorf("expected to=1, got %d", to)
+	}
+	// blockAllCheck(1) returns true — session stays blocked at the lower level.
+	if !sess.BlockAll() {
+		t.Error("expected atBlockAll=true at level 1 with custom config")
+	}
+}
+
+func TestSessionState_TryAutoRecover_AtLevelZero(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("recover-level-zero")
+
+	// Level 0 session cannot de-escalate further.
+	blockAllCheck := func(level int) bool { return level >= 3 }
+
+	changed, _, _ := sess.TryAutoRecover(blockAllCheck)
+
+	if changed {
+		t.Fatal("expected changed=false at level 0")
+	}
+	if sess.EscalationLevel() != 0 {
+		t.Errorf("expected escalation level 0, got %d", sess.EscalationLevel())
+	}
+}
+
+func TestSessionState_OnEntryRecovery(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("agent|127.0.0.1")
+
+	// Push to critical with expired timer.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	frozenActivity := sess.lastActivity
+	sess.mu.Unlock()
+
+	blockAllCheck := func(level int) bool { return level >= 3 }
+
+	// Simulate what recordSessionActivity does: TryAutoRecover then RecordRequest.
+	changed, _, _ := sess.TryAutoRecover(blockAllCheck)
+	if !changed {
+		t.Fatal("expected on-entry recovery to fire")
+	}
+
+	// RecordRequest should refresh lastActivity (no longer at block_all).
+	sess.RecordRequest("example.com", cfg)
+
+	sess.mu.Lock()
+	activityRefreshed := sess.lastActivity.After(frozenActivity)
+	sess.mu.Unlock()
+
+	if !activityRefreshed {
+		t.Error("lastActivity should refresh after on-entry recovery clears block_all")
+	}
+}
+
+func TestSessionManager_DeescalationSweep(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+
+	// Push to critical with expired timer.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Call sweep directly (don't wait for ticker).
+	sm.sweepDeescalation()
+
+	if sess.EscalationLevel() != 2 {
+		t.Errorf("expected level 2 after sweep, got %d", sess.EscalationLevel())
+	}
+	if sess.BlockAll() {
+		t.Error("expected atBlockAll=false after de-escalation to high")
+	}
+}
+
+func TestSessionManager_SweepNoAdaptiveConfig(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.mu.Unlock()
+
+	// With nil adaptive config, sweep should be a no-op.
+	sm.sweepDeescalation()
+
+	if sess.EscalationLevel() != 3 {
+		t.Errorf("sweep without adaptive config should not de-escalate; got level %d", sess.EscalationLevel())
+	}
+}
+
+// TestSessionState_FullRecoveryCycle exercises the complete block_all recovery
+// lifecycle: escalate to critical, timer expires, background sweep de-escalates,
+// clean requests flow and decay, re-escalation is possible.
+func TestSessionState_FullRecoveryCycle(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:              true,
+		EscalationThreshold:  5.0,
+		DecayPerCleanRequest: 0.5,
+		Levels: config.EscalationLevels{
+			Elevated: config.EscalationActions{},
+			High:     config.EscalationActions{},
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("test-agent|10.0.0.1")
+
+	// 1. Escalate to critical.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now()
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// 2. Verify blocked.
+	if !sess.BlockAll() {
+		t.Fatal("expected block_all at critical")
+	}
+
+	// 3. Simulate 6 minutes passing (beyond 5 min maxLevelDuration).
+	sess.mu.Lock()
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.mu.Unlock()
+
+	// 4. Background sweep fires.
+	sm.sweepDeescalation()
+
+	// 5. Should be at high (level 2), no longer blocked.
+	if sess.EscalationLevel() != 2 {
+		t.Errorf("expected level 2, got %d", sess.EscalationLevel())
+	}
+	if sess.BlockAll() {
+		t.Error("expected block_all cleared at high")
+	}
+
+	// 6. Clean requests now flow and decay works.
+	sess.RecordClean(0.5)
+	score := sess.ThreatScore()
+	if score >= 20.0 {
+		t.Errorf("expected score to decay below 20, got %.1f", score)
+	}
+
+	// 7. Re-escalation: bad signal pushes score up but stays at high
+	//    because threshold was halved (20.0) and score is below it.
+	escalated, _, _ := sess.RecordSignal(session.SignalBlock, 5.0) // +3 points
+	_ = escalated                                                  // may or may not cross threshold
+	if sess.EscalationLevel() < 2 {
+		t.Error("should not drop below high without more time")
+	}
+}
+
+// TestSessionManager_SweepAfterConfigReload verifies that the background sweep
+// uses the NEW adaptive config after a hot-reload, not the stale original.
+func TestSessionManager_SweepAfterConfigReload(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+
+	// Start with block_all only at critical (default).
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+
+	// Push to critical with expired timer.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Hot-reload: now block_all also applies at high (level 2).
+	newAdaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			High:     config.EscalationActions{BlockAll: &blockAllTrue},
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm.UpdateConfig(cfg, newAdaptiveCfg)
+
+	// Sweep should use NEW config for blockAllCheck.
+	sm.sweepDeescalation()
+
+	// De-escalated from critical to high, but high now also has block_all.
+	if sess.EscalationLevel() != 2 {
+		t.Errorf("expected level 2, got %d", sess.EscalationLevel())
+	}
+	// atBlockAll should STILL be true because high has block_all in new config.
+	if !sess.BlockAll() {
+		t.Error("expected atBlockAll=true at high with updated config")
+	}
+}
+
+func TestSessionManager_ClearBlockAllOnAdaptiveDisable(t *testing.T) {
+	cfg := testSessionConfig()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+	sess.SetBlockAll(true)
+
+	if !sess.BlockAll() {
+		t.Fatal("expected block_all before disable")
+	}
+
+	// Hot-reload with adaptive disabled (nil).
+	sm.UpdateConfig(cfg, nil)
+
+	if sess.BlockAll() {
+		t.Error("expected atBlockAll cleared after adaptive enforcement disabled via nil")
+	}
+
+	// Reset for second variant: Enabled=false.
+	sess.SetBlockAll(true)
+	disabledCfg := &config.AdaptiveEnforcement{Enabled: false}
+	sm.UpdateConfig(cfg, disabledCfg)
+
+	if sess.BlockAll() {
+		t.Error("expected atBlockAll cleared after adaptive enforcement Enabled=false")
+	}
+}
+
+func TestSessionManager_RecomputeBlockAllOnConfigChange(t *testing.T) {
+	cfg := testSessionConfig()
+	blockAllTrue := true
+	// Start with block_all only at critical (level 3+).
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+
+	// Session at level 2 (high) — not block_all in current config.
+	sess.mu.Lock()
+	sess.escalationLevel = 2
+	sess.mu.Unlock()
+	sess.SetBlockAll(false)
+
+	if sess.BlockAll() {
+		t.Fatal("level 2 should not be block_all with initial config")
+	}
+
+	// Hot-reload: now block_all applies at high (level 2) too.
+	newAdaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			High:     config.EscalationActions{BlockAll: &blockAllTrue},
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm.UpdateConfig(cfg, newAdaptiveCfg)
+
+	// atBlockAll should now be true for the level 2 session.
+	if !sess.BlockAll() {
+		t.Error("expected atBlockAll=true at level 2 after config reload added block_all at high")
+	}
+}
+
+func TestSessionState_OnEntryRecovery_EmitsMetrics(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("agent|127.0.0.1")
+
+	// Push to critical with expired timer.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Simulate what recordSessionActivity does: build blockAllCheck, call TryAutoRecover.
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+	changed, from, to := sess.TryAutoRecover(blockAllCheck)
+	if !changed {
+		t.Fatal("expected recovery")
+	}
+
+	// Emit metrics like recordSessionActivity does.
+	fromLabel := session.EscalationLabel(from)
+	toLabel := session.EscalationLabel(to)
+	m.RecordSessionAutoDeescalation(fromLabel, toLabel)
+	m.SetAdaptiveSessionLevel(fromLabel, -1)
+	m.SetAdaptiveSessionLevel(toLabel, 1)
+
+	// Verify metrics were recorded.
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	want := `pipelock_session_auto_deescalation_total{from="` + testLevelCritical + `",to="` + testLevelHigh + `"} 1`
+	if !strings.Contains(text, want) {
+		t.Errorf("expected %q in metrics output", want)
+	}
+}
+
+func TestSessionState_TypeAssertRecovery(t *testing.T) {
+	// This tests the pattern used in websocket.go and intercept.go:
+	// type-assert session.Recorder to *SessionState, then call TryAutoRecover.
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("test-ws-client")
+
+	// Push to critical with expired timer.
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Simulate the pattern: session.Recorder -> type assert -> TryAutoRecover.
+	var rec session.Recorder = sess
+	ss, ok := rec.(*SessionState)
+	if !ok {
+		t.Fatal("SessionState should implement session.Recorder")
+	}
+
+	blockAllCheck := func(level int) bool { return level >= 3 }
+	changed, from, to := ss.TryAutoRecover(blockAllCheck)
+	if !changed {
+		t.Fatal("expected recovery via type assertion")
+	}
+	if from != 3 || to != 2 {
+		t.Errorf("expected 3->2, got %d->%d", from, to)
+	}
+}
+
+func TestSessionManager_RecomputeBlockAllMultipleSessions(t *testing.T) {
+	cfg := testSessionConfig()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, nil)
+	defer sm.Close()
+
+	// Session at level 1 (elevated).
+	sess1 := sm.GetOrCreate("client-1")
+	sess1.mu.Lock()
+	sess1.escalationLevel = 1
+	sess1.mu.Unlock()
+
+	// Session at level 2 (high).
+	sess2 := sm.GetOrCreate("client-2")
+	sess2.mu.Lock()
+	sess2.escalationLevel = 2
+	sess2.mu.Unlock()
+
+	// Session at level 3 (critical).
+	sess3 := sm.GetOrCreate("client-3")
+	sess3.mu.Lock()
+	sess3.escalationLevel = 3
+	sess3.mu.Unlock()
+	sess3.SetBlockAll(true)
+
+	// Reload: block_all now applies at high (level 2) and above.
+	newAdaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			High:     config.EscalationActions{BlockAll: &blockAllTrue},
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm.UpdateConfig(cfg, newAdaptiveCfg)
+
+	if sess1.BlockAll() {
+		t.Error("level 1 should not be block_all")
+	}
+	if !sess2.BlockAll() {
+		t.Error("level 2 should now be block_all")
+	}
+	if !sess3.BlockAll() {
+		t.Error("level 3 should still be block_all")
+	}
+}
+
+// TestSessionManager_SweepMetrics_MultiLevel exercises sweepDeescalation with
+// sessions at multiple escalation levels to cover the from > 0 and to > 0
+// gauge-update guards plus the deescalation counter emission path.
+func TestSessionManager_SweepMetrics_MultiLevel(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	// Session 1: level 3 (critical) -- will recover to 2 (high).
+	s1 := sm.GetOrCreate("client-1")
+	s1.mu.Lock()
+	s1.escalationLevel = 3
+	s1.lastEscalation = time.Now().Add(-6 * time.Minute)
+	s1.currentThreshold = 40.0
+	s1.threatScore = 20.0
+	s1.atBlockAll = true
+	s1.mu.Unlock()
+
+	// Session 2: level 1 (elevated) -- will recover to 0 (normal).
+	s2 := sm.GetOrCreate("client-2")
+	s2.mu.Lock()
+	s2.escalationLevel = 1
+	s2.lastEscalation = time.Now().Add(-6 * time.Minute)
+	s2.currentThreshold = 10.0
+	s2.threatScore = 5.0
+	s2.mu.Unlock()
+
+	sm.sweepDeescalation()
+
+	// Session 1: level 2 (high), gauge updated.
+	if s1.EscalationLevel() != 2 {
+		t.Errorf("s1: expected level 2, got %d", s1.EscalationLevel())
+	}
+
+	// Session 2: level 0 (normal), gauge should NOT increment "normal" (level > 0 guard).
+	if s2.EscalationLevel() != 0 {
+		t.Errorf("s2: expected level 0, got %d", s2.EscalationLevel())
+	}
+
+	// Verify metrics.
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	// Should have critical->high deescalation counter.
+	wantCritToHigh := `pipelock_session_auto_deescalation_total{from="` + testLevelCritical + `",to="` + testLevelHigh + `"} 1`
+	if !strings.Contains(text, wantCritToHigh) {
+		t.Errorf("missing critical->high deescalation counter; want %q in output", wantCritToHigh)
+	}
+	// Should have elevated->normal deescalation counter.
+	wantElevToNorm := `pipelock_session_auto_deescalation_total{from="` + testLevelElevated + `",to="` + testLevelNormal + `"} 1`
+	if !strings.Contains(text, wantElevToNorm) {
+		t.Errorf("missing elevated->normal deescalation counter; want %q in output", wantElevToNorm)
+	}
+}
+
+// TestSessionState_TryAutoRecover_ConfigDerivedCheck verifies the recovery
+// pattern used by proxy.go and websocket.go: build blockAllCheck from the
+// live adaptive config via decide.UpgradeAction, then call TryAutoRecover.
+func TestSessionState_TryAutoRecover_ConfigDerivedCheck(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Build blockAllCheck the same way proxy.go and websocket.go do.
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+
+	changed, from, to := sess.TryAutoRecover(blockAllCheck)
+	if !changed {
+		t.Fatal("expected recovery")
+	}
+	if from != 3 || to != 2 {
+		t.Errorf("expected 3->2, got %d->%d", from, to)
+	}
+	if sess.BlockAll() {
+		t.Error("level 2 should not have block_all in this config")
+	}
+}
+
+// TestSessionManager_SweepNilMetrics verifies that sweepDeescalation with
+// nil metrics does not panic and still de-escalates sessions correctly.
+// This covers the `changed && sm.metrics != nil` guard in sweepDeescalation.
+func TestSessionManager_SweepNilMetrics(t *testing.T) {
+	cfg := testSessionConfig()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	// Pass nil for metrics -- the sweep should still de-escalate without panicking.
+	sm := NewSessionManager(cfg, adaptiveCfg, nil)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate("nil-metrics-client")
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	// Sweep with nil metrics must not panic and must still de-escalate.
+	sm.sweepDeescalation()
+
+	if sess.EscalationLevel() != 2 {
+		t.Errorf("expected level 2 after sweep with nil metrics, got %d", sess.EscalationLevel())
+	}
+	if sess.BlockAll() {
+		t.Error("expected atBlockAll=false after de-escalation from critical to high")
+	}
+}
+
+// TestSessionManager_SweepMetrics_ToZeroSkipsGaugeIncrement verifies that
+// when a session de-escalates to level 0, the sweep emits the deescalation
+// counter but does NOT call SetAdaptiveSessionLevel for the "normal" label
+// (the to > 0 guard prevents incrementing a gauge for un-escalated sessions).
+func TestSessionManager_SweepMetrics_ToZeroSkipsGaugeIncrement(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 5.0,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+	sm := NewSessionManager(cfg, adaptiveCfg, m)
+	defer sm.Close()
+
+	// Single session at level 1 (elevated), will recover to level 0 (normal).
+	sess := sm.GetOrCreate("to-zero-client")
+	sess.mu.Lock()
+	sess.escalationLevel = 1
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 10.0
+	sess.threatScore = 5.0
+	sess.mu.Unlock()
+
+	sm.sweepDeescalation()
+
+	if sess.EscalationLevel() != 0 {
+		t.Errorf("expected level 0, got %d", sess.EscalationLevel())
+	}
+
+	// Deescalation counter should exist for elevated->normal.
+	wantCounter := `pipelock_session_auto_deescalation_total{from="` + testLevelElevated + `",to="` + testLevelNormal + `"} 1`
+	if !scrapeMetric(t, m, wantCounter) {
+		t.Errorf("expected deescalation counter %q", wantCounter)
+	}
+
+	// The "normal" level gauge should NOT have been incremented (to > 0 guard).
+	// Gather raw metrics and check that "normal" label does not appear in
+	// pipelock_adaptive_sessions_current.
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, fam := range fams {
+		if fam.GetName() != metricAdaptiveSessions {
+			continue
+		}
+		for _, metric := range fam.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() == metricLabelLevel && lbl.GetValue() == testLevelNormal && metric.GetGauge().GetValue() > 0 {
+					t.Error("should not increment gauge for normal level (to > 0 guard)")
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// trySessionRecovery helper tests
+// ---------------------------------------------------------------------------
+
+func TestTrySessionRecovery_Success(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+	sm := NewSessionManager(cfg, nil, m)
+	defer sm.Close()
+
+	sess := sm.GetOrCreate(testClient)
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	changed, fromLabel, toLabel := trySessionRecovery(sess, adaptiveCfg, m)
+	if !changed {
+		t.Fatal("expected recovery")
+	}
+	if fromLabel != testLevelCritical || toLabel != testLevelHigh {
+		t.Errorf("expected critical->high, got %s->%s", fromLabel, toLabel)
+	}
+
+	// Verify metrics.
+	wantCounter := `pipelock_session_auto_deescalation_total{from="` + testLevelCritical + `",to="` + testLevelHigh + `"} 1`
+	if !scrapeMetric(t, m, wantCounter) {
+		t.Error("missing deescalation counter")
+	}
+}
+
+func TestTrySessionRecovery_NilAdaptive(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClient)
+
+	changed, _, _ := trySessionRecovery(sess, nil, nil)
+	if changed {
+		t.Error("should be no-op with nil adaptive config")
+	}
+}
+
+func TestTrySessionRecovery_DisabledAdaptive(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClient)
+
+	adaptiveCfg := &config.AdaptiveEnforcement{Enabled: false}
+	changed, _, _ := trySessionRecovery(sess, adaptiveCfg, nil)
+	if changed {
+		t.Error("should be no-op with disabled adaptive")
+	}
+}
+
+func TestTrySessionRecovery_NonSessionState(t *testing.T) {
+	// Pass a session.Recorder that is NOT *SessionState.
+	adaptiveCfg := &config.AdaptiveEnforcement{Enabled: true}
+	var rec session.Recorder // nil interface
+	changed, _, _ := trySessionRecovery(rec, adaptiveCfg, nil)
+	if changed {
+		t.Error("should be no-op with nil recorder")
+	}
+}
+
+func TestTrySessionRecovery_NotExpired(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClient)
+
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-2 * time.Minute) // NOT expired
+	sess.currentThreshold = 40.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	changed, _, _ := trySessionRecovery(sess, adaptiveCfg, nil)
+	if changed {
+		t.Error("should not recover before maxLevelDuration")
+	}
+}
+
+func TestTrySessionRecovery_ToZeroSkipsGauge(t *testing.T) {
+	cfg := testSessionConfig()
+	m := metrics.New()
+	sm := NewSessionManager(cfg, nil, m)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClient)
+
+	sess.mu.Lock()
+	sess.escalationLevel = 1
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 10.0
+	sess.threatScore = 5.0
+	sess.mu.Unlock()
+
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels:  config.EscalationLevels{},
+	}
+
+	changed, fromLabel, toLabel := trySessionRecovery(sess, adaptiveCfg, m)
+	if !changed {
+		t.Fatal("expected recovery")
+	}
+	if fromLabel != testLevelElevated || toLabel != testLevelNormal {
+		t.Errorf("expected elevated->normal, got %s->%s", fromLabel, toLabel)
+	}
+
+	// Verify "normal" gauge was NOT incremented (to > 0 guard).
+	fams, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, fam := range fams {
+		if fam.GetName() != metricAdaptiveSessions {
+			continue
+		}
+		for _, metric := range fam.GetMetric() {
+			for _, lbl := range metric.GetLabel() {
+				if lbl.GetName() == metricLabelLevel && lbl.GetValue() == testLevelNormal && metric.GetGauge().GetValue() > 0 {
+					t.Error("should not increment normal gauge for to-zero recovery")
+				}
+			}
+		}
+	}
+}
+
+func TestTrySessionRecovery_NilMetrics(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClient)
+
+	sess.mu.Lock()
+	sess.escalationLevel = 3
+	sess.lastEscalation = time.Now().Add(-6 * time.Minute)
+	sess.currentThreshold = 40.0
+	sess.threatScore = 20.0
+	sess.atBlockAll = true
+	sess.mu.Unlock()
+
+	blockAllTrue := true
+	adaptiveCfg := &config.AdaptiveEnforcement{
+		Enabled: true,
+		Levels: config.EscalationLevels{
+			Critical: config.EscalationActions{BlockAll: &blockAllTrue},
+		},
+	}
+
+	// Must not panic with nil metrics.
+	changed, fromLabel, toLabel := trySessionRecovery(sess, adaptiveCfg, nil)
+	if !changed {
+		t.Fatal("expected recovery even with nil metrics")
+	}
+	if fromLabel != testLevelCritical || toLabel != testLevelHigh {
+		t.Errorf("expected critical->high, got %s->%s", fromLabel, toLabel)
 	}
 }

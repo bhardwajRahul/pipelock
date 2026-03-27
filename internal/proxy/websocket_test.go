@@ -2478,7 +2478,7 @@ func TestWSRelay_EscalationLevel_NilRecorder(t *testing.T) {
 // delegates to the session recorder when it is non-nil.
 func TestWSRelay_EscalationLevel_NonNilRecorder(t *testing.T) {
 	cfg := testSessionConfig()
-	sm := NewSessionManager(cfg, nil)
+	sm := NewSessionManager(cfg, nil, nil)
 	defer sm.Close()
 
 	sess := sm.GetOrCreate(testClientIP)
@@ -2755,7 +2755,7 @@ func TestWsRelayRecordSignal_AdaptiveDisabled(t *testing.T) {
 		SessionTTLMinutes:      30,
 		CleanupIntervalSeconds: 60,
 	}
-	sm := NewSessionManager(sessCfg, nil)
+	sm := NewSessionManager(sessCfg, nil, nil)
 	defer sm.Close()
 	rec := sm.GetOrCreate("test-key")
 
@@ -2793,7 +2793,7 @@ func TestWsRelayRecordSignal_RecordsSignal(t *testing.T) {
 		SessionTTLMinutes:      30,
 		CleanupIntervalSeconds: 60,
 	}
-	sm := NewSessionManager(sessCfg, nil)
+	sm := NewSessionManager(sessCfg, nil, nil)
 	defer sm.Close()
 	rec := sm.GetOrCreate("agent|10.0.0.1")
 
@@ -2825,7 +2825,7 @@ func TestWsRelayEscalationLevel_WithRecorder(t *testing.T) {
 		SessionTTLMinutes:      30,
 		CleanupIntervalSeconds: 60,
 	}
-	sm := NewSessionManager(sessCfg, nil)
+	sm := NewSessionManager(sessCfg, nil, nil)
 	defer sm.Close()
 	rec := sm.GetOrCreate("test")
 
@@ -2860,7 +2860,7 @@ func TestWsRelayRecordSignal_AnonymousAgent(t *testing.T) {
 		SessionTTLMinutes:      30,
 		CleanupIntervalSeconds: 60,
 	}
-	sm := NewSessionManager(sessCfg, nil)
+	sm := NewSessionManager(sessCfg, nil, nil)
 	defer sm.Close()
 
 	// Anonymous agent: session key should be just the IP, not "agent|IP".

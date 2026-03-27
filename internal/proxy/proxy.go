@@ -192,7 +192,11 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	p.editionPtr.Store(&editionSnapshot{ed})
 
 	if cfg.SessionProfiling.Enabled {
-		p.sessionMgrPtr.Store(NewSessionManager(&cfg.SessionProfiling, m))
+		var adaptiveCfg *config.AdaptiveEnforcement
+		if cfg.AdaptiveEnforcement.Enabled {
+			adaptiveCfg = &cfg.AdaptiveEnforcement
+		}
+		p.sessionMgrPtr.Store(NewSessionManager(&cfg.SessionProfiling, adaptiveCfg, m))
 	}
 
 	p.setupCEE(&cfg.CrossRequestDetection)
@@ -305,10 +309,14 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) {
 	}
 
 	// Toggle session manager lifecycle on config change.
+	var adaptiveCfg *config.AdaptiveEnforcement
+	if cfg.AdaptiveEnforcement.Enabled {
+		adaptiveCfg = &cfg.AdaptiveEnforcement
+	}
 	wasEnabled := oldCfg.SessionProfiling.Enabled
 	isEnabled := cfg.SessionProfiling.Enabled
 	if !wasEnabled && isEnabled {
-		p.sessionMgrPtr.Store(NewSessionManager(&cfg.SessionProfiling, p.metrics))
+		p.sessionMgrPtr.Store(NewSessionManager(&cfg.SessionProfiling, adaptiveCfg, p.metrics))
 	} else if wasEnabled && !isEnabled {
 		if old := p.sessionMgrPtr.Swap(nil); old != nil {
 			old.Close()
@@ -317,7 +325,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) {
 		// Config values changed while profiling stays enabled — update in place
 		// so TTL/capacity thresholds take effect without losing session state.
 		if sm := p.sessionMgrPtr.Load(); sm != nil {
-			sm.UpdateConfig(&cfg.SessionProfiling)
+			sm.UpdateConfig(&cfg.SessionProfiling, adaptiveCfg)
 		}
 	}
 
@@ -549,6 +557,14 @@ func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID strin
 	}
 
 	sess := sm.GetOrCreate(key)
+
+	// On-entry de-escalation: recover sessions stuck at block_all.
+	if changed, fromLabel, toLabel := trySessionRecovery(sess, &cfg.AdaptiveEnforcement, p.metrics); changed {
+		if log != nil {
+			log.LogAdaptiveEscalation(key, fromLabel, toLabel, clientIP, requestID, sess.ThreatScore())
+		}
+	}
+
 	anomalies := sess.RecordRequest(hostname, &cfg.SessionProfiling)
 
 	// IP-level domain tracking: catches header rotation attacks where the
