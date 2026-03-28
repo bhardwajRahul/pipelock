@@ -621,6 +621,7 @@ func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID strin
 // CIDRs before connecting. Prevents DNS rebinding SSRF where an attacker
 // returns a safe IP during scanning but a private IP at connection time.
 // Used by both the HTTP client transport and CONNECT tunnel dialing.
+// Trusted domains (from config.trusted_domains) bypass the internal-IP check.
 func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -628,6 +629,8 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 	}
 
 	// If the host is already an IP, check it and dial directly.
+	// IsTrustedDomain rejects IP literals, so raw IPs are always
+	// subject to SSRF blocking regardless of trusted_domains config.
 	if ip := net.ParseIP(host); ip != nil {
 		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to 4-byte form,
 		// consistent with the DNS resolution path below.
@@ -651,6 +654,7 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 	}
 
 	currentSc := p.scannerPtr.Load()
+	isTrusted := currentSc.IsTrustedDomain(host)
 	for _, ipStr := range ips {
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
@@ -661,6 +665,12 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 			ip = v4
 		}
 		if currentSc.IsInternalIP(ip) {
+			if isTrusted {
+				// Trusted domain resolves to internal IP — allow with
+				// advisory note. The scanner-level checkSSRF handles
+				// the authoritative allow/deny decision and logging.
+				continue
+			}
 			return nil, fmt.Errorf("SSRF blocked: %s resolves to internal IP %s", host, ipStr)
 		}
 	}
