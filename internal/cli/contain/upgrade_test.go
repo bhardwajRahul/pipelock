@@ -70,10 +70,25 @@ func testUpgradeEnv(t *testing.T) *upgradeEnv {
 		chmod:            func(string, os.FileMode) error { return nil },
 		proxyUserName:    defaultProxyUser,
 		pipelockTarget:   target,
+		configPath:       filepath.Join(dir, "pipelock.yaml"),
 		integrityDir:     intDir,
 		integrityPin:     pinPath,
 		serviceName:      "pipelock.service",
+		proxyPort:        defaultProxyPort,
 		readinessTimeout: 2 * time.Second,
+	}
+	if err := writeFileAtomic(env.configPath, []byte("metrics_listen: 127.0.0.1:9091\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A managed host has a service unit, and upgrade now reads it to carry the
+	// containment marker forward. Point at a temp copy rather than the real
+	// /etc/systemd/system path so tests never touch the host.
+	env.unitPath = filepath.Join(dir, "pipelock.service")
+	unit := "[Unit]\nDescription=Pipelock proxy\n\n[Service]\nType=simple\nExecStart=" +
+		env.pipelockTarget + " run --config " + env.configPath + "\n\n[Install]\nWantedBy=multi-user.target\n"
+	if err := writeFileAtomic(env.unitPath, []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	return env
@@ -100,6 +115,96 @@ func successRunCmd(env *upgradeEnv, newBinary []byte) runCommand {
 			return "", 0, nil
 		}
 		return "", 0, nil
+	}
+}
+
+func TestUpgrade_UnsafeManagedConfigRefusesBeforeMutation(t *testing.T) {
+	env := testUpgradeEnv(t)
+	if err := writeFileAtomic(env.configPath, []byte("metrics_listen: 0.0.0.0:9091\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldBinary, err := os.ReadFile(env.pipelockTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPin, err := os.ReadFile(env.integrityPin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return "", 0, nil
+	}
+
+	err = runUpgrade(context.Background(), env, upgradeOpts{})
+	if err == nil {
+		t.Fatal("runUpgrade succeeded with an unsafe managed metrics listener")
+	}
+	if !errors.Is(err, errUpgradeConfig) {
+		t.Fatalf("error = %v, want errUpgradeConfig", err)
+	}
+	if !strings.Contains(err.Error(), "dedicated port") {
+		t.Fatalf("error = %q, want containment metrics remediation", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("unsafe managed config reached a command mutation/check: %v", calls)
+	}
+	gotBinary, err := os.ReadFile(env.pipelockTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBinary, oldBinary) {
+		t.Fatal("unsafe managed config changed the deployed binary")
+	}
+	gotPin, err := os.ReadFile(env.integrityPin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotPin, oldPin) {
+		t.Fatal("unsafe managed config changed the integrity pin")
+	}
+}
+
+func TestUpgrade_PostVerifyRechecksManagedConfig(t *testing.T) {
+	env := testUpgradeEnv(t)
+	newBinary := []byte("new-binary-post-verify-drift")
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name == env.pipelockTarget && len(args) > 0 {
+			switch args[0] {
+			case "check":
+				return "", 0, nil
+			case "update":
+				if err := writeFileAtomic(env.pipelockTarget, newBinary, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return "Updated to v9.9.9", 0, nil
+			case "contain":
+				if err := writeFileAtomic(env.configPath, []byte("metrics_listen: 127.0.0.1:8888\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return "Result: 12 PASS / 0 FAIL / 0 SKIP", 0, nil
+			}
+		}
+		if name == "systemctl" {
+			if len(args) > 0 && args[0] == "is-active" {
+				return "active", 0, nil
+			}
+			return "", 0, nil
+		}
+		return "", 0, nil
+	}
+
+	err := runUpgrade(context.Background(), env, upgradeOpts{})
+	if err == nil {
+		t.Fatal("runUpgrade succeeded after the managed config drifted during upgrade")
+	}
+	if !errors.Is(err, errUpgradeVerify) {
+		t.Fatalf("error = %v, want errUpgradeVerify", err)
+	}
+	if !strings.Contains(err.Error(), "unsafe for containment") {
+		t.Fatalf("error = %q, want post-verify containment config failure", err)
 	}
 }
 
@@ -293,13 +398,16 @@ func TestUpgrade_RepinFails_RollsBackBinaryAndPin(t *testing.T) {
 	newBinary := []byte("new-binary-content")
 	env.runCmd = successRunCmd(env, newBinary)
 
-	// Make hashFile fail to simulate re-pin failure.
+	// Make hashFile fail to simulate re-pin failure. The initial integrity
+	// check and the managed-config preflight each hash the deployed binary
+	// before re-pinning begins.
 	origHash := env.hashFile
-	firstCall := true
+	hashCalls := 0
 	env.hashFile = func(path string) (string, error) {
-		// Allow the pre-execution hash check but fail for repin.
-		if firstCall {
-			firstCall = false
+		hashCalls++
+		// Allow the pre-execution hash check and the before/after hashes that
+		// keep the integrity-pinned config check from executing a changed binary.
+		if hashCalls <= 3 {
 			return origHash(path)
 		}
 		return "", fmt.Errorf("disk I/O error")

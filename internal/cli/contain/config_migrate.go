@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"gopkg.in/yaml.v3"
 )
@@ -83,9 +84,21 @@ func migratePipelockConfigForContain(env *installEnv, configSource string, data 
 	// distinct loopback listener; the containment rules allow only the proxy
 	// port and drop agent-owned traffic to other loopback ports.
 	metricsListen := strings.TrimSpace(scalarValue(mappingValue(mapping, "metrics_listen")))
+	proxyPort := effectiveProxyPort(mapping, env.proxyPort)
 	if metricsListen == "" {
+		// The value we are about to write gets the same check as one the
+		// operator wrote. It is a fixed port, so on a host whose proxy already
+		// runs there the default collides, and inserting it unchecked would
+		// have the installer produce a config its own runtime refuses: metrics
+		// come up disabled and the reason points at a line the operator never
+		// typed.
+		if err := config.ValidateContainmentMetricsListen(containMetricsListen, proxyPort); err != nil {
+			return nil, nil, fmt.Errorf("cannot migrate %s: the default containment metrics listener %s collides with this host's proxy port %d; "+
+				"set metrics_listen to another loopback port, or move fetch_proxy.listen: %w",
+				"metrics_listen", containMetricsListen, proxyPort, err)
+		}
 		setMappingScalar(mapping, "metrics_listen", containMetricsListen)
-	} else if err := validateContainMetricsListen(metricsListen, env.proxyPort); err != nil {
+	} else if err := config.ValidateContainmentMetricsListen(metricsListen, proxyPort); err != nil {
 		return nil, nil, err
 	}
 
@@ -161,10 +174,42 @@ func containServiceReadOnlyPaths(data []byte, proxyPort int) ([]string, error) {
 	if metricsListen == "" {
 		return nil, errors.New("metrics_listen must use a dedicated loopback port; rerun contain install with --config to migrate the managed config safely")
 	}
-	if err := validateContainMetricsListen(metricsListen, proxyPort); err != nil {
+	if err := config.ValidateContainmentMetricsListen(metricsListen, effectiveProxyPort(mapping, proxyPort)); err != nil {
 		return nil, err
 	}
 	return containServiceReadOnlyPathsFromMapping(mapping)
+}
+
+// effectiveProxyPort returns the port the contained agent can actually reach.
+//
+// The caller passes the installer's port, which is the default on almost every
+// host and therefore right almost every time. On a host that configures its own
+// fetch_proxy.listen it is wrong, and wrong in the permissive direction: the
+// check would compare the metrics listener against 8888 while the agent reaches
+// the proxy somewhere else, so a metrics_listen equal to the real proxy port
+// passes here and is refused by the runtime. Reading the port out of the same
+// config being validated keeps every caller agreeing with the runtime.
+//
+// The passed port remains the fallback, because a config that omits
+// fetch_proxy.listen genuinely runs on the installer's port.
+func effectiveProxyPort(mapping *yaml.Node, fallback int) int {
+	fetchProxy := getMappingPath(mapping, []string{"fetch_proxy"})
+	if fetchProxy == nil {
+		return fallback
+	}
+	listen := strings.TrimSpace(scalarValue(mappingValue(fetchProxy, "listen")))
+	if listen == "" {
+		return fallback
+	}
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(port)
+	if err != nil || parsed < 1 || parsed > 65535 {
+		return fallback
+	}
+	return parsed
 }
 
 func containServiceReadOnlyPathsFromMapping(root *yaml.Node) ([]string, error) {
@@ -225,22 +270,6 @@ func isProtectedHomePath(path string) bool {
 		}
 	}
 	return false
-}
-
-func validateContainMetricsListen(listen string, proxyPort int) error {
-	host, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		return fmt.Errorf("metrics_listen %q is unsafe for containment: %w", listen, err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("metrics_listen %q is unsafe for containment: use a numeric loopback address on a dedicated port", listen)
-	}
-	parsedPort, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || parsedPort == 0 || int(parsedPort) == proxyPort {
-		return fmt.Errorf("metrics_listen %q is unsafe for containment: use a port other than the agent-accessible proxy port %d", listen, proxyPort)
-	}
-	return nil
 }
 
 func parseSingleYAMLDocument(data []byte) (*yaml.Node, error) {

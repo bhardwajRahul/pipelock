@@ -16,6 +16,7 @@
 package contain
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/hex"
@@ -33,6 +34,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
 // upgradeOpts collects flag-derived state for the upgrade subcommand.
@@ -69,9 +71,12 @@ type upgradeEnv struct {
 	// Paths.
 	proxyUserName  string
 	pipelockTarget string
+	configPath     string
 	integrityDir   string
 	integrityPin   string
 	serviceName    string
+	unitPath       string
+	proxyPort      int
 
 	// Readiness.
 	readinessTimeout time.Duration
@@ -94,9 +99,12 @@ func defaultUpgradeEnv(out, errOut io.Writer) *upgradeEnv {
 		chmod:            os.Chmod,
 		proxyUserName:    defaultProxyUser,
 		pipelockTarget:   defaultPipelockTarget,
+		configPath:       filepath.Join(defaultConfigDir, "pipelock.yaml"),
 		integrityDir:     defaultIntegrityDir,
 		integrityPin:     defaultIntegrityPin,
 		serviceName:      defaultServiceName,
+		unitPath:         defaultSystemUnitPath,
+		proxyPort:        defaultProxyPort,
 		readinessTimeout: installReadinessTimeout,
 	}
 }
@@ -161,6 +169,7 @@ var (
 	errUpgradeRollback  = errors.New("rollback failed")
 	errUpgradeUpdate    = errors.New("pipelock update failed")
 	errUpgradeIntegrity = errors.New("pre-upgrade integrity check failed")
+	errUpgradeConfig    = errors.New("managed config preflight failed")
 )
 
 func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
@@ -232,6 +241,16 @@ func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
 				"an unreadable pin may indicate tampering)",
 			errUpgradeIntegrity, env.integrityPin, oldPinErr))
 	}
+
+	// The deployed binary was verified against its pin above before this check
+	// executes it. Keep this before backup, replacement, re-pinning, or service
+	// restart so a host whose managed config drifted out of containment posture
+	// stops with its running service untouched.
+	_, _ = fmt.Fprintln(w, "validating containment managed config...")
+	if err := preflightUpgradeManagedConfig(ctx, env); err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("%w: %w", errUpgradeConfig, err))
+	}
+	_, _ = fmt.Fprintln(w, "  managed config accepted")
 
 	// ── Step 3: back up the current binary ──────────────────────────────
 	_, _ = fmt.Fprintln(w, "backing up current binary...")
@@ -318,6 +337,21 @@ func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
 			"%w: %w (rolled back)", errUpgradeRepin, err))
 	}
 	_, _ = fmt.Fprintln(w, "  integrity pin updated")
+
+	// ── Step 5b: carry the containment marker onto an older unit ────────
+	// A unit written before the containment runtime guard existed carries no
+	// marker, so the guard would stay inactive on exactly the hosts this command
+	// is meant to bring current. Upgrade already reloads and restarts, so this is
+	// the one moment the correction costs nothing extra.
+	if err := ensureContainmentMarkerInUnit(env); err != nil {
+		_, _ = fmt.Fprintf(env.errOut, "unit marker update failed: %v\n", err)
+		if rbErr := rollbackAll(); rbErr != nil {
+			return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.Join(
+				fmt.Errorf("%w: %w", errUpgradeConfig, err),
+				fmt.Errorf("%w (backup retained at %s)", rbErr, backupPath)))
+		}
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("%w: %w", errUpgradeConfig, err))
+	}
 
 	// ── Step 6: restart the pipelock service ────────────────────────────
 	_, _ = fmt.Fprintln(w, "restarting pipelock service...")
@@ -479,7 +513,10 @@ func upgradeRestartAndWait(ctx context.Context, env *upgradeEnv) error {
 	}
 }
 
-// upgradePostVerify runs the newly deployed binary's contain verify command.
+// upgradePostVerify runs the newly deployed binary's containment probes and
+// rechecks the managed config. The latter repeats the pre-mutation condition:
+// a concurrent config edit cannot make an otherwise successful binary upgrade
+// bless a host whose metrics surface no longer satisfies containment policy.
 func upgradePostVerify(ctx context.Context, env *upgradeEnv) error {
 	out, code, err := env.runCmd(ctx, env.pipelockTarget, "contain", "verify")
 	if err != nil {
@@ -487,6 +524,142 @@ func upgradePostVerify(ctx context.Context, env *upgradeEnv) error {
 	}
 	if code != 0 {
 		return fmt.Errorf("contain verify exited %d: %s", code, truncateForErr(out))
+	}
+	if err := preflightUpgradeManagedConfig(ctx, env); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureContainmentMarkerInUnit adds the containment marker to a service unit
+// written before the runtime guard existed.
+//
+// Without this the guard protects only hosts installed after the change, which is
+// the failure mode where a release note is true of a fresh install and false of
+// every existing one. It edits a single Environment line rather than regenerating
+// the unit, so an operator's other adjustments to that file survive.
+//
+// A missing unit is an error rather than a skip: this command is upgrading a
+// containment-managed host, and one without a unit is not in the state the rest of
+// the upgrade assumes.
+// unitHasActiveContainmentMarker reports whether the unit already carries the
+// marker somewhere systemd will actually read it.
+//
+// A plain substring search is wrong in the unsafe direction. systemd applies
+// Environment= only inside [Service], so the same text sitting in [Unit], in
+// [Install], or in a comment means nothing at runtime. Treating it as present
+// would skip the insertion and leave the host unguarded while the upgrade
+// reported success, which is the exact failure this migration exists to fix.
+func unitHasActiveContainmentMarker(body, marker string) bool {
+	section := ""
+	for _, raw := range strings.Split(body, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if section == "Service" && line == marker {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureContainmentMarkerInUnit(env *upgradeEnv) error {
+	marker := "Environment=" + config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue
+
+	// This is a root-privileged write to a path under /etc, so refuse anything
+	// that is not a plain file before touching it. A symlink here would
+	// redirect the write to a target of someone else's choosing.
+	if info, err := env.lstat(env.unitPath); err != nil {
+		return fmt.Errorf("inspect service unit %s: %w", env.unitPath, err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("service unit %s is a symlink; refusing privileged write", env.unitPath)
+	} else if !info.Mode().IsRegular() {
+		return fmt.Errorf("service unit %s is not a regular file; refusing privileged write", env.unitPath)
+	}
+
+	current, err := env.readFile(env.unitPath)
+	if err != nil {
+		return fmt.Errorf("read service unit %s: %w", env.unitPath, err)
+	}
+	body := string(current)
+	if unitHasActiveContainmentMarker(body, marker) {
+		return nil
+	}
+
+	lines := strings.Split(body, "\n")
+	inserted := false
+	out := make([]string, 0, len(lines)+1)
+	for _, line := range lines {
+		out = append(out, line)
+		if !inserted && strings.TrimSpace(line) == "[Service]" {
+			out = append(out, marker)
+			inserted = true
+		}
+	}
+	if !inserted {
+		return fmt.Errorf("service unit %s has no [Service] section; refusing to guess where the containment marker belongs", env.unitPath)
+	}
+
+	if err := env.writeFile(env.unitPath, []byte(strings.Join(out, "\n")), modeUnitFile); err != nil {
+		return fmt.Errorf("write service unit %s: %w", env.unitPath, err)
+	}
+	_, _ = fmt.Fprintf(env.out, "  containment marker added to %s\n", env.unitPath)
+	return nil
+}
+
+// preflightUpgradeManagedConfig proves that the managed config remains valid
+// for both the deployed runtime binary and the containment service sandbox.
+// It intentionally runs only after runUpgrade verified the deployed binary's
+// integrity pin, because this invokes that binary as root.
+func preflightUpgradeManagedConfig(ctx context.Context, env *upgradeEnv) error {
+	configPath := filepath.Clean(env.configPath)
+	data, err := env.readFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read managed config %s: %w", configPath, err)
+	}
+	if _, err := containServiceReadOnlyPaths(data, env.proxyPort); err != nil {
+		return fmt.Errorf("validate managed config %s for containment: %w", configPath, err)
+	}
+
+	binaryHashBefore, err := env.hashFile(env.pipelockTarget)
+	if err != nil {
+		return fmt.Errorf("hash deployed binary before config check: %w", err)
+	}
+	out, code, err := env.runCmd(ctx, env.pipelockTarget, "check", "--config", configPath)
+	if err != nil {
+		return fmt.Errorf("run deployed binary config check for %s: %w", configPath, err)
+	}
+	if code != 0 {
+		detail := strings.TrimSpace(out)
+		if detail == "" {
+			detail = fmt.Sprintf("pipelock check exited %d", code)
+		}
+		return fmt.Errorf("deployed binary rejected managed config %s: %s", configPath, oneLine(detail))
+	}
+	binaryHashAfter, err := env.hashFile(env.pipelockTarget)
+	if err != nil {
+		return fmt.Errorf("hash deployed binary after config check: %w", err)
+	}
+	if binaryHashAfter != binaryHashBefore {
+		return errors.New("deployed binary changed during managed config check")
+	}
+	// The config gets the same treatment as the binary above. Two separate
+	// things inspected this file, the containment validator on bytes already in
+	// memory and the deployed binary on the path, so a config that changed in
+	// between would mean neither verdict describes the file the service is
+	// about to load. Comparing the bytes does not make the sequence atomic, but
+	// it turns a silent disagreement into a refusal.
+	dataAfter, err := env.readFile(configPath)
+	if err != nil {
+		return fmt.Errorf("re-read managed config %s after config check: %w", configPath, err)
+	}
+	if !bytes.Equal(dataAfter, data) {
+		return fmt.Errorf("managed config %s changed during its own validation; refusing to upgrade against a config neither check describes", configPath)
 	}
 	return nil
 }

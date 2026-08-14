@@ -98,10 +98,12 @@ type ServerOpts struct {
 type Server struct {
 	opts ServerOpts
 
-	runtimeMode       config.RuntimeMode
-	hasMCPListen      bool
-	apiOnSeparatePort bool
-	hasApprover       bool
+	runtimeMode        config.RuntimeMode
+	hasMCPListen       bool
+	apiOnSeparatePort  bool
+	hasApprover        bool
+	containmentManaged bool
+	metricsDisabled    bool
 
 	cfg          *config.Config
 	bundleResult *rules.LoadResult
@@ -320,8 +322,9 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:         opts,
-		hasMCPListen: hasMCPListen,
+		opts:               opts,
+		hasMCPListen:       hasMCPListen,
+		containmentManaged: containmentManagedRuntime(),
 	}
 	s.mcpListenerBearerToken = mcpAuthToken
 	if cfg.EvidenceProvenance.CommitmentKeyringPath != "" {
@@ -377,6 +380,12 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	logger.SetEmitter(emitter)
 	s.emitter = emitter
 	s.emitSinks = append([]emit.Sink(nil), emitSinks...)
+	if s.containmentManaged {
+		if containmentErr := validateContainmentMetricsConfig(cfg); containmentErr != nil {
+			s.metricsDisabled = true
+			s.reportContainmentMetricsDrift(cfg, "startup", containmentErr)
+		}
+	}
 	emitLicenseExpiryWarning(cfg, logger, sentryClient, opts.Stderr)
 
 	runtimeMode := config.RuntimeForward
@@ -656,6 +665,14 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		})
 		proxyOpts = append(proxyOpts, proxy.WithEnvelopeEmitter(s.envelopeEmitter))
 		_, _ = fmt.Fprintf(opts.Stderr, "  Envelope: enabled (mediation envelopes injected)\n")
+	}
+
+	// A containment refusal has to reach the proxy's own routes too. Skipping
+	// the dedicated listener alone leaves /metrics and /stats served on the
+	// proxy port whenever metrics_listen is empty, which is the address the
+	// contained agent can reach, while startup reports metrics disabled.
+	if s.metricsDisabled {
+		proxyOpts = append(proxyOpts, proxy.WithMetricsSuppressed())
 	}
 
 	p, pErr := proxy.New(cfg, logger, sc, m, proxyOpts...)
