@@ -148,8 +148,29 @@ class WorkflowPackagingTest(unittest.TestCase):
         self.assertIn("openai-api-key", action)
         self.assertIn("PR_REVIEW_MODEL_FAST", action)
         self.assertIn("PR_REVIEW_MODEL_DEEP", action)
-        self.assertIn("cache: pip", action)
-        self.assertIn("cache-dependency-path: ${{ github.action_path }}/requirements.txt", action)
+        # Either cache key breaks setup for this action and stops every review
+        # before it starts, so this asserts against the parsed document rather
+        # than the file's text. Four text-matching versions were each bypassed
+        # a different way: by the comment that named the key, by a quoted
+        # value, by a flow mapping, and by whitespace before the colon. Those
+        # are parser differentials, and the answer to a parser differential is
+        # a parser.
+        #
+        # The import is local and its absence is a hard failure rather than a
+        # skip. The job that runs these tests installs no Python packages, so
+        # PyYAML being present is an assumption; a skip would turn that
+        # assumption into silent lost coverage, which is the whole failure
+        # class here. If this ever goes red on a missing module, that is the
+        # fact worth learning, and it is one dependency line to fix.
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover
+            self.fail("PyYAML is required to verify this action's setup keys")
+        document = yaml.safe_load(action)
+        for step in document["runs"]["steps"]:
+            settings = step.get("with") or {}
+            self.assertNotIn("cache", settings, f"{step.get('name')} must not enable pip caching")
+            self.assertNotIn("cache-dependency-path", settings, f"{step.get('name')} must not set a cache path")
 
 
 class StateMachineTest(unittest.TestCase):
