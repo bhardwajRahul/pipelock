@@ -16,6 +16,7 @@ import sys
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +41,12 @@ DEEP_LLM_TIMEOUT_SECONDS = 720
 # timeout so the run can refuse a call it cannot finish and report partial.
 REVIEW_WALL_CLOCK_SECONDS = 2_100
 DIFF_FETCH_ATTEMPTS = 2
+# A connection failure before the provider returns a response is the one
+# request-error class worth retrying: it costs no completed review result and
+# frequently represents a transient runner-to-provider path failure. Keep the
+# bound literal and small; a second connection failure remains incomplete work,
+# not an invitation to keep spending the review budget.
+MODEL_CONNECTION_ATTEMPTS = 2
 # Bounds the admission scan on a pull request with a very long comment history.
 ADMISSION_COMMENT_PAGES = 10
 # A running marker older than any possible job (10-minute admit plus 45-minute
@@ -86,6 +93,10 @@ class ModelTimeout(ReviewError):
 
 class ModelOutputError(ReviewError):
     """A provider response was not a complete, valid structured result."""
+
+
+class ModelConnectionError(ModelOutputError):
+    """The provider connection failed before either of two attempts completed."""
 
 
 class ProviderConfigurationError(ReviewError):
@@ -536,26 +547,49 @@ def call_model(system: str, user: str, mode: str, phase: str, correlation: str) 
     api_url, api_key = provider_configuration()
     model = model_for_mode(mode)
     timeout = llm_timeout_for(mode)
-    try:
-        response = requests.post(
-            api_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=build_llm_payload(model, system, user, mode),
-            timeout=timeout,
-        )
-    except requests.Timeout as exc:
-        log_phase(phase, status="timeout", correlation=correlation)
-        raise ModelTimeout("provider timed out") from exc
-    except requests.RequestException as exc:
-        log_phase(phase, status="request-error", correlation=correlation)
-        raise ModelOutputError("provider request failed") from exc
-    log_phase(phase, status=response.status_code, correlation=correlation)
-    if response.status_code != 200:
-        raise ModelOutputError(f"provider returned HTTP {response.status_code}")
-    try:
-        return json.loads(_content_from_response(response.json()))
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise ModelOutputError("provider did not return JSON") from exc
+    # This is a correlation key, not an idempotency promise: the direct and
+    # LiteLLM-compatible endpoints do not share a documented deduplication
+    # contract. It stays stable across the one permitted retry so a provider
+    # can trace both attempts if a connection fault needs investigation.
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Client-Request-Id": str(uuid.uuid4()),
+    }
+    payload = build_llm_payload(model, system, user, mode)
+    for attempt in range(1, MODEL_CONNECTION_ATTEMPTS + 1):
+        try:
+            response = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+        except requests.ConnectTimeout as exc:
+            # The only failure that proves the request was never delivered: the
+            # connection itself was never established, so the provider cannot
+            # have seen or billed it. This clause must stay ABOVE Timeout,
+            # which ConnectTimeout also subclasses, or it never runs.
+            log_phase(phase, attempt=attempt, status="connect-timeout", correlation=correlation)
+            if attempt == MODEL_CONNECTION_ATTEMPTS:
+                raise ModelConnectionError("provider connection failed after one retry") from exc
+            continue
+        except requests.Timeout as exc:
+            # Ambiguous: the provider may complete and bill this after the
+            # runner stops waiting, so it is deliberately never retried.
+            log_phase(phase, attempt=attempt, status="timeout", correlation=correlation)
+            raise ModelTimeout("provider timed out") from exc
+        except requests.RequestException as exc:
+            # Everything else, including a connection reset or a protocol
+            # error, can occur after the request reached the provider. None of
+            # them prove non-delivery, and X-Client-Request-Id above is a
+            # correlation key rather than a deduplication contract, so retrying
+            # any of them risks paying for the same review twice.
+            log_phase(phase, attempt=attempt, status="request-error", correlation=correlation)
+            raise ModelOutputError("provider request failed") from exc
+        log_phase(phase, attempt=attempt, status=response.status_code, correlation=correlation)
+        if response.status_code != 200:
+            raise ModelOutputError(f"provider returned HTTP {response.status_code}")
+        try:
+            return json.loads(_content_from_response(response.json()))
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ModelOutputError("provider did not return JSON") from exc
+    raise AssertionError("connection retry loop must return or raise")
 
 
 def _required_string(value: object, field_name: str, *, limit: int) -> str:
@@ -1251,6 +1285,14 @@ def run_review(
                     f"review chunk {chunk_index} timed out and was not retried to avoid a duplicate charge"
                 )
                 continue
+            except ModelConnectionError:
+                # This distinct reason tells the reader that the runner made
+                # the one safe retry, then retained the missing chunk as
+                # incomplete rather than hiding it behind later success.
+                progress.incomplete_reasons.append(
+                    f"review chunk {chunk_index} could not connect after one retry"
+                )
+                continue
             except ModelOutputError:
                 # A provider 500 or malformed response is localized to this
                 # chunk. Later chunks remain independently reviewable; the
@@ -1281,6 +1323,9 @@ def run_review(
             except ModelTimeout:
                 progress.timed_out = True
                 progress.incomplete_reasons.append("cross-file synthesis timed out")
+            except ModelConnectionError:
+                progress.aggregation_failed = True
+                progress.incomplete_reasons.append("cross-file synthesis could not connect after one retry")
             except ModelOutputError:
                 progress.aggregation_failed = True
                 progress.incomplete_reasons.append("cross-file synthesis was incomplete or invalid")
@@ -1306,6 +1351,9 @@ def run_review(
             except ModelTimeout:
                 progress.timed_out = True
                 progress.incomplete_reasons.append("judge pass timed out")
+            except ModelConnectionError:
+                progress.aggregation_failed = True
+                progress.incomplete_reasons.append("judge pass could not connect after one retry")
             except ModelOutputError:
                 progress.aggregation_failed = True
                 progress.incomplete_reasons.append("judge pass was incomplete or invalid")
@@ -1323,6 +1371,22 @@ def run_review(
         except (requests.RequestException, ReviewError):
             log_phase("comment-update", status="failed", correlation=binding.correlation)
             raise ReviewError("final status comment update failed") from None
+
+
+PUBLISHED_REVIEW_STATES = frozenset({"already-running", "clean", "failed", "findings", "partial", "superseded"})
+# A review that reached a verdict over the whole diff. Everything else left
+# something unreviewed, however cleanly it reported that.
+COMPLETE_REVIEW_STATES = frozenset({"clean", "findings"})
+
+
+def exit_code_for_state(state: str) -> int:
+    """Map a published terminal outcome to its runner result.
+
+    The status comment is the review result. A green job means that result was
+    published, including an explicit `failed`, `partial`, or `superseded`
+    verdict; red means setup failed or the runner could not publish a verdict.
+    """
+    return 0 if state in PUBLISHED_REVIEW_STATES else 1
 
 
 def main() -> None:
@@ -1368,7 +1432,15 @@ def main() -> None:
     except (FetchError, ReviewError, requests.RequestException):
         print("pr-review phase=terminal attempt=1 status=failed correlation=pending", file=sys.stderr)
         raise SystemExit(1) from None
-    if state not in {"clean", "findings", "already-running"}:
+    print(f"pr-review phase=terminal attempt=1 status={state} correlation=published")
+    # Published separately from the exit code because these answer different
+    # questions. The exit code says whether the runner worked; this says
+    # whether the review actually covered the diff. Collapsing them is what
+    # made a nine-finding review look like a crashed job, and inverting the
+    # collapse would instead let an incomplete review show an all-green pull
+    # request, which reads as reviewed when it was not.
+    write_action_outputs(state=state, complete="true" if state in COMPLETE_REVIEW_STATES else "false")
+    if exit_code_for_state(state):
         raise SystemExit(1)
 
 
