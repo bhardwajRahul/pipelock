@@ -6,6 +6,7 @@
 
 import importlib.util
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -113,7 +114,10 @@ class WorkflowPackagingTest(unittest.TestCase):
 
         review = workflow["jobs"]["review"]
         self.assertEqual(review["needs"], "admit")
-        self.assertIn("HAS_LITELLM", review["env"])
+        # Exactly the provider-presence flags, stated positively. Asserting
+        # that one removed flag is absent would only catch that one spelling
+        # and would say nothing about a third provider added later.
+        self.assertEqual(set(review["env"]), {"HAS_OPENAI"})
         checkout = review["steps"][0]
         self.assertEqual(checkout["with"]["repository"], "luckyPipewrench/pipelock")
         self.assertEqual(checkout["with"]["ref"], "${{ inputs.reviewer_sha }}")
@@ -133,7 +137,28 @@ class WorkflowPackagingTest(unittest.TestCase):
         completeness = workflow["jobs"]["completeness"]
         self.assertEqual(completeness["needs"], ["admit", "review"])
         self.assertIn("always()", completeness["if"])
-        self.assertEqual(review["outputs"]["complete"].count("outputs.complete"), 3)
+        # Every step that can run a review must feed both outputs. A hard-coded
+        # count went stale the moment a provider was removed, and a count is the
+        # wrong assertion anyway: it cannot tell which step was dropped. Derive
+        # the expected identifiers from the steps themselves, so adding or
+        # removing a provider without wiring its outputs fails here.
+        provider_ids = {
+            step["id"]
+            for step in review["steps"]
+            if step.get("id") and str(step.get("uses", "")).endswith("/actions/pr-review")
+        }
+        self.assertTrue(provider_ids, "the review job must run the review action")
+        for output in ("state", "complete"):
+            referenced = {
+                identifier
+                for identifier in provider_ids
+                if f"steps.{identifier}.outputs.{output}" in review["outputs"][output]
+            }
+            self.assertEqual(
+                referenced,
+                provider_ids,
+                f"every provider step must contribute to the {output} output",
+            )
         for step in review["steps"]:
             self.assertNotIn("secrets.", step.get("if", ""))
 
@@ -183,7 +208,7 @@ class WorkflowPackagingTest(unittest.TestCase):
         action = load_yaml(ACTION_YAML)
         self.assertTrue((ACTION_DIR / "requirements.txt").is_file())
         self.assertEqual(action["inputs"]["operation"]["default"], "review")
-        for name in ("status-comment-id", "operation", "litellm-api-key", "openai-api-key", "model-fast", "model-deep"):
+        for name in ("status-comment-id", "operation", "openai-api-key", "model-fast", "model-deep"):
             self.assertIn(name, action["inputs"])
         # Either cache key breaks setup for this action and stops every review
         # before it starts, so this asserts against the parsed document rather
@@ -998,6 +1023,367 @@ class StatusPresentationTest(unittest.TestCase):
         self.assertNotIn("**Binding:**", lead)
         self.assertNotIn("**Review identity:**", lead)
         self.assertIn("<summary>Review details: binding and planned review</summary>", status)
+
+
+class DeletionFidelityTest(unittest.TestCase):
+    """Deleting code is a change, and deep mode is the pass that must see it."""
+
+    @staticmethod
+    def diff_with_deletions(count: int) -> str:
+        removed = "\n".join(f"-old line {index}" for index in range(count))
+        return (
+            "diff --git a/internal/guard.go b/internal/guard.go\n"
+            "--- a/internal/guard.go\n"
+            "+++ b/internal/guard.go\n"
+            f"@@ -1,{count} +1,1 @@\n"
+            f"{removed}\n"
+            "+replacement\n"
+        )
+
+    def test_deep_mode_reads_every_deleted_line(self) -> None:
+        # Removing a guard reads as a deletion hunk, so summarizing deletions
+        # in the mode asked for full fidelity can hide the change that matters
+        # most on a security product.
+        count = pr_review.MAX_DELETION_LINES_PER_HUNK * 3
+        units, errors = pr_review.parse_diff(self.diff_with_deletions(count), "deep")
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(item.collapsed_deletions for item in units), 0)
+        for index in range(count):
+            self.assertIn(f"-old line {index}", units[0].body)
+
+    def test_deep_mode_splits_an_oversized_deletion_hunk_without_omission(self) -> None:
+        # The prior version collapsed this hunk before it reached the deep
+        # planner. Leaving it whole made it exceed that planner's per-chunk
+        # input budget and therefore omitted the entire deletion. Split it
+        # into bounded contiguous units instead: no deleted line is hidden or
+        # dropped, but each provider call remains within its budget.
+        count = 16_000
+        units, errors = pr_review.parse_diff(self.diff_with_deletions(count), "deep")
+        chunks, omitted = pr_review.plan_chunks(units, "deep")
+        deleted_lines = [
+            line
+            for unit in units
+            for line in unit.body.splitlines()
+            if line.startswith("-old line ")
+        ]
+        self.assertEqual(errors, [])
+        self.assertGreater(len(units), 1)
+        self.assertTrue(all(unit.estimated_tokens <= pr_review.DEEP_INPUT_TOKEN_BUDGET for unit in units))
+        self.assertEqual(sum(len(chunk) for chunk in chunks), len(units))
+        self.assertEqual(omitted, [])
+        self.assertEqual(deleted_lines, [f"-old line {index}" for index in range(count)])
+        # Every piece must still be a readable diff. Emitting a continuation
+        # without the hunk header hands the model file headers and a bare run
+        # of changed lines, which is not a diff and carries no line context.
+        for unit in units:
+            body = unit.body.splitlines()
+            self.assertIn(unit.hunk_header, body)
+            self.assertTrue(
+                body.index(unit.hunk_header) < len(body) - 1,
+                "a unit must carry changed lines after its hunk header",
+            )
+
+    def test_no_newline_marker_never_separates_from_its_line(self) -> None:
+        # The marker describes the line immediately before it. A boundary
+        # falling between the two states the opposite of the truth twice: the
+        # first piece then claims the file ended with a newline, and the next
+        # opens with a marker for a line the reviewer cannot see. Deep mode
+        # exists to address exact lines, so this is the one corruption the
+        # split must not introduce.
+        marker = pr_review.NO_NEWLINE_MARKER
+        header = ["--- a/f.go", "+++ b/f.go"]
+
+        # Sweep line counts so a boundary lands on the marker for at least one
+        # of them rather than depending on one hand-computed offset.
+        for count in range(6, 40):
+            content = []
+            for index in range(count):
+                content.append(f"-old line {index}")
+                content.append(marker)
+            hunk = [f"@@ -1,{count} +1,1 @@", *content]
+
+            with mock.patch.object(pr_review, "DEEP_INPUT_TOKEN_BUDGET", 24):
+                pieces = pr_review._split_oversized_deep_hunk(header, hunk)
+
+            self.assertGreater(len(pieces), 1, f"count={count} did not split")
+            for piece in pieces:
+                body = piece[1:]
+                self.assertNotEqual(
+                    body[0], marker, f"count={count}: a piece opens with an orphan marker"
+                )
+                for position, line in enumerate(body):
+                    if line == marker:
+                        self.assertNotEqual(
+                            body[position - 1],
+                            marker,
+                            f"count={count}: marker lost the line it annotates",
+                        )
+            # No line may be dropped by the grouping.
+            emitted = [line for piece in pieces for line in piece[1:]]
+            self.assertEqual(emitted, content, f"count={count}: split altered the hunk")
+
+    def test_split_pieces_carry_their_own_accurate_hunk_header(self) -> None:
+        # Every piece used to repeat the original @@ header, so a continuation
+        # starting thousands of lines in still announced the hunk's first line.
+        # The reviewer anchors findings to that header, so deep mode reported
+        # real findings against the wrong lines: the split exists to preserve
+        # line-addressed output and was quietly corrupting it.
+        count = 16_000
+        units, errors = pr_review.parse_diff(self.diff_with_deletions(count), "deep")
+        self.assertEqual(errors, [])
+        self.assertGreater(len(units), 1)
+
+        headers = [unit.hunk_header for unit in units]
+        self.assertEqual(len(headers), len(set(headers)), "pieces repeated one header")
+
+        old_cursor = 1
+        new_cursor = 1
+        for unit in units:
+            match = pr_review.HUNK_HEADER_RE.match(unit.hunk_header)
+            self.assertIsNotNone(match, f"unparseable piece header {unit.hunk_header!r}")
+            old_start, old_count = int(match.group(1)), int(match.group(2))
+            new_start, new_count = int(match.group(3)), int(match.group(4))
+
+            # A piece must start where the previous one ended on both sides.
+            self.assertEqual(old_start, old_cursor, f"old start drifted at {unit.hunk_header!r}")
+            self.assertEqual(new_start, new_cursor, f"new start drifted at {unit.hunk_header!r}")
+
+            # And its declared counts must match the lines it actually carries.
+            body = unit.body.splitlines()
+            piece = body[body.index(unit.hunk_header) + 1 :]
+            actual_old = sum(1 for line in piece if not line or line.startswith(("-", " ")))
+            actual_new = sum(1 for line in piece if not line or line.startswith(("+", " ")))
+            self.assertEqual(old_count, actual_old, f"old count wrong in {unit.hunk_header!r}")
+            self.assertEqual(new_count, actual_new, f"new count wrong in {unit.hunk_header!r}")
+
+            old_cursor += actual_old
+            new_cursor += actual_new
+
+        # The pieces together must still describe the whole original hunk.
+        self.assertEqual(old_cursor - 1, count)
+        self.assertEqual(new_cursor - 1, 1)
+
+    def test_default_mode_still_collapses_and_discloses(self) -> None:
+        count = pr_review.MAX_DELETION_LINES_PER_HUNK * 3
+        units, _ = pr_review.parse_diff(self.diff_with_deletions(count), "default")
+        collapsed = sum(item.collapsed_deletions for item in units)
+        self.assertGreater(collapsed, 0)
+        self.assertIn("deletion lines collapsed", units[0].body)
+        self.assertEqual(units[0].manifest()["collapsed_deletions"], collapsed)
+
+    def test_a_collapsed_hunk_is_not_a_coverage_gap(self) -> None:
+        # An observed review read 321 of 321 units, omitted nothing, and still
+        # reported partial behind a failing check because six hunks were
+        # collapsed. A check that fails on complete reviews gets ignored, and
+        # then it protects nothing when a review really is short.
+        #
+        # This asserts the decision, not its consequence. Asserting that
+        # derive_state returns clean for a hand-built progress cannot catch
+        # this: the defect was in what the caller recorded, so a version that
+        # recorded the collapse again still passed that assertion.
+        units, _ = pr_review.parse_diff(
+            self.diff_with_deletions(pr_review.MAX_DELETION_LINES_PER_HUNK * 3), "default"
+        )
+        self.assertGreater(sum(item.collapsed_deletions for item in units), 0)
+        self.assertEqual(pr_review.coverage_gaps(units, [], []), [])
+
+    def test_a_genuinely_omitted_unit_is_a_coverage_gap(self) -> None:
+        units, _ = pr_review.parse_diff(self.diff_with_deletions(2), "deep")
+        gaps = pr_review.coverage_gaps(units, [units[0]], [])
+        self.assertEqual(gaps, ["one or more units were omitted or unrepresentable"])
+
+    def test_a_parse_error_is_carried_through_as_a_gap(self) -> None:
+        units, _ = pr_review.parse_diff(self.diff_with_deletions(2), "deep")
+        self.assertEqual(pr_review.coverage_gaps(units, [], ["diff has no file headers"]),
+                         ["diff has no file headers"])
+
+    def test_an_omitted_unit_still_reports_partial(self) -> None:
+        progress = pr_review.ReviewProgress()
+        progress.expected_units = 4
+        progress.reviewed_units = 3
+        self.assertEqual(pr_review.derive_state(progress), "partial")
+
+
+class SingleProviderTest(unittest.TestCase):
+    def test_openai_credential_selects_the_only_provider(self) -> None:
+        with mock.patch.dict(pr_review.os.environ, {"OPENAI_API_KEY": "key"}, clear=True):
+            endpoint, key = pr_review.provider_configuration()
+        self.assertEqual(endpoint, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(key, "key")
+
+    def test_no_environment_value_can_redirect_the_provider_call(self) -> None:
+        # The endpoint is a constant, not something the environment supplies.
+        # This is the property worth holding: a review carries the repository's
+        # diff and a credential, so anything able to name the destination could
+        # send both somewhere else. Stated generally rather than against one
+        # variable, since the risk is any endpoint-shaped value on the runner,
+        # not the particular one a removed provider branch happened to read.
+        environment = {"OPENAI_API_KEY": "key"}
+        for name in (
+            "API_BASE", "API_BASE_URL", "BASE_URL", "OPENAI_API_BASE",
+            "OPENAI_BASE_URL", "PROVIDER_BASE_URL", "PR_REVIEW_API_BASE",
+        ):
+            environment[name] = "https://attacker.vendor.example/v1"
+        with mock.patch.dict(pr_review.os.environ, environment, clear=True):
+            endpoint, key = pr_review.provider_configuration()
+        self.assertEqual(endpoint, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(key, "key")
+
+    def test_no_credential_is_a_configuration_failure(self) -> None:
+        with mock.patch.dict(pr_review.os.environ, {}, clear=True):
+            with self.assertRaises(pr_review.ProviderConfigurationError):
+                pr_review.provider_configuration()
+
+    def test_every_secret_the_guide_requires_is_one_the_workflow_accepts(self) -> None:
+        # Setup instructions are the first thing an adopter follows, and a
+        # secret named there that the workflow never declares is a step that
+        # silently accomplishes nothing. Checked against the declared secrets
+        # rather than against any particular name, so it holds for a provider
+        # added or removed later and not only for one already gone.
+        guide = (ROOT / "docs" / "guides" / "pr-review.md").read_text(encoding="utf-8")
+        marker = "### Required GitHub Secret"
+        self.assertIn(marker, guide, "the guide must tell an adopter which secrets to set")
+        # Stop at the next heading of any level. Running to the next top-level
+        # heading swept in the optional-variables section, and a repository
+        # variable is not a secret: reporting one as an undeclared secret is a
+        # false alarm on correct documentation, which is how a check like this
+        # gets deleted rather than fixed.
+        section = re.split(r"\n#{2,}\s", guide.split(marker, 1)[1], maxsplit=1)[0]
+        advertised = {
+            name.strip("`")
+            for name in re.findall(r"`[A-Z][A-Z0-9_]{3,}`", section)
+        }
+        self.assertTrue(advertised, "the secrets section must name at least one secret")
+
+        declared = {name.upper() for name in load_yaml(REUSABLE_WORKFLOW)["on"]["workflow_call"]["secrets"]}
+        # GITHUB_TOKEN is supplied by Actions itself and mapped by the caller
+        # as review_token, so it is legitimately named without being declared.
+        self.assertEqual(
+            advertised - declared - {"GITHUB_TOKEN"},
+            set(),
+            "the guide names a secret the reusable workflow does not accept",
+        )
+
+
+class AdoptionStubTest(unittest.TestCase):
+    """The stub in the guide is what other repositories copy, so it is code.
+
+    Six repositories each grew their own copy of this reviewer and drifted
+    apart, which is what made the command work in one repository and not the
+    next. Replacing the copies with a shared caller only holds if the
+    instructions for writing that caller cannot fall behind the caller this
+    repository actually runs. Prose cannot be relied on for that, so the
+    published stub is compared against the real caller here.
+    """
+
+    # A caller outside this repository must name the reviewer by immutable
+    # commit, where a same-repository call resolves it implicitly. Those two
+    # keys are expected to differ; nothing else is.
+    EXPECTED_DIFFERENCES = frozenset({"uses", "reviewer_sha"})
+    PLACEHOLDER_LOGIN = "YOUR_GITHUB_LOGIN"
+    REAL_LOGIN = "luckyPipewrench"
+
+    def documented_stub(self) -> dict[str, object]:
+        guide = (ROOT / "docs" / "guides" / "pr-review.md").read_text(encoding="utf-8")
+        marker = "## Reusing the reviewer in another repository"
+        self.assertIn(marker, guide, "the adoption section is what other repositories copy")
+        section = guide.split(marker, 1)[1]
+        blocks = section.split("```yaml")
+        self.assertGreater(len(blocks), 1, "the adoption section must publish a YAML stub")
+        body = blocks[1].split("```", 1)[0]
+        # The stub is written for another repository, so it carries a
+        # placeholder where this repository carries its own login.
+        self.assertIn(self.PLACEHOLDER_LOGIN, body, "the stub must not hard-code one account")
+        return parse_yaml(body.replace(self.PLACEHOLDER_LOGIN, self.REAL_LOGIN))
+
+    @staticmethod
+    def collapse(value: object) -> object:
+        """Compare meaning, not line breaks, since YAML folding is free."""
+        if isinstance(value, str):
+            return " ".join(value.split())
+        if isinstance(value, list):
+            return [AdoptionStubTest.collapse(item) for item in value]
+        if isinstance(value, dict):
+            return {key: AdoptionStubTest.collapse(item) for key, item in value.items()}
+        return value
+
+    @staticmethod
+    def triggers(document: dict[str, object]) -> object:
+        """Compare what a trigger accepts, not how it describes itself.
+
+        An input's description is text shown to whoever runs the dispatch. It
+        carries no behavior, and requiring two copies of it to match word for
+        word would fail on an improved wording. A guard that fails on
+        harmless edits gets removed, so this compares the contract instead:
+        which inputs exist, whether each is required, its type, its default
+        and its permitted values.
+        """
+        events = AdoptionStubTest.collapse(document.get("on"))
+        dispatch = events.get("workflow_dispatch") if isinstance(events, dict) else None
+        if isinstance(dispatch, dict) and isinstance(dispatch.get("inputs"), dict):
+            dispatch["inputs"] = {
+                name: {key: value for key, value in spec.items() if key != "description"}
+                for name, spec in dispatch["inputs"].items()
+            }
+        return events
+
+    def test_documented_stub_matches_the_caller_this_repository_runs(self) -> None:
+        stub = self.documented_stub()
+        real = load_yaml(CALLER_WORKFLOW)
+
+        self.assertEqual(
+            self.triggers(stub),
+            self.triggers(real),
+            "the stub must offer the same triggers, including the manual dispatch that "
+            "makes a change to a caller testable before it merges",
+        )
+        self.assertEqual(
+            stub.get("permissions"),
+            real.get("permissions"),
+            "a called workflow cannot hold a permission its caller withheld, so a stub "
+            "granting less silently strips it from the reviewer",
+        )
+
+        stub_job = stub["jobs"]["review"]
+        real_job = real["jobs"]["review"]
+        self.assertEqual(
+            self.collapse(stub_job.get("if")),
+            self.collapse(real_job.get("if")),
+            "the stub must authorize exactly who the real caller authorizes",
+        )
+        self.assertEqual(
+            stub_job.get("secrets"),
+            real_job.get("secrets"),
+            "every secret is mapped by name because personal accounts cannot inherit them",
+        )
+
+        stub_with = self.collapse(stub_job.get("with"))
+        real_with = self.collapse(real_job.get("with"))
+        self.assertEqual(
+            set(stub_with), set(real_with), "the stub must pass the same inputs"
+        )
+        differing = {key for key in stub_with if stub_with[key] != real_with[key]}
+        self.assertEqual(
+            differing,
+            self.EXPECTED_DIFFERENCES & set(stub_with),
+            "only the reviewer pin may differ between an external stub and this caller",
+        )
+
+    def test_stub_pins_the_reviewer_by_commit_in_both_positions(self) -> None:
+        stub = self.documented_stub()
+        job = stub["jobs"]["review"]
+        placeholder = "PINNED_PIPELOCK_REVIEW_COMMIT_SHA"
+        uses = job["uses"]
+        self.assertTrue(
+            uses.endswith("@" + placeholder),
+            "the stub must be pinned by commit; a branch or tag can move the reviewer "
+            "code under the pin",
+        )
+        self.assertEqual(
+            job["with"]["reviewer_sha"],
+            placeholder,
+            "the workflow and the reviewer it checks out must be pinned to one commit",
+        )
 
 
 if __name__ == "__main__":

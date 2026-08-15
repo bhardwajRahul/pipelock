@@ -75,6 +75,9 @@ MAX_JUDGE_CONTEXT_FETCHES = 20
 MAX_DELETION_LINES_PER_HUNK = 24
 MAX_RENDERED_MANIFEST_ENTRIES = 8
 REPO_PATTERN = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+# @@ -old_start,old_count +new_start,new_count @@ optional section heading.
+# Counts are optional in unified diff when they are 1.
+HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 RUBRIC_VERSION = "2026-08-14.1"
 STATUS_MARKER = "pr-review-status:v1"
 
@@ -262,7 +265,20 @@ def _path_from_file_block(lines: list[str]) -> str | None:
     return None
 
 
-def _collapse_deletions(lines: list[str]) -> tuple[list[str], int]:
+def _collapse_deletions(lines: list[str], mode: str) -> tuple[list[str], int]:
+    """Summarize the middle of a large deletion hunk, except in deep mode.
+
+    Removing code is a real change, and on a security product it is often the
+    change that matters most: deleting a guard reads as a deletion hunk. A deep
+    review is the one asked to see everything, and it has the budget to, so it
+    reads deletions in full.
+
+    A default review still collapses them, because it is the cheap pass and
+    additions carry most of what it is looking for. That is disclosed on the
+    review rather than treated as a gap in coverage.
+    """
+    if mode == "deep":
+        return lines, 0
     deletion_indexes = [
         index
         for index, line in enumerate(lines)
@@ -285,7 +301,113 @@ def _collapse_deletions(lines: list[str]) -> tuple[list[str], int]:
     return result, collapsed
 
 
-def parse_diff(diff: str) -> tuple[list[DiffUnit], list[str]]:
+def _split_oversized_deep_hunk(header: list[str], hunk: list[str]) -> list[list[str]]:
+    """Bound a deep-review hunk without dropping or summarizing its lines.
+
+    A deep review keeps deletion hunks intact. A sufficiently large deletion
+    hunk can therefore exceed the per-call input budget, which made the chunk
+    planner omit the entire hunk. Repeat the file and hunk headers around
+    bounded contiguous pieces so every changed line remains available to the
+    reviewer. A single oversized line is deliberately left whole: splitting a
+    source line would alter the diff's meaning, so the normal omission path can
+    report that it could not be reviewed.
+    """
+    prefix = header + hunk[:1]
+    content = hunk[1:]
+    if estimate_tokens("\n".join(prefix + content)) <= DEEP_INPUT_TOKEN_BUDGET:
+        return [hunk]
+
+    # Track the joined length instead of rebuilding the candidate string each
+    # time. estimate_tokens is ceil(len / 4), so the length is enough and the
+    # loop stays linear. Re-joining made it quadratic in characters, which on a
+    # 16,000-line deletion is around a billion characters copied per piece.
+    prefix_length = _joined_length(prefix)
+    old_cursor, new_cursor = _hunk_start_offsets(hunk[0])
+
+    parts: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+    for record in _atomic_records(content):
+        record_length = _joined_length(record) + 1
+        candidate_length = prefix_length + current_length + record_length
+        if current and math.ceil(candidate_length / 4) > DEEP_INPUT_TOKEN_BUDGET:
+            piece, old_cursor, new_cursor = _emit_piece(hunk[0], old_cursor, new_cursor, current)
+            parts.append(piece)
+            current = list(record)
+            current_length = record_length
+            continue
+        current.extend(record)
+        current_length += record_length
+    if current:
+        piece, old_cursor, new_cursor = _emit_piece(hunk[0], old_cursor, new_cursor, current)
+        parts.append(piece)
+    return parts or [hunk]
+
+
+NO_NEWLINE_MARKER = r"\ No newline at end of file"
+
+
+def _atomic_records(content: list[str]) -> list[list[str]]:
+    """Group diff lines that cannot be separated without changing meaning.
+
+    A "\\ No newline at end of file" marker describes the line immediately
+    before it. Packing them independently lets a boundary fall between the two,
+    which states the opposite of the truth twice over: the piece that keeps the
+    line now claims the file ended with a newline, and the next piece opens with
+    a marker describing a line the reviewer cannot see. Deep mode exists to
+    report findings against exact lines, so a silently altered line is the one
+    corruption it must not introduce.
+    """
+    records: list[list[str]] = []
+    for line in content:
+        if line == NO_NEWLINE_MARKER and records:
+            records[-1].append(line)
+            continue
+        records.append([line])
+    return records
+
+
+def _joined_length(lines: list[str]) -> int:
+    """Length of "\\n".join(lines), computed without building the string."""
+    if not lines:
+        return 0
+    return sum(len(line) for line in lines) + len(lines) - 1
+
+
+def _hunk_start_offsets(hunk_header: str) -> tuple[int, int]:
+    """Old-side and new-side starting line numbers from an @@ header."""
+    match = HUNK_HEADER_RE.match(hunk_header)
+    if not match:
+        return 1, 1
+    return int(match.group(1)), int(match.group(3))
+
+
+def _side_line_counts(lines: list[str]) -> tuple[int, int]:
+    """How many lines a piece occupies on the old side and the new side."""
+    old = sum(1 for line in lines if not line or line.startswith(("-", " ")))
+    new = sum(1 for line in lines if not line or line.startswith(("+", " ")))
+    return old, new
+
+
+def _emit_piece(
+    original_header: str, old_start: int, new_start: int, lines: list[str]
+) -> tuple[list[str], int, int]:
+    """Give a piece its own accurate @@ header and advance the cursors.
+
+    Every piece previously repeated the original hunk header, so a continuation
+    starting thousands of lines into a file still announced the whole hunk's
+    starting line. The reviewer anchors findings to that header, so deep mode
+    reported real findings against the wrong lines: the split was added to
+    preserve line-addressed output and was silently corrupting it.
+    """
+    old_count, new_count = _side_line_counts(lines)
+    match = HUNK_HEADER_RE.match(original_header)
+    suffix = match.group(5) if match else ""
+    piece_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}"
+    return [piece_header] + lines, old_start + old_count, new_start + new_count
+
+
+def parse_diff(diff: str, mode: str = "default") -> tuple[list[DiffUnit], list[str]]:
     """Split an exact-commit unified diff into hunk-addressable review units."""
     lines = diff.splitlines()
     starts = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
@@ -330,21 +452,27 @@ def parse_diff(diff: str) -> tuple[list[DiffUnit], list[str]]:
         for hunk_number, hunk_start in enumerate(hunk_starts):
             hunk_end = hunk_starts[hunk_number + 1] if hunk_number + 1 < len(hunk_starts) else len(block)
             hunk = block[hunk_start:hunk_end]
-            collapsed_hunk, collapsed = _collapse_deletions(hunk)
-            body = "\n".join(header + collapsed_hunk)
-            additions = sum(1 for line in hunk if line.startswith("+") and not line.startswith("+++"))
-            units.append(
-                DiffUnit(
-                    identifier=len(units) + 1,
-                    path=path,
-                    hunk_header=hunk[0],
-                    body=body,
-                    category=category,
-                    additions=additions,
-                    estimated_tokens=estimate_tokens(body),
-                    collapsed_deletions=collapsed,
+            review_hunks = _split_oversized_deep_hunk(header, hunk) if mode == "deep" else [hunk]
+            for review_hunk in review_hunks:
+                collapsed_hunk, collapsed = _collapse_deletions(review_hunk, mode)
+                body = "\n".join(header + collapsed_hunk)
+                additions = sum(1 for line in review_hunk if line.startswith("+") and not line.startswith("+++"))
+                units.append(
+                    DiffUnit(
+                        identifier=len(units) + 1,
+                        path=path,
+                        # The piece's own header, not the original hunk's. A
+                        # split piece carries different line numbers, and this
+                        # value is what the manifest and the review prompt use
+                        # to locate a finding.
+                        hunk_header=review_hunk[0],
+                        body=body,
+                        category=category,
+                        additions=additions,
+                        estimated_tokens=estimate_tokens(body),
+                        collapsed_deletions=collapsed,
+                    )
                 )
-            )
     return units, errors
 
 
@@ -499,11 +627,15 @@ def build_llm_payload(model: str, system: str, user: str, mode: str) -> dict[str
 
 
 def provider_configuration() -> tuple[str, str]:
-    litellm_url = os.environ.get("LITELLM_BASE_URL", "")
-    litellm_key = os.environ.get("LITELLM_API_KEY", "")
+    """Resolve the single supported provider.
+
+    This previously preferred a LiteLLM gateway and fell back to OpenAI. No
+    repository ever set the gateway secrets, so the preferred branch never ran
+    and every review has always taken the fallback. Carrying an unreachable
+    provider branch on the path that authorizes an outbound call is a liability
+    with no user, so the fallback is now simply the path.
+    """
     openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if litellm_url and litellm_key:
-        return litellm_url.rstrip("/") + "/chat/completions", litellm_key
     if openai_key:
         return "https://api.openai.com/v1/chat/completions", openai_key
     raise ProviderConfigurationError("no LLM credential was supplied")
@@ -547,10 +679,10 @@ def call_model(system: str, user: str, mode: str, phase: str, correlation: str) 
     api_url, api_key = provider_configuration()
     model = model_for_mode(mode)
     timeout = llm_timeout_for(mode)
-    # This is a correlation key, not an idempotency promise: the direct and
-    # LiteLLM-compatible endpoints do not share a documented deduplication
-    # contract. It stays stable across the one permitted retry so a provider
-    # can trace both attempts if a connection fault needs investigation.
+    # This is a correlation key, not an idempotency promise: the direct OpenAI
+    # endpoint has no documented deduplication contract. It stays stable across
+    # the one permitted retry so the provider can trace both attempts if a
+    # connection fault needs investigation.
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -970,6 +1102,30 @@ def judge_findings(
     return verified, True, excluded
 
 
+def coverage_gaps(_units: list[DiffUnit], omitted: list[DiffUnit], parse_errors: list[str]) -> list[str]:
+    """Name only the things the review should have read and did not.
+
+    Separated from the caller so the policy can be tested directly. It was
+    inline, and the one rule that mattered here was therefore only assertable
+    by hand-building the state it produces, which tests the consequence rather
+    than the decision.
+
+    A collapsed deletion hunk is deliberately NOT a gap. It is a disclosed
+    compression that the default mode applies uniformly, reported under its own
+    heading on the review, and deep mode does not apply it at all. Counting it
+    as incompleteness made the completeness check fail on any pull request
+    removing a block of more than MAX_DELETION_LINES_PER_HUNK lines, which is
+    most of them: an observed review read 321 of 321 units, omitted nothing,
+    and still reported partial behind a failing check. A signal that is red on
+    complete reviews is one an operator learns to ignore, and then it protects
+    nothing on the review that really is short.
+    """
+    gaps = list(parse_errors)
+    if omitted:
+        gaps.append("one or more units were omitted or unrepresentable")
+    return gaps
+
+
 def derive_state(progress: ReviewProgress) -> str:
     """Own status transitions in code; model prose never decides completeness."""
     if progress.head_changed:
@@ -1246,16 +1402,11 @@ def run_review(
         truncation = compare_incompleteness(repo, binding, token)
         if truncation:
             progress.incomplete_reasons.append(truncation)
-        units, parse_errors = parse_diff(diff)
+        units, parse_errors = parse_diff(diff, mode)
         classification = classify_units(units)
         progress.expected_units = sum(1 for unit in units if unit.representable)
-        if parse_errors:
-            progress.incomplete_reasons.extend(parse_errors)
         chunks, omitted = plan_chunks(units, mode)
-        if omitted:
-            progress.incomplete_reasons.append("one or more units were omitted or unrepresentable")
-        if any(unit.collapsed_deletions for unit in units):
-            progress.incomplete_reasons.append("one or more deletion hunks were collapsed")
+        progress.incomplete_reasons.extend(coverage_gaps(units, omitted, parse_errors))
         reviewed_changes: list[dict[str, str]] = []
         candidates: list[Finding] = []
         for chunk_index, chunk in enumerate(chunks, 1):
