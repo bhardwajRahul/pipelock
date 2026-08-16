@@ -10,12 +10,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -125,6 +127,55 @@ func TestRunProxy_ResponseTimeoutReapsEscapedPipeHolder(t *testing.T) {
 		}
 	})
 	waitForGone(t, map[string]int{"escaped pipe holder": pid}, 5*time.Second)
+}
+
+func TestWaitForCommandWithProcessGroupSignalsBeforeReap(t *testing.T) {
+	const resolverScript = "umask 077; sleep 300 & child=$!; printf '%s\\n' \"$child\" > \"$MCP_TEST_PID_FILE\"; wait"
+
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "resolver-child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", resolverScript)
+	cmd.Env = append(os.Environ(), "MCP_TEST_PID_FILE="+pidFile)
+	setupChildProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting resolver tree: %v", err)
+	}
+	pgid := captureChildPgid(cmd.Process.Pid)
+	reaped := false
+	t.Cleanup(func() {
+		if !reaped {
+			terminateProcessGroup(pgid)
+			_ = cmd.Wait()
+		}
+	})
+
+	var childPID int
+	testwait.For(t, 5*time.Second, func() bool {
+		pidBytes, err := os.ReadFile(filepath.Clean(pidFile))
+		if err != nil {
+			return false
+		}
+		childPID, err = strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+		return err == nil && childPID > 0
+	}, "the resolver child to write its PID")
+
+	done := make(chan error, 1)
+	go func() { done <- waitForCommandWithProcessGroup(ctx, cmd, pgid, &processExitHandoff{}) }()
+	cancel()
+	select {
+	case err := <-done:
+		reaped = true
+		if err == nil {
+			t.Fatal("resolver tree exited cleanly after forced teardown")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolver tree was not reaped after cancellation")
+	}
+
+	waitForGone(t, map[string]int{"resolver child": childPID}, 5*time.Second)
 }
 
 // TestSessionExit_RealParentDeathReapsWholeTree drives the actual production
@@ -250,6 +301,289 @@ func TestSessionExit_RealParentDeathReapsWholeTree(t *testing.T) {
 	}
 }
 
+// TestSessionExit_SandboxTreeIsReaped drives the sandbox proxy entry point
+// through its real child process tree. The watch uses a controllable PPID so
+// the test can first prove the sandbox command and its detached descendant
+// exist, then trigger the same teardown production runs after reparenting.
+func TestSessionExit_SandboxTreeIsReaped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real sandbox proxy process tree")
+	}
+
+	const sandboxScript = "umask 077\necho $$ > \"$MCP_TEST_SANDBOX_FILE\"\nsetsid sleep 300 &\necho $! > \"$MCP_TEST_GRANDCHILD_FILE\"\nsleep 300"
+
+	dir := t.TempDir()
+	sandboxFile := filepath.Join(dir, "sandbox.pid")
+	grandchildFile := filepath.Join(dir, "grandchild.pid")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	clientIn := newBlockingReader()
+	defer func() { _ = clientIn.Close() }()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", sandboxScript)
+	cmd.Env = append(os.Environ(),
+		"MCP_TEST_SANDBOX_FILE="+sandboxFile,
+		"MCP_TEST_GRANDCHILD_FILE="+grandchildFile,
+	)
+	sc := testScannerWithAction(t, config.ActionWarn)
+	var logBuf syncBuffer
+	var parentDied atomic.Bool
+	opts := testOpts(sc)
+	opts.sessionExitForTest = &sessionExitTestHooks{watch: parentWatchOpts{
+		interval:  time.Millisecond,
+		startPPID: 4242,
+		getppid: func() int {
+			if parentDied.Load() {
+				return orphanedPPID
+			}
+			return 4242
+		},
+	}, grace: 50 * time.Millisecond}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunProxyWithSandbox(ctx, cmd, clientIn, io.Discard, &logBuf, opts)
+	}()
+
+	var sandboxPID, grandchildPID int
+	testwait.For(t, 15*time.Second, func() bool {
+		sandboxBytes, sandboxErr := os.ReadFile(filepath.Clean(sandboxFile))
+		grandchildBytes, grandchildErr := os.ReadFile(filepath.Clean(grandchildFile))
+		if sandboxErr != nil || grandchildErr != nil {
+			return false
+		}
+		var sandboxPIDErr, grandchildPIDErr error
+		sandboxPID, sandboxPIDErr = strconv.Atoi(strings.TrimSpace(string(sandboxBytes)))
+		grandchildPID, grandchildPIDErr = strconv.Atoi(strings.TrimSpace(string(grandchildBytes)))
+		return sandboxPIDErr == nil && grandchildPIDErr == nil && sandboxPID > 0 && grandchildPID > 0
+	}, "the sandbox tree to come up")
+
+	tree := map[string]int{
+		"sandbox command":        sandboxPID,
+		"detached sandbox child": grandchildPID,
+	}
+	for label, pid := range tree {
+		if !processAlive(pid) {
+			t.Fatalf("%s (pid %d) was not alive before session exit", label, pid)
+		}
+	}
+
+	parentDied.Store(true)
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("sandbox proxy stayed alive after the spawning session exited")
+	}
+
+	waitForGone(t, tree, 10*time.Second)
+	if !strings.Contains(logBuf.String(), "spawning session exited") {
+		t.Errorf("missing session-exit explanation in operator log, got %q", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "terminating process tree") {
+		t.Errorf("missing sandbox process-tree teardown notice, got %q", logBuf.String())
+	}
+}
+
+func TestSessionExit_SandboxLiveSessionIsNotTornDown(t *testing.T) {
+	const liveSessionScript = "umask 077; touch \"$MCP_TEST_READY_FILE\"; sleep 300"
+
+	if testing.Short() {
+		t.Skip("spawns a real sandbox proxy process")
+	}
+
+	dir := t.TempDir()
+	readyFile := filepath.Join(dir, "ready")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientIn := newBlockingReader()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", liveSessionScript)
+	cmd.Env = append(os.Environ(), "MCP_TEST_READY_FILE="+readyFile)
+	sc := testScannerWithAction(t, config.ActionWarn)
+	var logBuf syncBuffer
+	opts := testOpts(sc)
+	opts.sessionExitForTest = liveSessionExitHooks()
+	done := make(chan error, 1)
+	go func() {
+		done <- RunProxyWithSandbox(ctx, cmd, clientIn, io.Discard, &logBuf, opts)
+	}()
+
+	testwait.For(t, 10*time.Second, func() bool {
+		if _, err := os.Stat(readyFile); err == nil {
+			return true
+		}
+		return false
+	}, "the sandbox command to become ready")
+
+	select {
+	case err := <-done:
+		t.Fatalf("sandbox proxy exited while its session was alive: %v; log: %q", err, logBuf.String())
+	case <-time.After(250 * time.Millisecond):
+	}
+	if strings.Contains(logBuf.String(), "spawning session exited") {
+		t.Errorf("session-exit path ran against a live parent, got %q", logBuf.String())
+	}
+
+	_ = clientIn.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		// Report the operator log and the surviving processes. This assertion
+		// has failed on CI while passing on a development host, and a bare
+		// timeout says nothing about which stage did not finish.
+		t.Fatalf("sandbox proxy did not stop after context cancellation; log: %q; surviving descendants: %s",
+			logBuf.String(), describeOwnDescendants())
+	}
+}
+
+// TestSessionExit_SandboxCancellationWithSurvivingPipeHolder is the CI-shaped
+// version of the cancellation case above.
+//
+// The sibling test runs "sh -c '...; sleep 300'", which on many shells execs
+// the final sleep in place, so the direct-child SIGKILL that
+// exec.CommandContext sends happens to reach the process holding stdout. That
+// makes the test pass without any cancellation teardown at all, and it is why
+// it passed on a development host while failing on CI.
+//
+// Here the shell keeps a detached descendant that holds stdout and does not
+// exec in place, so the direct kill cannot reach the pipe holder. Without a
+// cancellation teardown the output reader never sees EOF and this call never
+// returns.
+func TestSessionExit_SandboxCancellationWithSurvivingPipeHolder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real sandbox proxy process")
+	}
+
+	dir := t.TempDir()
+	readyFile := filepath.Join(dir, "ready")
+	// setsid moves the descendant into its own session, so it survives both
+	// the direct-child kill and a plain process-group signal, while keeping
+	// the inherited stdout it was given.
+	script := "umask 077; setsid sleep 300 & touch \"$MCP_TEST_READY_FILE\"; wait"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientIn := newBlockingReader()
+	defer func() { _ = clientIn.Close() }()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	cmd.Env = append(os.Environ(), "MCP_TEST_READY_FILE="+readyFile)
+	var logBuf syncBuffer
+	opts := testOpts(testScannerWithAction(t, config.ActionWarn))
+	opts.sessionExitForTest = liveSessionExitHooks()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunProxyWithSandbox(ctx, cmd, clientIn, io.Discard, &logBuf, opts)
+	}()
+
+	testwait.For(t, 10*time.Second, func() bool {
+		_, err := os.Stat(readyFile)
+		return err == nil
+	}, "the sandbox command to become ready")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("sandbox proxy did not stop after cancellation while a detached descendant held stdout; log: %q; surviving descendants: %s",
+			logBuf.String(), describeOwnDescendants())
+	}
+}
+
+func TestRunProxyWithSandbox_SubreaperFailureDirections(t *testing.T) {
+	failure := errors.New("subreaper unavailable")
+
+	t.Run("best effort continues with warning", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var logBuf syncBuffer
+		opts := testOpts(testScannerWithAction(t, config.ActionWarn))
+		opts.enableSubreaperForTest = func() error { return failure }
+		cmd := exec.CommandContext(ctx, "cat")
+		if err := RunProxyWithSandbox(ctx, cmd, strings.NewReader(""), io.Discard, &logBuf, opts); err != nil {
+			t.Fatalf("best-effort sandbox proxy = %v", err)
+		}
+		if !strings.Contains(logBuf.String(), "session descendant cleanup degraded") {
+			t.Errorf("missing subreaper warning, got %q", logBuf.String())
+		}
+	})
+
+	t.Run("strict fails closed", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		opts := testOpts(testScannerWithAction(t, config.ActionWarn))
+		opts.enableSubreaperForTest = func() error { return failure }
+		cmd := exec.CommandContext(ctx, "cat")
+		err := RunProxyWithSandbox(ctx, cmd, strings.NewReader(""), io.Discard, io.Discard, opts, true)
+		if !errors.Is(err, failure) {
+			t.Fatalf("strict sandbox proxy error = %v, want subreaper failure", err)
+		}
+	})
+}
+
+// TestRunProxyWithSandbox_BestEffortChildSurvivesSiblingReaper is the
+// cross-session direction of the subreaper failure case above.
+//
+// reapAdoptedZombies walks /proc and reaps any zombie parented to this process
+// except the direct children sessions have claimed. A session whose subreaper
+// setup was refused still owns a direct child, so if it does not claim that
+// child, a concurrent session's reaper consumes its exit status and the owning
+// cmd.Wait fails with ECHILD, surfacing as "waitid: no child processes".
+//
+// The sweeper here stands in for that concurrent session's reaper. It is
+// deliberately continuous: the theft window is between the child exiting and
+// this session reaping it, which is narrow and load-dependent, and is why this
+// reproduced on a loaded CI runner rather than on a development host.
+func TestRunProxyWithSandbox_BestEffortChildSurvivesSiblingReaper(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	opts := testOpts(testScannerWithAction(t, config.ActionWarn))
+	opts.enableSubreaperForTest = func() error { return errors.New("subreaper unavailable") }
+
+	// A PID that is never one of ours, so the sweeper protects nothing of the
+	// session under test and behaves exactly like a foreign session's reaper.
+	const foreignDirectPID = -1
+	sweeperDone := make(chan struct{})
+	sweeperStopped := make(chan struct{})
+	go func() {
+		defer close(sweeperStopped)
+		for {
+			select {
+			case <-sweeperDone:
+				return
+			default:
+				reapAdoptedZombies(foreignDirectPID)
+			}
+		}
+	}()
+	defer func() {
+		close(sweeperDone)
+		<-sweeperStopped
+	}()
+
+	var logBuf syncBuffer
+	cmd := exec.CommandContext(ctx, "cat")
+	if err := RunProxyWithSandbox(ctx, cmd, strings.NewReader(""), io.Discard, &logBuf, opts); err != nil {
+		t.Fatalf("best-effort sandbox proxy with a concurrent sibling reaper = %v, want the session to keep its own child", err)
+	}
+}
+
+func TestRunProxyWithSandbox_OrphanedParentStaysInert(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var logBuf syncBuffer
+	opts := testOpts(testScannerWithAction(t, config.ActionWarn))
+	opts.sessionExitForTest = &sessionExitTestHooks{watch: parentWatchOpts{startPPID: orphanedPPID}}
+	cmd := exec.CommandContext(ctx, "cat")
+	if err := RunProxyWithSandbox(ctx, cmd, strings.NewReader(""), io.Discard, &logBuf, opts); err != nil {
+		t.Fatalf("sandbox proxy with an unbound parent = %v", err)
+	}
+	if strings.Contains(logBuf.String(), "spawning session exited") {
+		t.Errorf("unbound parent ran the session-exit path, got %q", logBuf.String())
+	}
+}
+
 // TestSessionExitHelperProcess is the proxy level of the tree above. It is a
 // helper, not a test: it runs only when the parent test sets the env marker.
 func TestSessionExitHelperProcess(t *testing.T) {
@@ -277,4 +611,48 @@ func TestSessionExitHelperProcess(t *testing.T) {
 		[]string{"/bin/sh", "-c", "exec /bin/sh \"$PIPELOCK_SESSION_EXIT_SERVER\""}, MCPProxyOpts{},
 		"PIPELOCK_SESSION_EXIT_SERVER="+os.Getenv("PIPELOCK_SESSION_EXIT_SERVER"))
 	fmt.Fprintf(os.Stderr, "helper: RunProxy returned: %v\n", err)
+}
+
+// describeOwnDescendants lists the live processes still parented to this
+// process, with their state and command name. It exists for one reason: a
+// teardown assertion that times out on CI and passes on a development host
+// says nothing about WHAT failed to finish, and a process holding a pipe open
+// is the difference between a hung wait and a hung scan.
+func describeOwnDescendants() string {
+	selfPID := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return "unreadable /proc: " + err.Error()
+	}
+	var found []string
+	for _, entry := range entries {
+		name := entry.Name()
+		pid, convErr := strconv.Atoi(name)
+		if convErr != nil || pid == selfPID {
+			continue
+		}
+		statBytes, readErr := os.ReadFile(filepath.Clean("/proc/" + name + "/stat"))
+		if readErr != nil {
+			continue
+		}
+		stat := string(statBytes)
+		cmdEnd := strings.LastIndex(stat, ")")
+		cmdStart := strings.Index(stat, "(")
+		if cmdEnd < 0 || cmdStart < 0 || cmdEnd <= cmdStart || cmdEnd+2 > len(stat) {
+			continue
+		}
+		rest := strings.Fields(stat[cmdEnd+1:])
+		if len(rest) < 2 {
+			continue
+		}
+		if rest[1] != strconv.Itoa(selfPID) {
+			continue
+		}
+		found = append(found, fmt.Sprintf("pid=%d state=%s comm=%s", pid, rest[0], stat[cmdStart+1:cmdEnd]))
+	}
+	if len(found) == 0 {
+		return "none"
+	}
+	sort.Strings(found)
+	return strings.Join(found, "; ")
 }

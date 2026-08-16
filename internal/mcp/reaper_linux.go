@@ -18,7 +18,26 @@ import (
 var (
 	protectedDirectPIDsMu sync.Mutex
 	protectedDirectPIDs   = make(map[int]int)
+
+	// childStartMu closes the window between a child existing and its owning
+	// session having claimed it. Claiming cannot happen before the fork,
+	// because the PID does not exist yet, so a sweep that runs in between sees
+	// an unclaimed process and is entitled to reap it. Serializing starts
+	// against sweeps is what makes "started" and "claimed" one step from every
+	// other session's point of view.
+	//
+	// Held across fork/exec, which is brief and rare; sweeps are brief too.
+	childStartMu sync.Mutex
 )
+
+// lockChildStart blocks descendant sweeps until the caller has claimed the
+// child it is about to start. Call the returned function once the claim is
+// registered, and keep the critical section to start-and-claim.
+func lockChildStart() func() {
+	childStartMu.Lock()
+	var once sync.Once
+	return func() { once.Do(childStartMu.Unlock) }
+}
 
 // startAdoptedReaper drains exited adopted descendants while the direct
 // MCP child is still alive. Without it, long-running wraps (codex
@@ -86,6 +105,12 @@ func startAdoptedReaper(directPID int, done <-chan struct{}) {
 // Best-effort throughout - ESRCH on PID-recycle race, EINTR on signal,
 // EPERM on namespace boundary all fall through silently.
 func reapAdoptedZombies(directPID int) {
+	// Exclude a session that is mid-start. Its child may already exist while
+	// its claim does not, and this sweep would read that as an unowned zombie
+	// and consume the exit status its owner is waiting for.
+	unlock := lockChildStart()
+	defer unlock()
+
 	selfPID := os.Getpid()
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -110,6 +135,17 @@ func reapAdoptedZombies(directPID int) {
 		_, _ = syscall.Wait4(childPID, &status, syscall.WNOHANG, nil)
 	}
 }
+
+// protectDirectChild claims pid as a session's own direct child so no other
+// session's reaper can consume its exit status, without starting a reaper of
+// its own. Every session must claim its child, including one whose subreaper
+// setup was refused by the host: reapAdoptedZombies walks /proc for any zombie
+// parented to this process, so an unclaimed child is reapable by a sibling
+// session's reaper. The owning session's cmd.Wait then fails with ECHILD,
+// surfacing as "waitid: no child processes".
+//
+// Returns the release function; call it once the child has been reaped.
+func protectDirectChild(pid int) func() { return registerProtectedDirectPID(pid) }
 
 func registerProtectedDirectPID(pid int) func() {
 	if pid <= 0 {

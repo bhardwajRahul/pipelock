@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 // blockingReader stands in for a client whose session is alive: it never
@@ -147,13 +149,16 @@ func TestRunProxy_SessionExitTerminatesIgnoringServer(t *testing.T) {
 		t.Fatal("RunProxy never returned after the spawning session died; the proxy leaked")
 	}
 
-	log := logBuf.String()
-	if !strings.Contains(log, "spawning session exited") {
-		t.Errorf("missing session-exit explanation in operator log, got %q", log)
-	}
-	if !strings.Contains(log, "terminating process tree") {
-		t.Errorf("missing forced-teardown notice for a server that ignored stdin close, got %q", log)
-	}
+	testwait.For(t, 5*time.Second, func() bool {
+		return strings.Contains(logBuf.String(), "spawning session exited")
+	}, "asynchronous session-exit log message")
+	// `sleep` never reads stdin, so the cooperative shutdown cannot end it and
+	// the drain window has to expire into a forced teardown. That escalation is
+	// the behavior this test is named for, and this is the only assertion of it
+	// that runs on a non-Linux build.
+	testwait.For(t, 5*time.Second, func() bool {
+		return strings.Contains(logBuf.String(), "terminating process tree")
+	}, "forced process-tree teardown log message")
 }
 
 // TestRunProxy_LiveSessionIsNotTornDown is the availability direction: with
@@ -402,4 +407,21 @@ func TestDrainStderr_ReleasesEscapedPipeHolder(t *testing.T) {
 			t.Fatalf("stderr reader error after normal drain = %v, want os.ErrClosed", err)
 		}
 	})
+}
+
+func TestRunProxy_OrphanedParentStaysInert(t *testing.T) {
+	sc := testScannerWithAction(t, "warn")
+	var stdout, logBuf bytes.Buffer
+	err := RunProxy(context.Background(), strings.NewReader(""), &stdout, &logBuf, []string{"cat"}, MCPProxyOpts{
+		Scanner: sc,
+		sessionExitForTest: &sessionExitTestHooks{watch: parentWatchOpts{
+			startPPID: orphanedPPID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("RunProxy with an unbound parent = %v", err)
+	}
+	if strings.Contains(logBuf.String(), "spawning session exited") {
+		t.Errorf("unbound parent ran the session-exit path, got %q", logBuf.String())
+	}
 }
