@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -171,7 +172,13 @@ func RunHTTPListenerProxy(
 	logW io.Writer,
 	opts MCPProxyOpts,
 ) error {
+	// Capture before listener validation and upstream preflight to narrow the
+	// startup race. A launcher can still exit before this first syscall; closing
+	// that earlier window needs a harness-owned lifetime primitive.
+	startupParentWatch := parentWatchOpts{startPPID: os.Getppid()}
 	safeLogW := &syncWriter{w: logW}
+	ctx, stopSession, _ := newSessionBoundContext(ctx, startupParentWatch, nil, safeLogW, opts.sessionExitForTest)
+	defer stopSession()
 	opts.UpstreamHeaders = canonicalizeListenerUpstreamHeaders(opts.UpstreamHeaders)
 	if err := validateListenerBearerToken(opts.ListenerBearerToken); err != nil {
 		return err

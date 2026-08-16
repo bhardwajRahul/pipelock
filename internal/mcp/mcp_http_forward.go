@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -69,6 +70,36 @@ func consumeTrackedRequestOutcome(tracker *RequestTracker, id json.RawMessage) (
 	return tracker.Consume(id)
 }
 
+type mcpInputReadResult struct {
+	message []byte
+	err     error
+}
+
+// readMCPInputMessage lets a session-bound HTTP bridge return when its parent
+// exits even when a caller supplied a Reader that cannot be closed. Closable
+// inputs use the direct read path: newSessionBoundContext closes them on exit.
+// A non-closable input leaves at most its single blocked Read behind; its result
+// channel is buffered, so releasing that reader cannot strand a goroutine after
+// the bridge has already returned.
+func readMCPInputMessage(ctx context.Context, clientIn io.Reader, reader transport.MessageReader) ([]byte, error) {
+	if _, closable := clientIn.(io.Closer); closable {
+		return reader.ReadMessage()
+	}
+
+	result := make(chan mcpInputReadResult, 1)
+	go func() {
+		message, err := reader.ReadMessage()
+		result <- mcpInputReadResult{message: message, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		return result.message, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // RunHTTPProxy bridges stdio (client) to an upstream HTTP MCP server with
 // bidirectional scanning. Reads JSON-RPC from clientIn, POSTs to upstreamURL,
 // scans responses via ForwardScanned, writes to clientOut.
@@ -84,6 +115,15 @@ func RunHTTPProxy(
 	extraHeaders http.Header,
 	opts MCPProxyOpts,
 ) error {
+	// Capture before validating the upstream to narrow the time startup work can
+	// hide a parent death. This cannot close the earlier launcher-to-first-
+	// syscall race; that needs a harness-owned lifetime primitive.
+	startupParentWatch := parentWatchOpts{startPPID: os.Getppid()}
+	safeClientOut := &syncWriter{w: clientOut}
+	safeLogW := &syncWriter{w: logW}
+	ctx, cancel, sessionExit := newSessionBoundContext(ctx, startupParentWatch, clientIn, safeLogW, opts.sessionExitForTest)
+	defer cancel()
+
 	// Set transport for capture records if not already set by caller.
 	if opts.Transport == "" {
 		opts.Transport = "mcp_http_upstream"
@@ -99,10 +139,6 @@ func RunHTTPProxy(
 		return fmt.Errorf("contract upstream denied: %s", mcpContractBlockReason(gate))
 	}
 
-	// Create a child context so we can stop the GET stream when stdin EOF is reached.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	// Per-invocation adaptive enforcement recorder. Mint the invocation
 	// key once so it can also feed scanHTTPInputDecision below, keeping
 	// CEE state and audit correlation scoped to this RunHTTPProxy call
@@ -113,9 +149,6 @@ func RunHTTPProxy(
 		rec = opts.Store.GetOrCreate(invocationKey)
 	}
 	defer recordMCPBaselineSample(opts, rec)
-
-	safeClientOut := &syncWriter{w: clientOut}
-	safeLogW := &syncWriter{w: logW}
 
 	httpClient := transport.NewHTTPClientWithDialer(upstreamURL, extraHeaders, opts.DialContext)
 	var upstreamMu sync.Mutex
@@ -151,6 +184,7 @@ func RunHTTPProxy(
 	fwdOpts.ToolCfg = fwdToolCfg
 	fwdOpts.ToolCfgFn = nil
 	fwdOpts.WarnContext = ctx
+	fwdOpts.sessionExit = sessionExit
 	resolverRuntime := newDeferResolverRuntime(ctx)
 	fwdOpts.DeferResolverRuntime = resolverRuntime
 	defer func() {
@@ -168,9 +202,9 @@ func RunHTTPProxy(
 	var lastScanErr error
 
 	for {
-		msg, err := clientReader.ReadMessage()
+		msg, err := readMCPInputMessage(ctx, clientIn, clientReader)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || (sessionExit.inProgress() && (isSessionExitCloseErr(err) || errors.Is(err, context.Canceled))) {
 				break
 			}
 			return fmt.Errorf("reading stdin: %w", err)
