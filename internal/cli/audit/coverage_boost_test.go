@@ -29,9 +29,9 @@ func TestPrintSimulation_WithConfig(t *testing.T) {
 	cmd := testRoot()
 	cmd.AddCommand(SimulateCmd())
 
-	var buf strings.Builder
-	cmd.SetOut(&buf)
-	cmd.SetErr(&buf)
+	var stdout, stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
 
 	result := SimulateResult{
 		ConfigFile:  "test.yaml",
@@ -52,7 +52,7 @@ func TestPrintSimulation_WithConfig(t *testing.T) {
 	}
 
 	printSimulation(cmd, result)
-	output := buf.String()
+	output := stdout.String()
 
 	if !strings.Contains(output, "test.yaml") {
 		t.Error("expected config file in output")
@@ -69,15 +69,18 @@ func TestPrintSimulation_WithConfig(t *testing.T) {
 	if !strings.Contains(output, testGradeC) {
 		t.Error("expected grade C in output")
 	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected simulation output on stderr: %s", stderr.String())
+	}
 }
 
 func TestPrintSimulation_DefaultConfig(t *testing.T) {
 	cmd := testRoot()
 	cmd.AddCommand(SimulateCmd())
 
-	var buf strings.Builder
-	cmd.SetOut(&buf)
-	cmd.SetErr(&buf)
+	var stdout, stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
 
 	result := SimulateResult{
 		Mode:       "balanced",
@@ -92,10 +95,13 @@ func TestPrintSimulation_DefaultConfig(t *testing.T) {
 	}
 
 	printSimulation(cmd, result)
-	output := buf.String()
+	output := stdout.String()
 
 	if !strings.Contains(output, "defaults") {
 		t.Error("expected 'defaults' when no config file set")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected simulation output on stderr: %s", stderr.String())
 	}
 }
 
@@ -103,9 +109,9 @@ func TestPrintSimulation_NoFailures(t *testing.T) {
 	cmd := testRoot()
 	cmd.AddCommand(SimulateCmd())
 
-	var buf strings.Builder
-	cmd.SetOut(&buf)
-	cmd.SetErr(&buf)
+	var stdout, stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
 
 	result := SimulateResult{
 		Mode:       "strict",
@@ -119,11 +125,14 @@ func TestPrintSimulation_NoFailures(t *testing.T) {
 	}
 
 	printSimulation(cmd, result)
-	output := buf.String()
+	output := stdout.String()
 
 	// No MISSED line should appear.
 	if strings.Contains(output, "MISSED:") {
 		t.Error("expected no MISSED summary when no failures")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected simulation output on stderr: %s", stderr.String())
 	}
 }
 
@@ -648,9 +657,9 @@ func TestPrintScoreResult(t *testing.T) {
 	cmd := testRoot()
 	cmd.AddCommand(Cmd())
 
-	var buf strings.Builder
-	cmd.SetOut(&buf)
-	cmd.SetErr(&buf)
+	var stdout, stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
 
 	result := &ScoreResult{
 		TotalScore: 80,
@@ -670,7 +679,7 @@ func TestPrintScoreResult(t *testing.T) {
 	}
 
 	printScoreResult(cmd, result)
-	output := buf.String()
+	output := stdout.String()
 
 	if !strings.Contains(output, "Config Security Score") {
 		t.Error("expected header")
@@ -686,6 +695,9 @@ func TestPrintScoreResult(t *testing.T) {
 	}
 	if !strings.Contains(output, "[INFO]") {
 		t.Error("expected INFO tag")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected scorecard output on stderr: %s", stderr.String())
 	}
 }
 
