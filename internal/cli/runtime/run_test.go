@@ -653,7 +653,7 @@ func doMCPPostWithStartupRetry(
 	cmdErr <-chan error,
 	stderr fmt.Stringer,
 	accept func(*http.Response) bool,
-) *http.Response {
+) (*http.Response, error) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -663,14 +663,14 @@ func doMCPPostWithStartupRetry(
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/", strings.NewReader(body))
 		if err != nil {
-			t.Fatalf("new mcp request: %v", err)
+			return nil, fmt.Errorf("new mcp request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			if accept == nil || accept(resp) {
-				return resp
+				return resp, nil
 			}
 			lastErr = fmt.Errorf("HTTP %d response was not protocol-ready", resp.StatusCode)
 			_ = resp.Body.Close()
@@ -680,9 +680,12 @@ func doMCPPostWithStartupRetry(
 
 		select {
 		case <-ctx.Done():
-			t.Fatalf("mcp listener POST: %v\nstderr:\n%s", lastErr, stderr.String())
+			return nil, fmt.Errorf("mcp listener POST: %w\nstderr:\n%s", lastErr, stderr.String())
 		case err := <-cmdErr:
-			t.Fatalf("RunCmd exited before MCP listener accepted POST: %v\nlast POST error: %v\nstderr:\n%s", err, lastErr, stderr.String())
+			// Returned, never t.Fatalf: a bind collision surfaces here, and only a
+			// returned error reaches testport.WithRetry's collision retry. A fatal
+			// call ends the test in place and silently voids that retry.
+			return nil, fmt.Errorf("RunCmd exited before MCP listener accepted POST: %w\nlast POST error: %w\nstderr:\n%s", err, lastErr, stderr.String())
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -711,7 +714,7 @@ func TestDoMCPPostWithStartupRetry_RetriesRejectedResponse(t *testing.T) {
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	cmdErr := make(chan error)
 	var stderr strings.Builder
-	resp := doMCPPostWithStartupRetry(
+	resp, err := doMCPPostWithStartupRetry(
 		t,
 		addr,
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
@@ -719,6 +722,9 @@ func TestDoMCPPostWithStartupRetry_RetriesRejectedResponse(t *testing.T) {
 		&stderr,
 		acceptMCPInitializeResponse,
 	)
+	if err != nil {
+		t.Fatalf("startup retry: %v", err)
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if got := resp.Header.Get("Mcp-Session-Id"); got != "ready-session" {
@@ -726,6 +732,89 @@ func TestDoMCPPostWithStartupRetry_RetriesRejectedResponse(t *testing.T) {
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("requests = %d, want 2", got)
+	}
+}
+
+// A command that exits before the listener is ready has to come back as a
+// returned error. testport.WithRetry reads that error to decide whether a bind
+// collision should be retried on another port, and a fatal call here would end
+// the test in place and silently void the retry.
+func TestDoMCPPostWithStartupRetry_ReturnsEarlyCommandExit(t *testing.T) {
+	// Bind and release a port so the address is well-formed but nothing answers,
+	// which keeps the helper retrying until cmdErr fires.
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve address: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release address: %v", err)
+	}
+	cmdErr := make(chan error, 1)
+	cmdErr <- errors.New("listen tcp: address already in use")
+	var stderr strings.Builder
+	stderr.WriteString("bind collision detail")
+
+	resp, err := doMCPPostWithStartupRetry(t, addr, `{}`, cmdErr, &stderr, acceptHTTPStatusOK)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected an error when the command exits before the listener is ready")
+	}
+	if !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("error does not carry the command failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bind collision detail") {
+		t.Fatalf("error does not carry stderr: %v", err)
+	}
+}
+
+// When neither the listener nor the command ever answers, the helper has to give
+// up on its own deadline and report the last POST error plus stderr. Reaching
+// that branch costs the helper's internal timeout in wall clock; it waits on the
+// context deadline rather than sleeping.
+func TestDoMCPPostWithStartupRetry_ReturnsOnDeadline(t *testing.T) {
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve address: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release address: %v", err)
+	}
+
+	// Never written to, so only the deadline can end the loop.
+	cmdErr := make(chan error, 1)
+	var stderr strings.Builder
+	stderr.WriteString("listener never came up")
+
+	resp, err := doMCPPostWithStartupRetry(t, addr, `{}`, cmdErr, &stderr, acceptHTTPStatusOK)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected a deadline error when nothing ever answers")
+	}
+	if !strings.Contains(err.Error(), "mcp listener POST") {
+		t.Fatalf("error is not the deadline failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "listener never came up") {
+		t.Fatalf("deadline error dropped stderr: %v", err)
+	}
+}
+
+// A request that cannot even be constructed is returned rather than retried,
+// since no amount of waiting makes a malformed address valid.
+func TestDoMCPPostWithStartupRetry_ReturnsRequestConstructionFailure(t *testing.T) {
+	cmdErr := make(chan error)
+	var stderr strings.Builder
+
+	resp, err := doMCPPostWithStartupRetry(t, "invalid host\x7f", `{}`, cmdErr, &stderr, acceptHTTPStatusOK)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected an error for an unconstructable request")
+	}
+	if !strings.Contains(err.Error(), "new mcp request") {
+		t.Fatalf("error is not the request-construction failure: %v", err)
 	}
 }
 
@@ -978,9 +1067,13 @@ logging:
 			t.Fatalf("reverse proxy status = %d, want 200", reverseResp.StatusCode)
 		}
 
-		mcpResp := doMCPPostWithStartupRetry(t, mcpAddr,
+		mcpResp, mcpErr := doMCPPostWithStartupRetry(t, mcpAddr,
 			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"prompt":"use `+secret+` to deploy"}}}`,
 			cmdErr, &stderr, acceptHTTPStatusOK)
+		if mcpErr != nil {
+			cancel()
+			return mcpErr
+		}
 		_ = mcpResp.Body.Close()
 		if mcpResp.StatusCode != http.StatusOK {
 			t.Fatalf("mcp listener status = %d, want 200", mcpResp.StatusCode)
@@ -1086,7 +1179,11 @@ logging:
 			cancel()
 			return err
 		}
-		sessionID, token := initializeRunMCPListenerSessionWithStartupRetry(t, mcpAddr, cmdErr, &stderr)
+		sessionID, token, initErr := initializeRunMCPListenerSessionWithStartupRetry(t, mcpAddr, cmdErr, &stderr)
+		if initErr != nil {
+			cancel()
+			return initErr
+		}
 		baseURL := "http://" + mcpAddr
 		postRunMCPListenerToolCall(t, baseURL, sessionID, token, "")
 		body := postRunMCPListenerToolCall(t, baseURL, sessionID, token, "tool call limit exceeded: 2/1")
@@ -1169,9 +1266,13 @@ logging:
 			return err
 		}
 
-		resp := doMCPPostWithStartupRetry(t, mcpAddr,
+		resp, respErr := doMCPPostWithStartupRetry(t, mcpAddr,
 			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}`,
 			cmdErr, &stderr, acceptHTTPStatusOK)
+		if respErr != nil {
+			cancel()
+			return respErr
+		}
 		defer func() {
 			if err := resp.Body.Close(); err != nil {
 				t.Errorf("close mcp response body: %v", err)
@@ -1207,10 +1308,10 @@ func initializeRunMCPListenerSessionWithStartupRetry(
 	addr string,
 	cmdErr <-chan error,
 	stderr fmt.Stringer,
-) (string, string) {
+) (string, string, error) {
 	t.Helper()
 
-	resp := doMCPPostWithStartupRetry(
+	resp, err := doMCPPostWithStartupRetry(
 		t,
 		addr,
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
@@ -1218,8 +1319,11 @@ func initializeRunMCPListenerSessionWithStartupRetry(
 		stderr,
 		acceptMCPInitializeResponse,
 	)
+	if err != nil {
+		return "", "", err
+	}
 	defer func() { _ = resp.Body.Close() }()
-	return resp.Header.Get("Mcp-Session-Id"), resp.Header.Get("Pipelock-Session-Token")
+	return resp.Header.Get("Mcp-Session-Id"), resp.Header.Get("Pipelock-Session-Token"), nil
 }
 
 func postRunMCPListenerToolCall(t *testing.T, baseURL, sessionID, token, wantBody string) string {

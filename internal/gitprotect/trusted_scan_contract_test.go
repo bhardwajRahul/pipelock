@@ -362,6 +362,161 @@ func TestTrustedScanBuildsItsOwnScanner(t *testing.T) {
 	}
 }
 
+func TestActionScanDiffDistinguishesFindingsFromUnverifiableInput(t *testing.T) {
+	t.Parallel()
+
+	step := actionScanDiffStep(t)
+
+	const stubs = `
+git() { printf '%s\n' 'diff --git a/file b/file' '--- a/file' '+++ b/file' '@@ -0,0 +1 @@' '+clean'; }
+pipelock() {
+  cat >/dev/null
+  case "${PIPELOCK_TEST_SCAN_MODE}" in
+    finding) echo '[{"file":"x","line":1,"pattern":"AWS Access ID","severity":"critical"}]'; return 1 ;;
+    failed)  echo "ERROR: unverifiable input: no recognizable unified diff structure" >&2; return 2 ;;
+  esac
+  echo '[]'
+  return 0
+}
+`
+
+	for _, tc := range []struct {
+		name           string
+		scanMode       string
+		failOnFindings string
+		wantPass       bool
+		want           string
+		mustNotContain string
+	}{
+		{
+			name:           "failed scan fails closed and is not called a finding",
+			scanMode:       "failed",
+			failOnFindings: "true",
+			want:           "could not scan the PR diff",
+			mustNotContain: "Secrets detected in PR diff",
+		},
+		{
+			name:           "finding fails when enabled",
+			scanMode:       "finding",
+			failOnFindings: "true",
+			want:           "Secrets detected in PR diff",
+		},
+		{
+			name:           "finding warns when disabled",
+			scanMode:       "finding",
+			failOnFindings: "false",
+			wantPass:       true,
+			want:           "Potential secrets detected in PR diff",
+		},
+		{
+			// The dangerous direction: a scan that never ran must not go green
+			// just because fail-on-findings is off.
+			name:           "failed scan still fails when fail-on-findings is disabled",
+			scanMode:       "failed",
+			failOnFindings: "false",
+			want:           "could not scan the PR diff",
+			mustNotContain: "No secrets found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), "bash")
+			cmd.Stdin = strings.NewReader(stubs + step.Run)
+			cmd.Env = append(os.Environ(),
+				"PIPELOCK_TEST_SCAN_MODE="+tc.scanMode,
+				"PIPELOCK_FAIL_ON_FINDINGS="+tc.failOnFindings,
+				"PIPELOCK_EXCLUDE=",
+				"BASE_REF=main",
+				"CONFIG_PATH=",
+			)
+			output, err := cmd.CombinedOutput()
+			if tc.wantPass && err != nil {
+				t.Fatalf("scan action failed: %v\n%s", err, output)
+			}
+			if !tc.wantPass && err == nil {
+				t.Fatalf("scan action passed unexpectedly:\n%s", output)
+			}
+			if !strings.Contains(string(output), tc.want) {
+				t.Fatalf("action output missing %q:\n%s", tc.want, output)
+			}
+			if tc.mustNotContain != "" && strings.Contains(string(output), tc.mustNotContain) {
+				t.Fatalf("action misreported scanner error as finding:\n%s", output)
+			}
+		})
+	}
+}
+
+// findActionStep reads an action definition and returns the named step.
+//
+// It returns errors rather than failing the test so its own failure paths can
+// be exercised directly. A missing step is an error, not an empty result: the
+// tests that consume this assert on the step's contents, and an empty step
+// would satisfy several of those assertions vacuously.
+func findActionStep(path, name string) (workflowStep, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return workflowStep{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var action struct {
+		Runs struct {
+			Steps []workflowStep `yaml:"steps"`
+		} `yaml:"runs"`
+	}
+	if err := yaml.Unmarshal(data, &action); err != nil {
+		return workflowStep{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	for _, step := range action.Runs.Steps {
+		if step.Name == name {
+			return step, nil
+		}
+	}
+	return workflowStep{}, fmt.Errorf("%s has no %q step", path, name)
+}
+
+func actionScanDiffStep(t *testing.T) workflowStep {
+	t.Helper()
+
+	step, err := findActionStep(filepath.Join("..", "..", "action.yml"), "Scan PR diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return step
+}
+
+func TestFindActionStepReportsItsFailures(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	unparseable := filepath.Join(dir, "unparseable.yml")
+	if err := os.WriteFile(unparseable, []byte("runs: [this: is: not: valid\n"), 0o600); err != nil {
+		t.Fatalf("write unparseable action: %v", err)
+	}
+	stepless := filepath.Join(dir, "stepless.yml")
+	if err := os.WriteFile(stepless, []byte("runs:\n  steps:\n    - name: Something Else\n"), 0o600); err != nil {
+		t.Fatalf("write stepless action: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "file that does not exist", path: filepath.Join(dir, "absent.yml"), want: "read"},
+		{name: "file that is not valid YAML", path: unparseable, want: "parse"},
+		{name: "action without the step", path: stepless, want: "no \"Scan PR diff\" step"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := findActionStep(tc.path, "Scan PR diff")
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // TestContinueOnErrorFailsOpenAcrossYAMLShapes covers every form YAML admits
 // for continue-on-error, because the parsed type differs per shape and getting
 // one wrong silently permits a fail-open gate.
