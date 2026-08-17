@@ -13,6 +13,8 @@ that introduced the drift.
 from __future__ import annotations
 
 import unittest
+
+import yaml
 from pathlib import Path
 
 
@@ -257,6 +259,36 @@ class TestReleaseArtifacts(unittest.TestCase):
                     self.workflow,
                 )
 
+    def _release_job_runs(self) -> list[tuple[str, str]]:
+        """Return (step name, run script) for every step of the release job.
+
+        Reading the parsed workflow rather than its text is the point. A string
+        search is satisfied by a comment or an echo that merely mentions a
+        command, and it cannot tell which step a command belongs to.
+        """
+        parsed = yaml.safe_load(WORKFLOW.read_text())
+        steps = parsed["jobs"]["release"]["steps"]
+        return [
+            (step.get("name", ""), step["run"])
+            for step in steps
+            if isinstance(step, dict) and isinstance(step.get("run"), str)
+        ]
+
+    @staticmethod
+    def _executable_lines(script: str) -> list[str]:
+        """Return the lines of a run script that actually execute.
+
+        Comments do not run, so a check that accepts them proves nothing about
+        what the step does.
+        """
+        lines = []
+        for raw in script.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(line)
+        return lines
+
     def test_github_release_promotion_follows_proof_bundle_and_chart(self) -> None:
         goreleaser = self.workflow.index("- name: Run GoReleaser")
         proof_gate = self.workflow.index("- name: Verify attestation")
@@ -265,8 +297,65 @@ class TestReleaseArtifacts(unittest.TestCase):
         bundle_gate = self.workflow.index("- name: Verify Kubernetes image digest bundle attestation")
         upload = self.workflow.index("- name: Upload Kubernetes image digest bundle")
         chart = self.workflow.index("- name: Publish Helm chart")
-        promotion = self.workflow.index("- name: Publish GitHub release")
+        promotion = self.workflow.index("- name: Verify the release manifest signature and publish")
         self.assertIn('gh release edit "$GITHUB_REF_NAME" --draft=false', self.workflow)
+
+        # Release assets stay mutable while the release is a draft, and the job
+        # holds contents: write, so verifying and then promoting in one step
+        # NARROWS the window in which a verified manifest could be replaced. It
+        # does not close it. Preventing the substitution outright needs an
+        # immutable or pinned publication mechanism, which GitHub releases do not
+        # provide.
+        #
+        # Both commands must live inside the promotion step for even that
+        # narrowing to hold, so the ordering is asserted within the step's own
+        # text. Searching the whole workflow would pass while the two sat in
+        # different steps, which is the arrangement this is meant to rule out.
+        undraft_cmd = 'gh release edit "$GITHUB_REF_NAME" --draft=false'
+        verify_cmd = "go run ./cmd/pipelock-release-manifest --verify --manifest"
+
+        runs = self._release_job_runs()
+        promotion_steps = [
+            script
+            for name, script in runs
+            if name == "Verify the release manifest signature and publish"
+        ]
+        self.assertEqual(len(promotion_steps), 1, "expected exactly one promotion step")
+        promotion_lines = self._executable_lines(promotion_steps[0])
+
+        # The release must leave draft in exactly one place. An undraft anywhere
+        # else could publish before verification while a check scoped to this
+        # step still passed.
+        undrafting_steps = [
+            name for name, script in runs
+            if any(undraft_cmd in line for line in self._executable_lines(script))
+        ]
+        self.assertEqual(
+            undrafting_steps,
+            ["Verify the release manifest signature and publish"],
+            f"draft removal must happen only in the promotion step, found {undrafting_steps}",
+        )
+
+        # Both commands must EXECUTE here, not merely appear, and the verifier
+        # must be able to stop the publish. `... --verify --manifest x || true`
+        # starts with the verifier and permits an invalid signature through, so
+        # the line is required to be the canonical command exactly: no shell
+        # operator, no error suppression, no redirection appended to it.
+        canonical_verify = f'{verify_cmd} "$verify_dir/release.json"'
+        verify_at = [i for i, line in enumerate(promotion_lines) if canonical_verify in line]
+        undraft_at = [i for i, line in enumerate(promotion_lines) if undraft_cmd in line]
+        self.assertEqual(len(verify_at), 1, "promotion step must run the verifier exactly once")
+        self.assertEqual(len(undraft_at), 1, "promotion step must undraft exactly once")
+        for i in verify_at + undraft_at:
+            self.assertNotRegex(
+                promotion_lines[i],
+                r"(\|\||&&|;|\||>|<|\btrue\b)",
+                f"release-gating command must fail closed, found: {promotion_lines[i]}",
+            )
+        self.assertEqual(promotion_lines[verify_at[0]], canonical_verify)
+        self.assertEqual(promotion_lines[undraft_at[0]], undraft_cmd)
+        self.assertLess(verify_at[0], undraft_at[0])
+        self.assertNotIn("- name: Publish GitHub release", self.workflow)
 
         self.assertLess(goreleaser, proof_gate)
         self.assertLess(proof_gate, bundle)
