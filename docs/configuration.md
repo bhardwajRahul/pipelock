@@ -1593,6 +1593,20 @@ airlock:
     drain_timeout_seconds: 30  # drain deadline for in-flight completion
 ```
 
+`airlock.triggers` accepts exactly `on_elevated`, `on_high` and `on_critical`.
+Three fields that existed in 3.3.0 are rejected at config load in 3.4.0:
+
+| Removed field | Why |
+|---|---|
+| `on_severity` | Parsed and validated, never read. Setting it changed nothing. |
+| `anomaly_count` | Same. Airlock fires from the three severity triggers. |
+| `anomaly_window_minutes` | Same. |
+
+All three were inert: they passed validation and had no effect on enforcement, so
+a config carrying them described a policy the product was not applying. Loading
+now fails with the replacement named rather than accepting a setting that does
+nothing. Remove the old keys and set the severity triggers instead.
+
 ## Event Emission
 
 Forward audit events to external systems. Three independent sinks (webhook, syslog, OTLP), each with its own severity filter. Emission is fire-and-forget and never blocks the proxy.
