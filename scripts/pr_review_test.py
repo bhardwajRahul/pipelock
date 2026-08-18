@@ -1066,6 +1066,234 @@ class StructuredOutputSafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(pr_review.ModelOutputError, "invalid severity or path"):
             pr_review.parse_findings(outside, {"internal/a.go"})
 
+    def test_publication_sanitizer_redacts_credentials_in_model_prose(self) -> None:
+        """A finding may quote the very line it complains about.
+
+        The sanitizer flattens markdown and mentions, which is formatting safety
+        and not leak safety. Before this, a real credential appearing inside model
+        prose was published to a public pull-request comment under the workflow
+        token.
+
+        Sample prefixes are decoded from hex so this file carries no literal
+        credential string for a scanner to flag; the comment on each line names
+        the class it exercises.
+        """
+        hexed = {
+            "aws-access-key": ("414b4941", "QYLPMN5EXAMPLE99"),
+            "github-token": ("6768705f", "A" * 36),
+            "github-pat": ("6769746875625f7061745f", "B" * 30),
+            "slack-token": ("786f78622d", "1234567890-abcdefghij"),
+            "stripe-key": ("736b5f6c6976655f", "C" * 20),
+            "anthropic-key": ("736b2d616e742d", "api03-" + "D" * 30),
+            "google-api-key": ("41497a61", "E" * 35),
+            "npm-token": ("6e706d5f", "F" * 36),
+            "jwt": ("65794a68624763694f694a49557a49314e694a39", ".eyJzdWIiOiIxIn0." + "G" * 24),
+            "openai-key": ("736b2d", "I" * 30),
+            "bearer-token": ("6265617265722039", "J" * 24),
+            "private-key-block": ("2d2d2d2d2d424547494e", " RSA PRIVATE" + " KEY-----"),
+        }
+        for label, (prefix_hex, suffix) in hexed.items():
+            with self.subTest(credential=label):
+                sample = bytes.fromhex(prefix_hex).decode() + suffix
+                rendered = pr_review.sanitize_public_text(
+                    f"The diff hardcodes {sample} on line 42; read it from the environment.",
+                    limit=600,
+                )
+                self.assertNotIn(sample, rendered)
+                self.assertIn(label, rendered)
+
+    def test_a_separator_inside_the_body_does_not_shorten_a_token_past_its_minimum(self) -> None:
+        """A length minimum cannot be rescued by an optional separator.
+
+        The markdown translation removes underscores, so a body of 35 characters
+        holding one underscore becomes 34 and falls under the pattern's own minimum.
+        Scanning only the published text matched neither form and published the token
+        whole. Reproduced before both passes were restored.
+        """
+        prefix = bytes.fromhex("41497a61").decode()
+        body = "a" * 17 + "_" + "b" * 17
+        self.assertEqual(len(body), 35)
+        sample = prefix + body
+        rendered = pr_review.sanitize_public_text(
+            f"the diff hardcodes {sample} here", limit=600
+        )
+        self.assertNotIn(sample, rendered)
+        self.assertNotIn(sample.replace("_", ""), rendered)
+        self.assertIn("google-api-key", rendered)
+
+    def test_an_exempt_key_with_a_credential_suffix_is_not_laundered(self) -> None:
+        """The exemption must not break a surrounding credential match.
+
+        A hyphen can continue a credential body, so treating it as a boundary
+        exempted the documentation key inside a longer value, which broke the match
+        around it, and the placeholder was then restored with the whole value.
+        """
+        dummy = bytes.fromhex("414b4941").decode() + "IOSFODNN7" + "EXAMPLE"
+        value = dummy + "-suffix9"
+        rendered = pr_review.sanitize_public_text(
+            f"Authorization: bearer {value} rotate it", limit=600
+        )
+        self.assertNotIn(value, rendered)
+        self.assertIn("redacted:", rendered)
+
+    def test_ordinary_prose_is_preserved_exactly(self) -> None:
+        """Absence of a marker is weaker than preservation of the text.
+
+        A redactor could mangle prose without emitting a marker, so these assert the
+        sentence survives intact rather than merely unredacted. Trailing punctuation
+        is kept out of the comparison because the sanitizer legitimately rewrites
+        markdown characters.
+        """
+        for text in (
+            "The scanner rejects a bearer token in the query string, which is correct.",
+            "Rename shouldReturn to mustReturn for consistency with the sibling package.",
+            "Consider extracting the two credential checks into a shared helper.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pr_review.sanitize_public_text(text, limit=600), text)
+
+    def test_private_key_block_is_redacted_body_and_all(self) -> None:
+        """The delimiter alone is not the secret; the body is.
+
+        The pattern matched only the begin delimiter, so a finding quoting a key
+        had its header replaced and its encoded body published. Covers each key
+        type this is likely to see, and asserts the body is gone rather than just
+        that a marker appeared.
+        """
+        body = "MIIEowIBAAKCAQEA" + "b" * 40
+        for kind in ("RSA ", "EC ", "OPENSSH ", ""):
+            with self.subTest(key_type=kind.strip() or "plain"):
+                begin = "-----BEGIN" + " " + kind + "PRIVATE" + " KEY-----"
+                end = "-----END" + " " + kind + "PRIVATE" + " KEY-----"
+                rendered = pr_review.sanitize_public_text(
+                    f"the diff contains {begin}{body}{end} inline", limit=900
+                )
+                self.assertNotIn(body, rendered)
+                self.assertIn("private-key-block", rendered)
+
+    def test_unterminated_private_key_block_is_still_redacted(self) -> None:
+        """A block with no end delimiter must not publish whole.
+
+        Matching begin-through-end alone fails open here: a truncated quote, or a
+        deliberately unterminated block, matches nothing. The fallback redacts to
+        the end of the text instead, which over-redacts the remainder of a finding
+        that quotes key material and is the correct trade.
+        """
+        body = "MIIEowIBAAKCAQEA" + "c" * 40
+        begin = "-----BEGIN" + " RSA PRIVATE" + " KEY-----"
+        rendered = pr_review.sanitize_public_text(
+            f"the diff contains {begin}{body} and nothing else", limit=900
+        )
+        self.assertNotIn(body, rendered)
+        self.assertIn("private-key-block", rendered)
+
+    def test_private_key_prose_is_not_redacted(self) -> None:
+        """Talking about keys is not quoting one."""
+        rendered = pr_review.sanitize_public_text(
+            "Do not commit a private key to the repository; read it from the environment.",
+            limit=300,
+        )
+        self.assertNotIn("redacted:", rendered)
+
+    def test_credential_split_by_a_removed_markdown_character_is_redacted(self) -> None:
+        """The translation step removes characters, so a split token reassembles.
+
+        Redacting before that step was not enough. A token carrying one removed
+        markdown character failed to match beforehand and then came back together
+        as a whole credential in the published text. Reproduced on PR 1287 before
+        this was fixed.
+        """
+        prefix = bytes.fromhex("6768705f").decode()
+        body = "A" * 36
+        for splitter in ("*", "_", "|", "#", "`"):
+            with self.subTest(splitter=splitter):
+                split = prefix + body[:10] + splitter + body[10:]
+                rendered = pr_review.sanitize_public_text(f"hardcoded {split} here", limit=600)
+                reassembled = (prefix + body).replace("_", "")
+                self.assertNotIn(reassembled, rendered)
+                self.assertIn("-token", rendered)
+
+    def test_documentation_key_is_exempt_only_as_a_standalone_token(self) -> None:
+        """Exempting it as a substring let a longer token through.
+
+        The allowlist replaced every occurrence, including inside a longer
+        credential-shaped value, and the remaining suffix could then evade the
+        pattern while the surrounding text was published.
+        """
+        dummy = bytes.fromhex("414b4941").decode() + "IOSFODNN7" + "EXAMPLE"
+        embedded = dummy + "TRAILINGSECRET99"
+        rendered = pr_review.sanitize_public_text(f"key {embedded} here", limit=600)
+        self.assertNotIn(embedded, rendered)
+        # Without this, the test passes when only the trailing part is redacted and
+        # the exempted key itself survives in the output.
+        self.assertNotIn(dummy, rendered)
+        self.assertIn("aws-access-key", rendered)
+
+    def test_bearer_pattern_does_not_match_ordinary_hyphenated_prose(self) -> None:
+        """The value must look like a credential, not merely be long.
+
+        Requiring no digit made the pattern fire on any sufficiently long
+        hyphenated phrase after the word, which is ordinary review prose.
+        """
+        rendered = pr_review.sanitize_public_text(
+            "Pass the bearer authorization-header-for-the-client instead.", limit=600
+        )
+        self.assertNotIn("redacted:", rendered)
+
+    def test_credential_redaction_precedes_underscore_stripping(self) -> None:
+        """Ordering is the whole correctness of the redaction step.
+
+        The markdown translation strips underscores, so a token redacted after it
+        would already have been rewritten into a shape the patterns cannot match.
+        This asserts the ordering directly rather than trusting it.
+        """
+        sample = bytes.fromhex("6768705f").decode() + "H" * 36
+        rendered = pr_review.sanitize_public_text(f"token {sample} here", limit=300)
+        self.assertIn("github-token", rendered)
+        self.assertNotIn(sample, rendered)
+        self.assertNotIn(sample.replace("_", ""), rendered)
+
+    def test_credential_redaction_leaves_ordinary_review_prose_intact(self) -> None:
+        """Over-redaction is a failure direction too.
+
+        A redactor that mangles normal review prose gets the reviewer distrusted
+        and then ignored. Generic high-entropy matching is deliberately omitted for
+        that reason, so these cases must survive untouched.
+        """
+        for text in (
+            "The scanner rejects a bearer token in the query string, which is correct.",
+            "Rename shouldReturn to mustReturn for consistency with the sibling package.",
+            "This test asserts exit code 2, but the guard returns 1, so the fetch proceeds.",
+            "Consider extracting the two credential checks into a shared helper.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("redacted:", pr_review.sanitize_public_text(text, limit=600))
+
+    def test_credential_redaction_allows_the_vendor_documentation_key(self) -> None:
+        """The published dummy key appears in this repository's own docs.
+
+        A review may legitimately discuss it, and the scanner carves it out for the
+        same reason, so redacting it here would be a false positive on a
+        documentation conversation.
+        """
+        dummy = bytes.fromhex("414b4941").decode() + "IOSFODNN7" + "EXAMPLE"
+        rendered = pr_review.sanitize_public_text(
+            f"The example key {dummy} in the fixture is the vendor's published dummy.",
+            limit=600,
+        )
+        self.assertIn(dummy, rendered)
+        self.assertNotIn("redacted:", rendered)
+
+    def test_credential_redaction_marker_is_visible_not_silent(self) -> None:
+        """Silently deleting a credential would misdescribe what the model said.
+
+        A reader of the published finding must be able to tell that something was
+        removed, otherwise the comment reads as the model's actual words.
+        """
+        sample = bytes.fromhex("414b4941").decode() + "QYLPMN5EXAMPLE99"
+        rendered = pr_review.sanitize_public_text(f"found {sample}", limit=300)
+        self.assertIn("redacted", rendered)
+
     def test_publication_sanitizer_removes_mentions_commands_and_markup(self) -> None:
         rendered = pr_review.sanitize_public_text(
             "@victim run /review deep <script> [click]", limit=300
