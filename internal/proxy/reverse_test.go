@@ -6,12 +6,12 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/crc32"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -773,37 +773,75 @@ func TestReverseProxy_BinaryPassthrough(t *testing.T) {
 	}
 }
 
-// buildMinimalValidPNG returns an 8-byte signature + IHDR + IDAT + IEND
-// chunk stream with valid CRCs. Shared PNG fixture for tests that need a
-// passthrough-eligible image body.
+// buildMinimalValidPNG returns a decoder-valid PNG fixture for request and
+// response tests. Encoding it through image/png avoids treating signature-plus-
+// filler bytes as an honest image fixture.
 func buildMinimalValidPNG() []byte {
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff})
 	var b bytes.Buffer
-	b.Write([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
-	writeChunk := func(typ string, data []byte) {
-		n := len(data)
-		if n < 0 || n > math.MaxUint32 {
-			panic("buildMinimalValidPNG: length overflow")
-		}
-		lenBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBytes, uint32(n))
-		b.Write(lenBytes)
-		b.WriteString(typ)
-		b.Write(data)
-		crc := crc32.NewIEEE()
-		_, _ = crc.Write([]byte(typ))
-		_, _ = crc.Write(data)
-		crcBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(crcBytes, crc.Sum32())
-		b.Write(crcBytes)
+	if err := png.Encode(&b, img); err != nil {
+		panic(fmt.Sprintf("encode minimal PNG: %v", err))
 	}
-	writeChunk("IHDR", []byte("\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"))
-	writeChunk("IDAT", []byte("fake pixel data"))
-	writeChunk("IEND", nil)
 	return b.Bytes()
 }
 
-func TestReverseProxy_BinaryRequestPassthrough(t *testing.T) {
+func TestReverseProxy_BinaryRequestSecretIsBlocked(t *testing.T) {
 	cfg := reverseTestConfig()
+	upstreamHit := false
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+
+	proxy := reverseTestSetup(t, cfg, upstream)
+
+	// Eight real PNG signature bytes followed by plaintext AWS-shaped secret.
+	// The signature only establishes the old bypass precondition; it does not
+	// make the trailing credential safe to forward.
+	imageData := "\x89PNG\r\n\x1a\n" + ("AKIA" + "IOSFODNN7EXAMPLE")
+	resp := testPost(t, proxy.URL+"/upload",
+		"image/png", imageData)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 (PNG signature must not bypass DLP), got %d", resp.StatusCode)
+	}
+	if upstreamHit {
+		t.Fatal("upstream received a signature-prefixed secret")
+	}
+}
+
+func TestReverseProxy_ValidImageWithAppendedSecretIsBlocked(t *testing.T) {
+	// The signature-prefix test above uses eight bytes and nothing else, so it
+	// could pass because the body is malformed rather than because the secret
+	// was found. A structurally valid PNG with a credential appended can only
+	// be blocked by inspecting the body, which is what this change claims to do.
+	cfg := reverseTestConfig()
+	var upstreamHit bool
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}
+
+	proxy := reverseTestSetup(t, cfg, upstream)
+
+	imageData := string(buildMinimalValidPNG()) + ("AKIA" + "IOSFODNN7EXAMPLE")
+	resp := testPost(t, proxy.URL+"/upload", "image/png", imageData)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for a valid PNG carrying a credential, got %d", resp.StatusCode)
+	}
+	if upstreamHit {
+		t.Fatal("upstream received a valid image with an appended credential")
+	}
+}
+
+func TestReverseProxy_GenuineImageRequestPasses(t *testing.T) {
+	cfg := reverseTestConfig()
+	imageData := buildMinimalValidPNG()
 	var receivedBody []byte
 	upstream := func(w http.ResponseWriter, r *http.Request) {
 		receivedBody, _ = io.ReadAll(r.Body)
@@ -811,18 +849,205 @@ func TestReverseProxy_BinaryRequestPassthrough(t *testing.T) {
 	}
 
 	proxy := reverseTestSetup(t, cfg, upstream)
-
-	// Send binary content type - should skip DLP scanning.
-	imageData := "\x89PNG\r\n\x1a\n" + ("AKIA" + "IOSFODNN7EXAMPLE")
-	resp := testPost(t, proxy.URL+"/upload",
-		"image/png", imageData)
+	resp := testPost(t, proxy.URL+"/upload", "image/png", string(imageData))
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 (binary skip), got %d", resp.StatusCode)
+		t.Fatalf("expected 200 for a clean PNG, got %d", resp.StatusCode)
 	}
-	if string(receivedBody) != imageData {
-		t.Fatal("binary request body was modified or blocked")
+	if !bytes.Equal(receivedBody, imageData) {
+		t.Fatal("clean PNG request body changed before forwarding")
+	}
+}
+
+// TestReverseProxy_FakeBinaryRequestIsScanned reproduces the fail-open
+// carve-out where a request declaring a binary Content-Type (image/png)
+// skipped DLP scanning entirely regardless of what the body actually
+// contained. A body that is plaintext carrying a credential - not real PNG
+// bytes - must fall through to the normal DLP scan and be blocked, the
+// same as if it had declared application/json.
+func TestReverseProxy_FakeBinaryRequestIsScanned(t *testing.T) {
+	cfg := reverseTestConfig()
+	upstreamHit := false
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+
+	proxy := reverseTestSetup(t, cfg, upstream)
+
+	// No PNG magic bytes anywhere - plain JSON carrying a credential,
+	// mislabeled as image/png.
+	apiKey := "AKIA" + "IOSFODNN7EXAMPLE"
+	fakeImageData := `{"secret":"` + apiKey + `"}`
+	resp := testPost(t, proxy.URL+"/upload", "image/png", fakeImageData)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 (fake binary content-type must not bypass DLP), got %d", resp.StatusCode)
+	}
+	if upstreamHit {
+		t.Fatal("upstream received the request; a mislabeled body must be blocked before forwarding")
+	}
+}
+
+func TestReverseProxy_LargeGenuineImageRequestIsBlockedBeforeReading(t *testing.T) {
+	cfg := reverseTestConfig()
+	cfg.RequestBodyScanning.MaxBodyBytes = 1024
+
+	upstreamHit := false
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+
+	proxy := reverseTestSetup(t, cfg, upstream)
+
+	imageData := buildLargeValidPNG(t)
+	if len(imageData) <= cfg.RequestBodyScanning.MaxBodyBytes {
+		t.Fatalf("large PNG size = %d, want > %d", len(imageData), cfg.RequestBodyScanning.MaxBodyBytes)
+	}
+	resp := testPost(t, proxy.URL+"/upload", "image/png", string(imageData))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for declared oversize PNG, got %d", resp.StatusCode)
+	}
+	if upstreamHit {
+		t.Fatal("upstream received an oversized image")
+	}
+}
+
+func buildLargeValidPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 128, 128))
+	for y := 0; y < 128; y++ {
+		for x := 0; x < 128; x++ {
+			img.SetNRGBA(x, y, color.NRGBA{
+				R: byte((x*37 + y*17) % 256),
+				G: byte((x*11 + y*43) % 256),
+				B: byte((x*29 + y*7) % 256),
+				A: 0xff,
+			})
+		}
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatalf("encode large PNG: %v", err)
+	}
+	return b.Bytes()
+}
+
+type reverseBodyReadTracker struct {
+	reads atomic.Int32
+}
+
+func (r *reverseBodyReadTracker) Read(_ []byte) (int, error) {
+	r.reads.Add(1)
+	return 0, io.EOF
+}
+
+func TestReverseProxy_DeclaredOversizeRejectedBeforeBodyRead(t *testing.T) {
+	cfg := reverseTestConfig()
+	cfg.RequestBodyScanning.MaxBodyBytes = 1024
+	upstreamHit := false
+	_, handler := reverseTestSetupWithHandler(t, cfg, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	body := &reverseBodyReadTracker{}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://proxy.test/upload", body)
+	req.Header.Set("Content-Type", "image/png")
+	req.ContentLength = int64(cfg.RequestBodyScanning.MaxBodyBytes + 1)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.Code)
+	}
+	if got := body.reads.Load(); got != 0 {
+		t.Fatalf("declared oversize body was read %d times", got)
+	}
+	if upstreamHit {
+		t.Fatal("upstream received a declared oversized request")
+	}
+}
+
+func TestReverseProxy_RequestScanInflightBudgetBoundsConcurrentBodies(t *testing.T) {
+	cfg := reverseTestConfig()
+	cfg.RequestBodyScanning.MaxBodyBytes = 1024
+	cfg.ReverseProxy.MaxInflightScanBytes = 1024
+
+	entered := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseUpstream)
+		})
+	}
+	t.Cleanup(release)
+	var upstreamCalls atomic.Int32
+	proxy, handler := reverseTestSetupWithHandler(t, cfg, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		close(entered)
+		<-releaseUpstream
+		w.WriteHeader(http.StatusOK)
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxy.URL+"/upload", strings.NewReader("clean"))
+		if err != nil {
+			firstDone <- err
+			return
+		}
+		req.Header.Set("Content-Type", "image/png")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			firstDone <- err
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			firstDone <- fmt.Errorf("first status = %d, want 200", resp.StatusCode)
+			return
+		}
+		firstDone <- nil
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached the upstream")
+	}
+	if got := handler.requestScanBudget.inflightBytes.Load(); got != int64(cfg.RequestBodyScanning.MaxBodyBytes) {
+		t.Fatalf("reserved bytes = %d, want %d", got, cfg.RequestBodyScanning.MaxBodyBytes)
+	}
+
+	second := testPost(t, proxy.URL+"/upload", "image/png", "clean")
+	defer func() { _ = second.Body.Close() }()
+	if second.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want 503 from in-flight scan admission", second.StatusCode)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1; admitted body was forwarded without a reservation", got)
+	}
+
+	release()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request did not complete")
+	}
+	if got := handler.requestScanBudget.inflightBytes.Load(); got != 0 {
+		t.Fatalf("reserved bytes after first request = %d, want 0", got)
 	}
 }
 

@@ -727,10 +727,6 @@ func (s *Scanner) checkCoreDLP(parsed *url.URL) Result {
 	}
 
 	decodedQuery := IterativeDecode(parsed.RawQuery)
-	type dlpTarget struct {
-		text      string
-		viewLabel string
-	}
 	targets := []dlpTarget{
 		{parsed.Path, dlpViewLabel("url_path")},
 		{decodedQuery, dlpViewLabel("url_query")},
@@ -788,16 +784,7 @@ func (s *Scanner) checkCoreDLP(parsed *url.URL) Result {
 	}
 
 	// Ordered query-value concatenation (catches secrets split across params).
-	if parsed.RawQuery != "" && strings.Contains(parsed.RawQuery, "&") {
-		concat := orderedQueryConcat(parsed.RawQuery)
-		targets = append(targets, dlpTarget{concat, dlpViewLabel("query_concat")})
-		for _, d := range decodeEncodingsRecursive(concat) {
-			targets = append(targets, dlpTarget{d.text, dlpViewLabel(d.encoding)})
-		}
-		if stripped := stripURLNoise(concat); stripped != concat {
-			targets = append(targets, dlpTarget{stripped, dlpViewLabel("query_concat_noise_stripped")})
-		}
-	}
+	targets = appendQueryConcatTargets(targets, parsed.RawQuery)
 
 	// Coarse full-URL fallback runs after component targets so path/query spans
 	// keep their more precise view labels when both views match.
@@ -834,7 +821,9 @@ func (s *Scanner) checkCoreDLP(parsed *url.URL) Result {
 }
 
 // querySubsequenceCoreDLP checks ordered combinations of query values against
-// core DLP patterns. Mirrors the main scanner's querySubsequenceDLP.
+// core DLP patterns. Mirrors the main scanner's querySubsequenceDLP -- see
+// its doc comment for why the size-4 cap is a deliberately bounded secondary
+// defense, not the primary one, and is left unchanged.
 //
 //pipelock:provenance-transform query_subsequence
 func (s *Scanner) querySubsequenceCoreDLP(rawQuery string) Result {

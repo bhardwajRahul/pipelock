@@ -50,7 +50,8 @@ const (
 	// scanDirectionResponse labels an injection finding on the response body.
 	scanDirectionResponse = "response"
 
-	mediaUnscannedOutcome = "media_passthrough_unscanned"
+	mediaUnscannedOutcome                 = "media_passthrough_unscanned"
+	reverseRequestScanInflightBudgetLabel = "request_scan_inflight_budget"
 )
 
 // ReverseProxyBlockResponse is the JSON error body returned when the reverse
@@ -84,7 +85,36 @@ type ReverseProxyHandler struct {
 	reqPolicyFn          func(requestPolicyInput) requestPolicyResult                 // nil = disabled
 	reqPolicyPrepareFn   func(*http.Request, *requestPolicyInput) requestPolicyResult // nil = no body pre-read
 	sizeExemptScanBudget sizeExemptScanBudget
+	requestScanBudget    reverseRequestScanBudget
 	reloadMu             *sync.RWMutex
+}
+
+// reverseRequestScanBudget bounds the configured body-scan reservations held
+// by one reverse-proxy instance. Reservations deliberately span the complete
+// request exchange: the buffered body can stay reachable through r.Body and
+// mediation-envelope state until forwarding completes.
+type reverseRequestScanBudget struct {
+	inflightBytes atomic.Int64
+}
+
+func (b *reverseRequestScanBudget) reserve(bytesToReserve, limit int64) (func(), bool) {
+	if bytesToReserve <= 0 || limit < bytesToReserve {
+		return nil, false
+	}
+	for {
+		current := b.inflightBytes.Load()
+		if current > limit-bytesToReserve {
+			return nil, false
+		}
+		if b.inflightBytes.CompareAndSwap(current, current+bytesToReserve) {
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					b.inflightBytes.Add(-bytesToReserve)
+				})
+			}, true
+		}
+	}
 }
 
 // NewReverseProxy creates a reverse proxy handler that scans request and
@@ -806,6 +836,50 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	forwardedVerdict := config.ActionAllow
 	var reverseBodyBytes []byte
 	if r.Body != nil && r.ContentLength != 0 && cfg.RequestBodyScanning.Enabled {
+		maxBytes := reverseRequestScanMaxBytes(cfg)
+		if r.ContentLength > int64(maxBytes) {
+			reason := fmt.Sprintf("request body Content-Length %d exceeds max_body_bytes (%d)", r.ContentLength, maxBytes)
+			rp.metrics.RecordReverseProxyRequest(r.Method, strconv.Itoa(http.StatusRequestEntityTooLarge))
+			rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, scanner.ScannerDataBudget)
+			emitReverseReceipt(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   config.ActionBlock,
+				Layer:     scanner.ScannerDataBudget,
+				Pattern:   reason,
+				Transport: TransportReverse,
+				Method:    r.Method,
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			writeReverseProxyBlock(w, http.StatusRequestEntityTooLarge,
+				blockInfoFor(blockreason.DataBudget, scanner.ScannerDataBudget), reason)
+			return
+		}
+
+		inflightLimit := reverseRequestScanInflightLimit(cfg)
+		releaseRequestScan, reserved := rp.requestScanBudget.reserve(int64(maxBytes), int64(inflightLimit))
+		if !reserved {
+			reason := fmt.Sprintf("request body scan would reserve %d bytes and exceed this reverse proxy instance's max_inflight_scan_bytes %d bytes", maxBytes, inflightLimit)
+			rp.metrics.RecordReverseProxyRequest(r.Method, strconv.Itoa(http.StatusServiceUnavailable))
+			rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, reverseRequestScanInflightBudgetLabel)
+			emitReverseReceipt(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   config.ActionBlock,
+				Layer:     reverseRequestScanInflightBudgetLabel,
+				Pattern:   reason,
+				Transport: TransportReverse,
+				Method:    r.Method,
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			writeReverseProxyBlock(w, http.StatusServiceUnavailable,
+				blockInfoFor(blockreason.DataBudget, reverseRequestScanInflightBudgetLabel), reason)
+			return
+		}
+		defer releaseRequestScan()
+
 		redaction := currentRedactionRuntimeForConfig(cfg, rp.redactionRuntimePtr, sc)
 		blocked, verdict, bodyBytes, bodyFinding := rp.scanRequest(w, r, cfg, sc, redaction, reverseBlockReceiptInput{
 			RequestID: requestID,
@@ -1142,15 +1216,10 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 		_ = rp.emitReceipt(opts)
 	}
 
-	// Skip binary content types - no secrets to scan in images/video.
-	if isBinaryMIME(r.Header.Get("Content-Type")) && redaction == nil {
-		return false, "", nil, false
-	}
-
-	maxBytes := cfg.RequestBodyScanning.MaxBodyBytes
-	if maxBytes <= 0 {
-		maxBytes = reverseProxyMaxBodyBytes
-	}
+	// Media declarations and signatures are not a request-side DLP exemption.
+	// A real image can carry a plaintext credential after its valid bytes; body
+	// scanning has the same limit and deny behavior for every content type.
+	maxBytes := reverseRequestScanMaxBytes(cfg)
 
 	bodyReq := BodyScanRequest{
 		Body:            r.Body,
@@ -2171,6 +2240,21 @@ func isBinaryMIME(ct string) bool {
 	return strings.HasPrefix(mediaType, "image/") ||
 		strings.HasPrefix(mediaType, "audio/") ||
 		strings.HasPrefix(mediaType, "video/")
+}
+
+func reverseRequestScanMaxBytes(cfg *config.Config) int {
+	maxBytes := cfg.RequestBodyScanning.MaxBodyBytes
+	if maxBytes <= 0 {
+		return reverseProxyMaxBodyBytes
+	}
+	return maxBytes
+}
+
+func reverseRequestScanInflightLimit(cfg *config.Config) int {
+	if cfg.ReverseProxy.MaxInflightScanBytes <= 0 {
+		return config.DefaultReverseProxyMaxInflightScanBytes
+	}
+	return cfg.ReverseProxy.MaxInflightScanBytes
 }
 
 // reverseClientIP extracts a client IP for capture session keying. Falls
