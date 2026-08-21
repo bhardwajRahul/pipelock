@@ -83,17 +83,20 @@ def unit(identifier: int, path: str, category: str, *, additions: int = 1, token
 
 
 class WorkflowPackagingTest(unittest.TestCase):
-    def test_caller_authorizes_comments_and_dispatches_to_the_same_identity(self) -> None:
+    def test_caller_authorizes_owner_comments_without_manual_dispatch(self) -> None:
         # Exercise the parsed workflow shape. String searches against a YAML
         # file were bypassed before by a comment or an unrelated scalar with
         # the same words.
         caller = load_yaml(CALLER_WORKFLOW)
         events = caller["on"]
+        # The exact event set, not a blacklist of one name. Naming
+        # workflow_dispatch alone would still admit pull_request_target,
+        # repository_dispatch, or a push trigger, each of which is another way
+        # for something other than a default-branch owner comment to start a run
+        # holding the review credential. The property is which events may start
+        # this workflow, so the assertion is the whole set.
+        self.assertEqual(set(events), {"issue_comment"})
         self.assertEqual(events["issue_comment"]["types"], ["created"])
-        dispatch = events["workflow_dispatch"]
-        self.assertEqual(dispatch["inputs"]["pr_number"]["required"], "true")
-        self.assertEqual(dispatch["inputs"]["review_mode"]["type"], "choice")
-        self.assertEqual(dispatch["inputs"]["review_mode"]["options"], ["default", "deep"])
 
         review = caller["jobs"]["review"]
         self.assertEqual(review["uses"], "./.github/workflows/pr-review-reusable.yaml")
@@ -105,17 +108,27 @@ class WorkflowPackagingTest(unittest.TestCase):
         expected = (
             "github.actor == 'luckyPipewrench' && "
             "github.triggering_actor == 'luckyPipewrench' && "
-            "((github.event_name == 'issue_comment' && "
             "github.event.comment.user.login == 'luckyPipewrench' && "
             "github.event.comment.author_association == 'OWNER' && "
             "github.event.issue.pull_request && "
             "(github.event.comment.body == '/review' || "
-            "github.event.comment.body == '/review deep')) || "
-            "github.event_name == 'workflow_dispatch')"
+            "github.event.comment.body == '/review deep')"
         )
         self.assertEqual(" ".join(review["if"].split()), expected)
-        self.assertIn("inputs.pr_number", review["with"]["pr_number"])
-        self.assertIn("inputs.review_mode", review["with"]["review_mode"])
+        self.assertEqual(review["with"]["pr_number"], "${{ github.event.issue.number }}")
+        self.assertEqual(
+            " ".join(review["with"]["review_mode"].split()),
+            "${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}",
+        )
+
+    def test_reusable_workflow_is_reachable_only_through_a_caller(self) -> None:
+        # The caller is not the only way into the reviewer. Adding a trigger to
+        # the reusable workflow would give it an entry point of its own, and a
+        # manual one there would be branch-selected in exactly the way removing
+        # it from the caller was meant to prevent. Asserting the caller alone
+        # left that door untested, so this asserts the same property on the
+        # workflow the caller delegates to.
+        self.assertEqual(set(load_yaml(REUSABLE_WORKFLOW)["on"]), {"workflow_call"})
 
     def test_reusable_workflow_uses_non_cancelling_pr_concurrency(self) -> None:
         workflow = load_yaml(REUSABLE_WORKFLOW)
@@ -1991,7 +2004,7 @@ class GuideAccuracyTest(unittest.TestCase):
                 # naming nothing a reader can open.
                 self.assertTrue((ROOT / path).is_file(), f"the guide names {path}, which is not a file")
 
-    def test_the_guide_explains_how_to_test_a_change_to_this_workflow(self) -> None:
+    def test_the_guide_keeps_review_credentials_on_default_branch_code(self) -> None:
         # The single most expensive thing to not know here: a comment-triggered
         # workflow runs only the default-branch copy, so a change cannot be
         # tested by the pull request that makes it. Every regression in this
@@ -2000,12 +2013,13 @@ class GuideAccuracyTest(unittest.TestCase):
         guide = self.GUIDE.read_text(encoding="utf-8")
         self.assertIn("## Changing the reviewer", guide)
         self.assertIn("## Propagating a change to the other repositories", guide)
-        self.assertIn("workflow_dispatch", guide)
+        self.assertIn("Do not add `workflow_dispatch`", guide)
+        self.assertIn("Test caller changes after they merge", guide)
         caller = load_yaml(CALLER_WORKFLOW)
-        self.assertIn(
+        self.assertNotIn(
             "workflow_dispatch",
             caller["on"],
-            "the guide documents a dispatch the caller must actually offer",
+            "manual dispatch can run branch-selected workflow code with review credentials",
         )
 
 
@@ -2099,42 +2113,8 @@ class RepeatReviewTest(unittest.TestCase):
         self.assertEqual(pr_review.previously_reported([legacy]), {"aaaaaaaaaaaa"})
         self.assertIsNone(pr_review.completed_identical_review([legacy], self.IDENTITY, "default"))
 
-    def test_workflow_dispatch_runs_even_when_a_matching_review_exists(self) -> None:
-        # Asserts the invariant rather than the implementation. An earlier
-        # version asserted the comment scan was never reached on a dispatch,
-        # which stopped being true once the scan also collects the notices that
-        # keep a declined command from commenting every time. The property that
-        # matters is that a matching completed review cannot stop a dispatch.
-        binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
-        matching = {
-            "state": "findings",
-            "identity": binding.correlation,
-            "mode": "default",
-            "model": pr_review.model_binding("default"),
-            "findings": "",
-            "html_url": "u",
-        }
-        self.assertIsNotNone(
-            pr_review.completed_identical_review([matching], binding.correlation, "default"),
-            "the marker must be one that WOULD skip a comment-triggered run",
-        )
-        with tempfile.NamedTemporaryFile() as output, mock.patch.dict(
-            pr_review.os.environ, {"GITHUB_OUTPUT": output.name, "GITHUB_EVENT_NAME": "workflow_dispatch"}, clear=False
-        ), mock.patch.object(pr_review, "get_pull_binding", return_value=binding), mock.patch.object(
-            pr_review, "scan_status_comments", return_value=([matching], set(), True)
-        ), mock.patch.object(pr_review, "find_running_comment", return_value=(None, True)), mock.patch.object(
-            pr_review, "create_comment", return_value={"id": 17}
-        ) as create:
-            pr_review.claim_review("owner/repo", "42", "token", "default", "c" * 40)
-            output.seek(0)
-            values = output.read().decode("utf-8")
-        self.assertIn("claimed=true", values)
-        self.assertIn("state=running", create.call_args.args[3])
-
     def test_a_comment_triggered_run_does_skip_that_same_review(self) -> None:
-        # The paired negative. Without it the dispatch test above could pass
-        # because nothing skips at all, which is the failure mode of a guard
-        # that only ever proves the permissive direction.
+        # A matching completed review must stop another provider call.
         binding = pr_review.PullBinding("a" * 40, "b" * 40, "c" * 40, pr_review.RUBRIC_VERSION)
         matching = {
             "state": "findings",
@@ -2534,10 +2514,6 @@ class AdoptionStubTest(unittest.TestCase):
     published stub is compared against the real caller here.
     """
 
-    # A caller outside this repository must name the reviewer by immutable
-    # commit, where a same-repository call resolves it implicitly. Those two
-    # keys are expected to differ; nothing else is.
-    EXPECTED_DIFFERENCES = frozenset({"uses", "reviewer_sha"})
     PLACEHOLDER_LOGIN = "YOUR_GITHUB_LOGIN"
     REAL_LOGIN = "luckyPipewrench"
 
@@ -2565,66 +2541,25 @@ class AdoptionStubTest(unittest.TestCase):
             return {key: AdoptionStubTest.collapse(item) for key, item in value.items()}
         return value
 
-    @staticmethod
-    def triggers(document: dict[str, object]) -> object:
-        """Compare what a trigger accepts, not how it describes itself.
-
-        An input's description is text shown to whoever runs the dispatch. It
-        carries no behavior, and requiring two copies of it to match word for
-        word would fail on an improved wording. A guard that fails on
-        harmless edits gets removed, so this compares the contract instead:
-        which inputs exist, whether each is required, its type, its default
-        and its permitted values.
-        """
-        events = AdoptionStubTest.collapse(document.get("on"))
-        dispatch = events.get("workflow_dispatch") if isinstance(events, dict) else None
-        if isinstance(dispatch, dict) and isinstance(dispatch.get("inputs"), dict):
-            dispatch["inputs"] = {
-                name: {key: value for key, value in spec.items() if key != "description"}
-                for name, spec in dispatch["inputs"].items()
-            }
-        return events
-
     def test_documented_stub_matches_the_caller_this_repository_runs(self) -> None:
         stub = self.documented_stub()
         real = load_yaml(CALLER_WORKFLOW)
+        stub_contract = self.collapse(stub)
+        real_contract = self.collapse(real)
 
+        # An external caller names the reusable workflow and reviewer source by
+        # immutable commit, while this repository resolves its local workflow at
+        # github.sha. Normalize exactly those two repository-specific values,
+        # then compare the complete executable example: trigger, permissions,
+        # guard, target, inputs, and secrets.
+        stub_contract["jobs"]["review"]["uses"] = real_contract["jobs"]["review"]["uses"]
+        stub_contract["jobs"]["review"]["with"]["reviewer_sha"] = real_contract["jobs"]["review"]["with"][
+            "reviewer_sha"
+        ]
         self.assertEqual(
-            self.triggers(stub),
-            self.triggers(real),
-            "the stub must offer the same triggers, including the manual dispatch that "
-            "makes a change to a caller testable before it merges",
-        )
-        self.assertEqual(
-            stub.get("permissions"),
-            real.get("permissions"),
-            "a called workflow cannot hold a permission its caller withheld, so a stub "
-            "granting less silently strips it from the reviewer",
-        )
-
-        stub_job = stub["jobs"]["review"]
-        real_job = real["jobs"]["review"]
-        self.assertEqual(
-            self.collapse(stub_job.get("if")),
-            self.collapse(real_job.get("if")),
-            "the stub must authorize exactly who the real caller authorizes",
-        )
-        self.assertEqual(
-            stub_job.get("secrets"),
-            real_job.get("secrets"),
-            "every secret is mapped by name because personal accounts cannot inherit them",
-        )
-
-        stub_with = self.collapse(stub_job.get("with"))
-        real_with = self.collapse(real_job.get("with"))
-        self.assertEqual(
-            set(stub_with), set(real_with), "the stub must pass the same inputs"
-        )
-        differing = {key for key in stub_with if stub_with[key] != real_with[key]}
-        self.assertEqual(
-            differing,
-            self.EXPECTED_DIFFERENCES & set(stub_with),
-            "only the reviewer pin may differ between an external stub and this caller",
+            stub_contract,
+            real_contract,
+            "the documented caller may differ only in its immutable external workflow pins",
         )
 
     def test_stub_pins_the_reviewer_by_commit_in_both_positions(self) -> None:
