@@ -1442,7 +1442,7 @@ func TestScanRequestBody_JSONImageDataURLWithoutImageMagicStillScansPayloadText(
 	}
 }
 
-func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstringWarns(t *testing.T) {
+func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstringBlocks(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
@@ -1466,13 +1466,14 @@ func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstring
 		Path:                         testTrustedProviderPath,
 		MaxBytes:                     cfg.RequestBodyScanning.MaxBodyBytes,
 		Scanner:                      sc,
+		Action:                       cfg.RequestBodyScanning.Action,
 		TrustedProviderOpaqueRequest: testTrustedProviderOpaqueRequest,
 	})
 	if result.Clean {
-		t.Fatal("expected embedded token-shaped substring in opaque provider field to stay visible as warn")
+		t.Fatal("expected embedded token-shaped substring in opaque provider field to stay visible")
 	}
-	if result.Action != config.ActionWarn {
-		t.Fatalf("expected warn action for provider opaque field, got action=%q matches=%v reason=%q", result.Action, result.DLPMatches, result.Reason)
+	if result.Action != config.ActionBlock {
+		t.Fatalf("expected block action for unverified provider opaque field, got action=%q matches=%v reason=%q", result.Action, result.DLPMatches, result.Reason)
 	}
 	if len(result.DLPMatches) == 0 {
 		t.Fatal("expected provider opaque field DLP matches to remain visible")
@@ -1485,8 +1486,8 @@ func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstring
 			t.Fatalf("provider opaque provenance must not reuse scanner warn state: %+v", match)
 		}
 	}
-	if shouldHardBlockBodyCriticalDLP(result, testTrustedProviderHost, cfg) {
-		t.Fatal("provider opaque field warn-only match must not hard-block")
+	if !shouldHardBlockBodyCriticalDLP(result, testTrustedProviderHost, cfg) {
+		t.Fatal("provider opaque field has no local authenticity proof and must hard-block")
 	}
 }
 
@@ -1606,7 +1607,7 @@ func TestExtractBodyTextForDLP_ProviderOpaqueWrongValueShapeScansNormally(t *tes
 	}
 }
 
-func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
+func TestScanRequestBody_ProviderOpaqueProvenanceNeverDowngradesDLP(t *testing.T) {
 	cfg := testScannerConfig()
 
 	opaqueValue := func(totalBytes int) string {
@@ -1633,7 +1634,7 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 		path           string
 		valueBytes     int
 		useDefaultGate bool
-		wantWarn       bool
+		wantOpaque     bool
 	}{
 		{
 			name:       "trusted host non-allowlisted path blocks",
@@ -1648,11 +1649,11 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			valueBytes: providerOpaqueCiphertextMinBytes - 1,
 		},
 		{
-			name:       "256 byte value warns",
+			name:       "256 byte value keeps provenance and blocks",
 			host:       testTrustedProviderHost,
 			path:       testTrustedProviderPath,
 			valueBytes: providerOpaqueCiphertextMinBytes,
-			wantWarn:   true,
+			wantOpaque: true,
 		},
 		{
 			name:           "nil gate uses production allowlist",
@@ -1660,7 +1661,7 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			path:           "/v1/responses",
 			valueBytes:     providerOpaqueCiphertextMinBytes,
 			useDefaultGate: true,
-			wantWarn:       true,
+			wantOpaque:     true,
 		},
 		{
 			name:           "nil gate rejects sibling endpoint",
@@ -1695,16 +1696,72 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			if result.Clean {
 				t.Fatal("expected GitHub token finding")
 			}
-			if tt.wantWarn {
-				if result.Action != config.ActionWarn {
-					t.Fatalf("Action = %q, want warn; matches=%+v", result.Action, result.DLPMatches)
-				}
+			if result.Action != config.ActionBlock {
+				t.Fatalf("Action = %q, want block; matches=%+v", result.Action, result.DLPMatches)
+			}
+			if tt.wantOpaque {
 				if len(result.DLPMatches) == 0 || !result.DLPMatches[0].ProviderOpaque {
 					t.Fatalf("matches = %+v, want provider-opaque provenance", result.DLPMatches)
+				}
+				if !shouldHardBlockBodyCriticalDLP(result, tt.host, cfg) {
+					t.Fatal("unverified provider-opaque critical match must hard-block")
 				}
 				return
 			}
 			assertBodyDLPBlocksWithoutProviderOpaque(t, result, tt.name)
+		})
+	}
+}
+
+func TestProviderOpaqueRequestDLPConfiguredActions(t *testing.T) {
+	tests := []struct {
+		name           string
+		patternName    string
+		defaultAction  string
+		patternActions map[string]string
+		wantAction     string
+		wantHardBlock  bool
+	}{
+		{
+			name:          "default warn remains visible but critical core blocks",
+			patternName:   "GitHub Token",
+			defaultAction: config.ActionWarn,
+			wantAction:    config.ActionWarn,
+			wantHardBlock: true,
+		},
+		{
+			name:           "core pattern override cannot weaken block",
+			patternName:    "GitHub Token",
+			defaultAction:  config.ActionBlock,
+			patternActions: map[string]string{"GitHub Token": config.ActionWarn},
+			wantAction:     config.ActionBlock,
+			wantHardBlock:  true,
+		},
+		{
+			name:           "configured non-core warning remains operator controlled",
+			patternName:    testBodyDLPPatternName,
+			defaultAction:  config.ActionBlock,
+			patternActions: map[string]string{testBodyDLPPatternName: config.ActionWarn},
+			wantAction:     config.ActionWarn,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testScannerConfig()
+			cfg.RequestBodyScanning.Action = tt.defaultAction
+			cfg.RequestBodyScanning.PatternActions = tt.patternActions
+			matches := []scanner.TextDLPMatch{{
+				PatternName:    tt.patternName,
+				Severity:       config.SeverityCritical,
+				ProviderOpaque: true,
+			}}
+			if got := requestBodyDLPAction(matches, tt.defaultAction, tt.patternActions); got != tt.wantAction {
+				t.Fatalf("requestBodyDLPAction = %q, want %q", got, tt.wantAction)
+			}
+			if got := shouldHardBlockRequestDLP(matches, cfg); got != tt.wantHardBlock {
+				t.Fatalf("shouldHardBlockRequestDLP = %v, want %v", got, tt.wantHardBlock)
+			}
 		})
 	}
 }
