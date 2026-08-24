@@ -121,6 +121,10 @@ const (
 	// the transport that originated the request rather than the
 	// hardcoded default. See Info 2 on the envelope-signing review.
 	ctxKeyRedirectTransport
+	// ctxKeyRedirectSessionRecorder carries the exact admission-time session
+	// recorder into CheckRedirect so policy is re-evaluated against the same
+	// identity and state on every hop.
+	ctxKeyRedirectSessionRecorder
 
 	// ctxKeySSRFDialScanSnapshot carries the DNS answers from an allowed
 	// scanner SSRF pass into the later dial-time re-resolution. The safe
@@ -179,6 +183,7 @@ type blockedRequestError struct {
 	reason string
 	detail string
 	target string
+	taint  *taintDecision
 }
 
 func (e *blockedRequestError) Error() string {
@@ -221,6 +226,12 @@ func newRedirectBlockedRequest(originLayer, reason string) *blockedRequestError 
 		layer = "redirect"
 	}
 	return newBlockedRequestError(layer, fullReason, fullReason)
+}
+
+func newRedirectTaintBlockedRequest(decision taintDecision, reason string) *blockedRequestError {
+	blockedErr := newRedirectBlockedRequest("taint_policy", reason)
+	blockedErr.taint = &decision
+	return blockedErr
 }
 
 func newEnvelopeBlockedRequest(err error) *blockedRequestError {
@@ -762,6 +773,34 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
 				logger.LogBlocked(actx, "git_protection", "redirect from "+originalURL+" blocked: "+gitPush.Reason)
 				return newRedirectBlockedRequest("git_protection", gitPush.Reason)
+			}
+			redirectRec, _ := req.Context().Value(ctxKeyRedirectSessionRecorder).(session.Recorder)
+			redirectTaint := evaluateHTTPTaint(currentCfg, redirectRec, req.Method, req.URL)
+			if redirectTaint.Result.Decision == session.PolicyAsk || redirectTaint.Result.Decision == session.PolicyBlock {
+				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				logger.LogTaintDecision(actx, audit.TaintDecision{
+					TaintLevel: redirectTaint.Risk.Level.String(), ActionClass: redirectTaint.ActionClass.String(),
+					Sensitivity: redirectTaint.Sensitivity.String(), Authority: redirectTaint.Authority.String(),
+					Decision: redirectTaint.Result.Decision.String(), Reason: redirectTaint.Result.Reason,
+					SourceURL: redirectTaint.Risk.SecurityOriginURL(), SourceKind: redirectTaint.Risk.SecurityOriginKind(),
+				})
+			}
+			switch redirectTaint.Result.Decision {
+			case session.PolicyBlock:
+				return newRedirectTaintBlockedRequest(redirectTaint, redirectTaint.Result.Reason)
+			case session.PolicyAsk:
+				approved, blockReason := p.resolveTaintAsk(agentName, redirectURL, req.Method, redirectTaint.Result.Reason)
+				if !approved {
+					return newRedirectTaintBlockedRequest(redirectTaint, blockReason)
+				}
+			}
+			if redirectSess, ok := redirectRec.(*SessionState); ok && redirectSess != nil {
+				tier := airlockTierForScope(redirectSess, adaptiveScopeForHost(req.URL.Hostname()))
+				if allowed, reason := ClassifyAction(tier, req.Method, redirectTransport, false); !allowed {
+					logger.LogAirlockDeny(redirectSess.key, tier, redirectTransport, req.Method, clientIP, requestID)
+					p.metrics.RecordAirlockDenial(tier, redirectTransport, req.Method)
+					return newRedirectBlockedRequest("airlock", reason)
+				}
 			}
 
 			// request_policy runs before the contract gate so a contract
@@ -4769,6 +4808,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, parsed.Hostname(), effectiveURLPort(parsed), result)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -4932,6 +4972,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
+			redirectTaint := fetchTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			resp := FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -4948,15 +4992,24 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				resp.Hint = "Request was redirected to a different origin. Cross-origin redirects are blocked to prevent open redirect attacks."
 			}
 			emitFetchReceipt(receipt.EmitOpts{
-				ActionID:  actionID,
-				Verdict:   config.ActionBlock,
-				Layer:     blockedErr.layer,
-				Pattern:   blockedErr.reason,
-				Transport: "fetch",
-				Method:    http.MethodGet,
-				Target:    redirectReceiptTarget(blockedErr, displayURL),
-				RequestID: requestID,
-				Agent:     agent,
+				ActionID:            actionID,
+				Verdict:             config.ActionBlock,
+				Layer:               blockedErr.layer,
+				Pattern:             blockedErr.reason,
+				Transport:           "fetch",
+				Method:              http.MethodGet,
+				Target:              redirectReceiptTarget(blockedErr, displayURL),
+				RequestID:           requestID,
+				Agent:               agent,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
 				redirectBlockedInfo(blockedErr),

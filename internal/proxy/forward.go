@@ -24,7 +24,6 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
-	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
@@ -1207,22 +1206,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case session.PolicyAsk:
 		forwardRequiresReauth = true
-		decision := hitl.DecisionBlock
-		blockReason := forwardTaint.Result.Reason
-		switch {
-		case p.approver == nil:
-			blockReason += " (no HITL approver)"
-		case !p.approver.IsTerminal():
-			blockReason += " (HITL stdin is not a terminal)"
-		default:
-			decision = p.approver.Ask(&hitl.Request{
-				Agent:   agent,
-				URL:     targetURL,
-				Reason:  forwardTaint.Result.Reason,
-				Preview: fmt.Sprintf("%s %s", r.Method, targetURL),
-			})
-		}
-		if decision != hitl.DecisionAllow {
+		approved, blockReason := p.resolveTaintAsk(agent, targetURL, r.Method, forwardTaint.Result.Reason)
+		if !approved {
 			emitForwardReceipt(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -1908,6 +1893,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportForward)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, forwardRec)
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, r.URL.Hostname(), effectiveURLPort(r.URL), result)
 	outReq := r.Clone(ctx)
 	outReq.RequestURI = "" // required for http.Client
@@ -2051,6 +2037,13 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			p.logger.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
+			// A redirect-time taint denial supersedes the admission decision.
+			// Preserve whether the matrix blocked outright or requested HITL;
+			// the receipt verdict already records the terminal block outcome.
+			redirectTaint := forwardTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -2061,15 +2054,15 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				Target:              redirectReceiptTarget(blockedErr, targetURL),
 				RequestID:           requestID,
 				Agent:               agent,
-				SessionTaintLevel:   forwardTaint.Risk.Level.String(),
-				SessionContaminated: forwardTaint.Risk.Contaminated,
-				RecentTaintSources:  forwardTaint.Risk.Sources,
-				SessionTaskID:       forwardTaint.Task.CurrentTaskID,
-				SessionTaskLabel:    forwardTaint.Task.CurrentTaskLabel,
-				AuthorityKind:       forwardTaint.Authority.String(),
-				TaintDecision:       forwardTaint.Result.Decision.String(),
-				TaintDecisionReason: forwardTaint.Result.Reason,
-				TaskOverrideApplied: forwardTaint.TaskOverrideApplied,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			}))
 			p.metrics.RecordBlocked(r.URL.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
 			// Open-redirect hint fires on any fail-closed redirect
