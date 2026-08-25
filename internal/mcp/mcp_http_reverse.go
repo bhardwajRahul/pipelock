@@ -200,6 +200,9 @@ func RunHTTPListenerProxy(
 	if opts.AuthorityDestination == "" {
 		opts.AuthorityDestination = upstreamURL
 	}
+	if opts.A2ACardURL == "" {
+		opts.A2ACardURL = upstreamURL
+	}
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
 		return fmt.Errorf("contract upstream evaluation: %w", gateErr)
 	} else if gate.Verdict == config.ActionBlock {
@@ -288,6 +291,9 @@ func RunHTTPListenerProxy(
 		DoWForgetSession:          opts.DoWForgetSession,
 		A2ACfg:                    opts.a2aCfg(),
 		A2ACfgFn:                  opts.A2ACfgFn,
+		CardBaseline:              opts.CardBaseline,
+		A2ACardURL:                opts.A2ACardURL,
+		A2ACardAuthFingerprint:    opts.A2ACardAuthFingerprint,
 		MediaPolicy:               opts.mediaPolicy(),
 		MediaPolicyFn:             opts.MediaPolicyFn,
 		ServerName:                opts.ServerName,
@@ -959,6 +965,7 @@ func RunHTTPListenerProxy(
 			baselineOpts.BaselineRec = baselineRec
 			defer recordMCPBaselineSample(baselineOpts, nil)
 			reqOpts := requestBaseOpts
+			reqOpts.A2ACardAuthFingerprint = CardCacheKeyFromRequest("", upReq.Header.Get("Authorization")).authFingerprint
 			reqOpts.Rec = reqRec
 			reqOpts.BaselineRec = baselineRec
 			reqOpts.AdaptiveCfg = adaptiveCfg
@@ -1592,7 +1599,7 @@ func RunHTTPListenerProxy(
 		// HTTP attachment alone does not correlate the JSON-RPC envelope. A
 		// hostile upstream can answer request 1 with result 999, or inject a
 		// concurrent request's ID, so validate the exact client request ID.
-		responseTracker := NewStrictRequestTracker(frame.ID)
+		responseTracker := NewStrictRequestTrackerFor(frame.ID, frame.Method)
 		upstreamIsSSE := transport.HasSingleSSEContentType(upResp.Header)
 		if setupState && upstreamIsSSE {
 			w.Header().Set("Content-Type", "application/json")
@@ -1609,6 +1616,7 @@ func RunHTTPListenerProxy(
 		var buf bytes.Buffer
 		bufWriter := &syncWriter{w: &buf}
 		reqOpts := requestBaseOpts
+		reqOpts.A2ACardAuthFingerprint = CardCacheKeyFromRequest("", upReq.Header.Get("Authorization")).authFingerprint
 		reqOpts.Rec = reqRec
 		reqOpts.BaselineRec = baselineRec
 		reqOpts.AdaptiveCfg = adaptiveCfg

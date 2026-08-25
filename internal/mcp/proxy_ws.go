@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -47,6 +49,10 @@ func RunWSProxy(
 	if opts.AuthorityDestination == "" {
 		opts.AuthorityDestination = upstreamURL
 	}
+	if opts.A2ACardURL == "" {
+		opts.A2ACardURL = upstreamURL
+	}
+	opts.A2ACardURL = a2aCardURLForWSUpstream(opts.A2ACardURL)
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
 		return fmt.Errorf("contract upstream evaluation: %w", gateErr)
 	} else if gate.Verdict == config.ActionBlock {
@@ -239,7 +245,7 @@ func RunWSProxy(
 		// Only track requests (have "method"), not client responses to
 		// server-initiated calls, to prevent tracker pollution.
 		if isRequest(msg) {
-			tracker.Track(frame.ID)
+			tracker.TrackRequest(frame.ID, frame.Method)
 		}
 
 		// Forward to upstream.
@@ -267,4 +273,21 @@ func RunWSProxy(
 		return lastScanErr
 	}
 	return nil
+}
+
+// a2aCardURLForWSUpstream maps a WebSocket endpoint to the equivalent HTTP
+// origin used by Agent Card signature key scopes. The path remains part of the
+// drift key, while ws and wss carry the same authority as http and https.
+func a2aCardURLForWSUpstream(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	return u.String()
 }

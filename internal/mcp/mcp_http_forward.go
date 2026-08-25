@@ -134,6 +134,12 @@ func RunHTTPProxy(
 	if opts.AuthorityDestination == "" {
 		opts.AuthorityDestination = upstreamURL
 	}
+	if opts.A2ACardURL == "" {
+		opts.A2ACardURL = upstreamURL
+	}
+	if opts.A2ACardAuthFingerprint == "" {
+		opts.A2ACardAuthFingerprint = CardCacheKeyFromRequest("", extraHeaders.Get("Authorization")).authFingerprint
+	}
 	opts.TaintExternalSource = true
 
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
@@ -315,7 +321,7 @@ func RunHTTPProxy(
 						upstreamMu.Lock()
 						defer upstreamMu.Unlock()
 						if isRequest(deferredReq.ForwardMessage) {
-							tracker.Track(deferredReq.ID)
+							tracker.TrackRequest(deferredReq.ID, deferredReq.Method)
 						}
 						respReader, sendErr := httpClient.SendMessage(ctx, deferredReq.ForwardMessage)
 						if sendErr != nil {
@@ -391,9 +397,11 @@ func RunHTTPProxy(
 		// server-initiated calls, to prevent tracker pollution.
 		if isRequest(msg) {
 			if decision.Outcome.Receipt.ActionID != "" {
-				tracker.TrackOutcome(frame.ID, decision.Outcome)
+				outcome := decision.Outcome
+				outcome.Method = frame.Method
+				tracker.TrackOutcome(frame.ID, outcome)
 			} else {
-				tracker.Track(frame.ID)
+				tracker.TrackRequest(frame.ID, frame.Method)
 			}
 		}
 
