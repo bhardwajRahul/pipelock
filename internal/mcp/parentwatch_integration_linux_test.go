@@ -569,15 +569,21 @@ func TestRunProxyWithSandbox_BestEffortChildSurvivesSiblingReaper(t *testing.T) 
 	// session under test and behaves exactly like a foreign session's reaper.
 	const foreignDirectPID = -1
 	sweeperDone := make(chan struct{})
+	sweeperReady := make(chan struct{})
 	sweeperStopped := make(chan struct{})
+	var sweeps atomic.Uint64
 	go func() {
 		defer close(sweeperStopped)
+		reapAdoptedZombies(foreignDirectPID)
+		sweeps.Add(1)
+		close(sweeperReady)
 		for {
 			select {
 			case <-sweeperDone:
 				return
 			default:
 				reapAdoptedZombies(foreignDirectPID)
+				sweeps.Add(1)
 			}
 		}
 	}()
@@ -585,11 +591,75 @@ func TestRunProxyWithSandbox_BestEffortChildSurvivesSiblingReaper(t *testing.T) 
 		close(sweeperDone)
 		<-sweeperStopped
 	}()
+	select {
+	case <-sweeperReady:
+	case <-ctx.Done():
+		t.Fatalf("sibling reaper did not complete its startup sweep: %v", ctx.Err())
+	}
+	if sweeps.Load() == 0 {
+		t.Fatal("sibling reaper signaled readiness without a completed sweep")
+	}
 
 	var logBuf syncBuffer
 	cmd := exec.CommandContext(ctx, "cat")
 	if err := RunProxyWithSandbox(ctx, cmd, strings.NewReader(""), io.Discard, &logBuf, opts); err != nil {
-		t.Fatalf("best-effort sandbox proxy with a concurrent sibling reaper = %v, want the session to keep its own child", err)
+		t.Fatalf("best-effort sandbox proxy with a concurrent sibling reaper = %v, want the session to keep its own child (sweeps=%d, %s, log=%q)",
+			err, sweeps.Load(), describeSandboxLifecycleFailure(ctx, err), logBuf.String())
+	}
+}
+
+// describeSandboxLifecycleFailure turns the three materially different
+// failures of the sibling-reaper regression into observable CI evidence. A
+// generic "subprocess exited" failure cannot distinguish a test-clock expiry,
+// a sibling stealing cmd.Wait's child status, and a termination initiated by
+// the proxy or exec.CommandContext.
+func describeSandboxLifecycleFailure(ctx context.Context, err error) string {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Sprintf("context=%v", ctxErr)
+	}
+	if errors.Is(err, syscall.ECHILD) {
+		return "child-status=stolen-by-sibling-reaper"
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return fmt.Sprintf("child-signal=%v", status.Signal())
+		}
+	}
+	return "child-status=unexpected-error-shape"
+}
+
+func TestDescribeSandboxLifecycleFailure(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancel()
+	expired, expire := context.WithTimeout(context.Background(), 0)
+	defer expire()
+	<-expired.Done()
+
+	terminated := exec.CommandContext(t.Context(), "/bin/sh", "-c", "kill -TERM $$").Run()
+	if terminated == nil {
+		t.Fatal("terminated-child fixture exited successfully")
+	}
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want string
+	}{
+		{name: "cancelled context", ctx: cancelled, err: errors.New("ignored once context expires"), want: "context=context canceled"},
+		{name: "expired deadline", ctx: expired, err: errors.New("ignored once context expires"), want: "context=context deadline exceeded"},
+		{name: "stolen child", ctx: context.Background(), err: syscall.ECHILD, want: "child-status=stolen-by-sibling-reaper"},
+		{name: "unexpected error", ctx: context.Background(), err: errors.New("unexpected"), want: "child-status=unexpected-error-shape"},
+		{name: "terminated child", ctx: context.Background(), err: terminated, want: "child-signal=terminated"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := describeSandboxLifecycleFailure(test.ctx, test.err); got != test.want {
+				t.Fatalf("diagnosis = %q, want %q (err=%v)", got, test.want, test.err)
+			}
+		})
 	}
 }
 
