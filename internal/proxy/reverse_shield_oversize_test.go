@@ -582,6 +582,94 @@ func TestReverseProxy_ShieldUnderCap_ScrubsWholeBody(t *testing.T) {
 	}
 }
 
+// A reverse response that crosses the normal scan ceiling exercises the real
+// size-exempt bounded reader and holds its memory reservation until Browser
+// Shield finishes. The tracking pixel sits past both the normal scan ceiling
+// and max_shield_bytes, proving the entire admitted body was rewritten.
+func TestReverseProxy_ShieldSizeExempt_ScrubsBoundedWholeBody(t *testing.T) {
+	const shieldCap = 2048
+
+	page := "<html><body>" + strings.Repeat("safe document text ", reverseProxyMaxBodyBytes/19+1) +
+		`<img src="https://tracker.vendor.example/p.gif" width="1" height="1"></body></html>`
+	if len(page) <= reverseProxyMaxBodyBytes {
+		t.Fatalf("test page size %d must exceed normal reverse scan ceiling %d", len(page), reverseProxyMaxBodyBytes)
+	}
+
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, page)
+	}))
+	t.Cleanup(upstreamSrv.Close)
+
+	upstreamURL, err := url.Parse(upstreamSrv.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	tests := []struct {
+		name                    string
+		responseScanningEnabled bool
+		scanMaxBytes            int
+		inflightMaxBytes        int
+		wantStatus              int
+		wantBodyContains        string
+	}{
+		{name: "response_scanning_enabled", responseScanningEnabled: true, scanMaxBytes: len(page) + 1024, wantStatus: http.StatusOK},
+		{name: "shield_only", responseScanningEnabled: false, scanMaxBytes: len(page) + 1024, wantStatus: http.StatusOK},
+		{name: "shield_only_exceeds_bounded_ceiling", responseScanningEnabled: false, scanMaxBytes: shieldCap * 2, wantStatus: http.StatusForbidden},
+		{name: "shield_only_exceeds_inflight_budget", responseScanningEnabled: false, scanMaxBytes: len(page) + 1024, inflightMaxBytes: shieldCap, wantStatus: http.StatusForbidden, wantBodyContains: "response_scanning.size_exempt_scan_max_inflight_bytes"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := reverseTestConfig()
+			cfg.ResponseScanning.Enabled = tc.responseScanningEnabled
+			cfg.BrowserShield.Enabled = true
+			cfg.BrowserShield.Strictness = config.ShieldStrictnessStandard
+			cfg.BrowserShield.StripTrackingPixels = true
+			cfg.BrowserShield.MaxShieldBytes = shieldCap
+			cfg.BrowserShield.OversizeAction = config.ShieldOversizeBlock
+			cfg.ResponseScanning.SizeExemptDomains = []string{"127.0.0.1"}
+			cfg.ResponseScanning.SizeExemptScanMaxBytes = tc.scanMaxBytes
+			cfg.ResponseScanning.SizeExemptScanMaxInflightBytes = cfg.ResponseScanning.SizeExemptScanMaxBytes
+			if tc.inflightMaxBytes > 0 {
+				cfg.ResponseScanning.SizeExemptScanMaxInflightBytes = tc.inflightMaxBytes
+			}
+
+			sc := scanner.MustNew(cfg)
+			t.Cleanup(sc.Close)
+
+			var cfgPtr atomic.Pointer[config.Config]
+			var scPtr atomic.Pointer[scanner.Scanner]
+			cfgPtr.Store(cfg)
+			scPtr.Store(sc)
+
+			logger, _ := audit.New("json", "stdout", "", false, false)
+			t.Cleanup(logger.Close)
+			handler := NewReverseProxy(upstreamURL, &cfgPtr, &scPtr, logger, metrics.New(), killswitch.New(cfg), nil, shield.NewEngine(nil))
+			proxySrv := httptest.NewServer(handler)
+			t.Cleanup(proxySrv.Close)
+
+			resp := testGet(t, proxySrv.URL+"/page")
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("bounded size-exempt response status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if tc.wantStatus == http.StatusOK && strings.Contains(string(body), "tracker.vendor.example") {
+				t.Fatal("tracking pixel beyond the ordinary shield cap survived whole-body shielding")
+			}
+			if tc.wantStatus == http.StatusOK && !strings.Contains(string(body), "</body></html>") {
+				t.Fatal("bounded whole-body shielding did not preserve the response tail")
+			}
+			if tc.wantBodyContains != "" && !strings.Contains(string(body), tc.wantBodyContains) {
+				t.Fatalf("response body %q does not contain %q", body, tc.wantBodyContains)
+			}
+		})
+	}
+}
+
 // Browser Shield is independent of response injection scanning. Disabling the
 // latter must not make reverse responses bypass an explicitly enabled shield.
 func TestReverseProxy_ShieldRunsWhenResponseScanningDisabled(t *testing.T) {

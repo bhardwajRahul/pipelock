@@ -1498,7 +1498,7 @@ func (rp *ReverseProxyHandler) modifyResponse(resp *http.Response) error {
 	revRespSizeExempt := isResponseSizeExempt(revHost, cfg.ResponseScanning.SizeExemptDomains)
 	shieldActiveForHost := rp.shieldEngine != nil && cfg.BrowserShield.Enabled &&
 		!isShieldExempt(revHost, cfg.BrowserShield.ExemptDomains)
-	applyShieldOversize := func(body []byte, complete bool) reverseShieldOversizeDecision {
+	applyShieldOversize := func(body []byte, complete bool, shieldMaxBytes int) reverseShieldOversizeDecision {
 		prefixLen := min(len(body), 512)
 		if shield.DetectPipeline(resp.Header.Get("Content-Type"), body[:prefixLen]) == shield.PipelineNone {
 			rp.metrics.RecordShieldSkipped("non_shieldable_content")
@@ -1506,16 +1506,16 @@ func (rp *ReverseProxyHandler) modifyResponse(resp *http.Response) error {
 		}
 
 		bodyBytes, bodyBytesExact := reverseObservedBodyBytes(resp.ContentLength, len(body), complete)
-		reason := shieldOversizeObservedReason(revHost, max(bodyBytes, len(body)), cfg.BrowserShield.MaxShieldBytes, bodyBytesExact)
+		reason := shieldOversizeObservedReason(revHost, max(bodyBytes, len(body)), shieldMaxBytes, bodyBytesExact)
 		actx := newHTTPAuditContext(rp.logger, resp.Request.Method, resp.Request.URL.String(), clientIP, requestID, "")
 		rp.metrics.RecordShieldSkipped("oversize")
 		switch cfg.BrowserShield.OversizeAction {
 		case config.ShieldOversizeScanHead:
 			rp.metrics.RecordShieldOversizeScanHead(TransportReverse)
 			rp.logger.LogAnomaly(actx, "shield_oversize_scan_head", reason, 0)
-			scanned := body[:cfg.BrowserShield.MaxShieldBytes]
+			scanned := body[:shieldMaxBytes]
 			head, summary := runShieldPipelineSharedResult(rp.shieldEngine, scanned, resp.Header.Get("Content-Type"), resp.Header, &cfg.BrowserShield, rp.metrics, TransportReverse)
-			summary = partialShieldSummary(summary, scanned, resp.Header.Get("Content-Type"), bodyBytes, cfg.BrowserShield.MaxShieldBytes)
+			summary = partialShieldSummary(summary, scanned, resp.Header.Get("Content-Type"), bodyBytes, shieldMaxBytes)
 			emitReverseReceipt(receipt.EmitOpts{
 				ActionID:       receipt.NewActionID(),
 				ParentActionID: actionID,
@@ -1531,7 +1531,7 @@ func (rp *ReverseProxyHandler) modifyResponse(resp *http.Response) error {
 				Agent:          agent,
 			})
 			return reverseShieldOversizeDecision{
-				body:          append(head, body[cfg.BrowserShield.MaxShieldBytes:]...),
+				body:          append(head, body[shieldMaxBytes:]...),
 				summary:       summary,
 				shieldable:    true,
 				outcomeReason: "shield_oversize_scan_head",
@@ -2003,9 +2003,38 @@ responseScanning:
 	// can pad the first maxBytes and place injection text after the scanning
 	// window. This matches request-side behavior (bodyscan.go blocks oversized
 	// requests) and ensures response scanning cannot be bypassed by size.
-	if len(body) > maxBytes {
+	if len(body) > maxBytes && shieldOnly && revRespSizeExempt {
+		var scanFailure *sizeExemptResponseReadError
+		var releaseSizeExemptScan sizeExemptScanRelease
+		body, releaseSizeExemptScan, scanFailure = rp.sizeExemptScanBudget.readBoundedSizeExemptResponse(revHost, body, resp.Body, cfg.ResponseScanning.SizeExemptScanMaxBytes, cfg.ResponseScanning.SizeExemptScanMaxInflightBytes)
+		if scanFailure != nil {
+			_ = resp.Body.Close()
+			rp.metrics.RecordReverseProxyRequest(resp.Request.Method, "403")
+			rp.metrics.RecordReverseProxyScanBlocked(scanDirectionResponse, string(scanFailure.Kind))
+			actx := newHTTPAuditContext(rp.logger, resp.Request.Method, resp.Request.URL.String(), clientIP, requestID, "")
+			if scanFailure.Err != nil {
+				rp.logger.LogError(actx, scanFailure.Err)
+			}
+			rp.logger.LogResponseScan(actx, config.ActionBlock, 0, []string{scanFailure.Reason}, nil)
+			emitReverseReceipt(receipt.EmitOpts{
+				ActionID:  actionID,
+				Verdict:   config.ActionBlock,
+				Layer:     LayerReverseResponseBlocked,
+				Pattern:   scanFailure.Reason,
+				Transport: "reverse",
+				Method:    resp.Request.Method,
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			replaceWithBlockResponse(resp, []string{scanFailure.Reason})
+			recordReverseOutcome(http.StatusForbidden, -1, string(scanFailure.Kind))
+			return nil
+		}
+		defer releaseSizeExemptScan()
+	} else if len(body) > maxBytes {
 		if shieldOnly && cfg.BrowserShield.MaxShieldBytes > 0 {
-			decision := applyShieldOversize(body, false)
+			decision := applyShieldOversize(body, false, cfg.BrowserShield.MaxShieldBytes)
 			if !decision.shieldable {
 				resp.Body = readCloserWithClose{
 					Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
@@ -2171,9 +2200,10 @@ responseScanning:
 		// read up to size_exempt_scan_max_bytes (64 MiB by default), well
 		// past the 5 MiB shield cap, so precisely the hosts trusted enough
 		// to scan whole were the ones losing the scrub.
-		oversize := cfg.BrowserShield.MaxShieldBytes > 0 && len(body) > cfg.BrowserShield.MaxShieldBytes
+		shieldMaxBytes := shieldMaxBytesForResponse(cfg, revHost, TransportReverse)
+		oversize := shieldMaxBytes > 0 && len(body) > shieldMaxBytes
 		if oversize {
-			decision := applyShieldOversize(body, true)
+			decision := applyShieldOversize(body, true, shieldMaxBytes)
 			if decision.blocked {
 				return nil
 			}
