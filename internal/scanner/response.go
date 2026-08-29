@@ -66,6 +66,40 @@ func (s *Scanner) ScanResponse(ctx context.Context, content string) ResponseScan
 	return s.ScanResponseWithSuppress(ctx, content, "", nil)
 }
 
+// ScanResponseBodyWithSuppress scans a raw HTTP response body. For verified PNG
+// and JPEG bodies it scans textual metadata but excludes compressed pixel data,
+// which can contain accidental pattern-shaped bytes. Declared Content-Type is
+// not consulted, so mislabeled text still takes the ordinary fail-closed path.
+func (s *Scanner) ScanResponseBodyWithSuppress(ctx context.Context, body []byte, suppressTarget string, suppress []config.SuppressEntry) ResponseScanResult {
+	if ctx != nil && ctx.Err() != nil {
+		return s.ScanResponseWithSuppress(ctx, "", suppressTarget, suppress)
+	}
+	metadata, image, err := responseImageMetadata(body)
+	if !image {
+		return s.ScanResponseWithSuppress(ctx, string(body), suppressTarget, suppress)
+	}
+	if err != nil {
+		return ResponseScanResult{
+			Clean: false,
+			Matches: []ResponseMatch{{
+				PatternName: "image_metadata_invalid",
+				MatchText:   err.Error(),
+			}},
+		}
+	}
+	if len(metadata) == 0 {
+		return ResponseScanResult{Clean: true}
+	}
+	result := s.ScanResponseWithSuppress(ctx, string(metadata), suppressTarget, suppress)
+	if !result.Clean {
+		// A metadata-only scan cannot safely transform the complete image body.
+		// Leave this empty so strip callers fail closed instead of replacing the
+		// image with redacted metadata bytes.
+		result.TransformedContent = ""
+	}
+	return result
+}
+
 // ScanResponseWithSuppress checks fetched content like ScanResponse, but applies
 // destination-scoped suppressions inside each normalization pass. This prevents
 // a suppressed first-pass hit from masking a later unsuppressed encoded or

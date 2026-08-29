@@ -2205,7 +2205,7 @@ func newInterceptHandler(
 			ic.Metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportConnect)
 		}
 		if ic.Scanner.ResponseScanningEnabled() {
-			scanResult := ic.Scanner.ScanResponseWithSuppress(r.Context(), string(respBody), r.URL.String(), ic.Config.Suppress)
+			scanResult := ic.Scanner.ScanResponseBodyWithSuppress(r.Context(), respBody, r.URL.String(), ic.Config.Suppress)
 			recordSuppressedResponseScanExempts(ic.Metrics, scanResult.SuppressedMatches, TransportConnect)
 
 			// Capture observer: record intercept response scan verdict for policy replay.
@@ -2264,6 +2264,10 @@ func newInterceptHandler(
 				}
 				bundleRules := responseBundleRules(scanResult.Matches)
 				reason := fmt.Sprintf("response injection: %s", strings.Join(patternNames, ", "))
+				if action == config.ActionStrip && scanResult.TransformedContent == "" {
+					action = config.ActionBlock
+					reason += " (strip failed)"
+				}
 
 				switch action {
 				case config.ActionBlock, config.ActionAsk:

@@ -5508,6 +5508,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if mediaVerdict.StripResult != nil && mediaVerdict.StripResult.Changed() {
 		body = mediaVerdict.Body
 	}
+	scanAsHTML := isHTML && !scanner.IsVerifiedImageResponseBody(body)
 	content := string(body)
 
 	// Extract text from HTML hiding spots (comments, script/style bodies)
@@ -5523,7 +5524,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		p.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportFetch)
 	}
 	var hiddenInjectionFound bool
-	if sc.ResponseScanningEnabled() && isHTML {
+	if sc.ResponseScanningEnabled() && scanAsHTML {
 		hidden := extractHiddenContent(content)
 		if hidden != "" {
 			rawResult := sc.ScanResponseWithSuppress(r.Context(), hidden, finalResponseURL, cfg.Suppress)
@@ -5563,7 +5564,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	// Use go-readability for HTML content extraction.
 	readabilityOK := false
-	if isHTML {
+	if scanAsHTML {
 		article, err := readability.FromReader(strings.NewReader(content), parsed)
 		if err != nil {
 			log.LogAnomaly(actx, "", fmt.Sprintf("readability extraction failed: %v", err), 0.3)
@@ -5609,7 +5610,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Exempt domains are still scanned for visibility (findings logged as warn)
 	// but adaptive scoring is skipped and actions are not upgraded.
 	if sc.ResponseScanningEnabled() {
-		scanResult := sc.ScanResponseWithSuppress(r.Context(), content, finalResponseURL, cfg.Suppress)
+		var scanResult scanner.ResponseScanResult
+		if scanAsHTML {
+			scanResult = sc.ScanResponseWithSuppress(r.Context(), content, finalResponseURL, cfg.Suppress)
+		} else {
+			scanResult = sc.ScanResponseBodyWithSuppress(r.Context(), []byte(content), finalResponseURL, cfg.Suppress)
+		}
 		recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportFetch)
 		if !scanResult.Clean {
 			responsePromptHit = true
@@ -5802,6 +5808,9 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 		sessionKey := sessionKeyFor(agent, clientIP)
 		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionLevel), FromAction: originalAction, ToAction: action, Scanner: "response_scan", ClientIP: clientIP, RequestID: requestID})
 	}
+	if action == config.ActionStrip && result.TransformedContent == "" {
+		action = config.ActionBlock
+	}
 
 	// recordResponseSignal records an adaptive enforcement signal for the
 	// response scan result. Exempt domains skip scoring - their findings
@@ -5886,6 +5895,20 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 		case hitl.DecisionAllow:
 			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:allow", len(result.Matches), patternNames, bundleRules)
 		case hitl.DecisionStrip:
+			if result.TransformedContent == "" {
+				recordResponseSignal(session.SignalBlock)
+				reason := fmt.Sprintf("response contains prompt injection: %s (strip failed)", strings.Join(patternNames, ", "))
+				log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "response_scan", reason)
+				emitResponseReceipt(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan", Pattern: reason,
+					Transport: "fetch", Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
+				})
+				writeBlockedJSON(w,
+					blockInfoFor(blockreason.PromptInjection, "response_scan"),
+					http.StatusForbidden,
+					FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
+				return true, "", true
+			}
 			out = result.TransformedContent
 			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:strip", len(result.Matches), patternNames, bundleRules)
 		default:
