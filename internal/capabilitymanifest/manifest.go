@@ -88,12 +88,16 @@ type Gate struct {
 // GateFeature points at the enforcement selector and at a declaration that
 // names the feature constant.
 //
-// The two references are checked INDEPENDENTLY: the parity test looks for the
-// enforcement selector in one declaration and the feature constant in the
-// other, and nothing connects them. So proof shows the feature constant is
-// passed to a call in the referenced declaration; it does not establish that
-// this selector is bound to that feature, or that the declaration verifies
-// anything.
+// Proof is a source reference for an auditor to follow, not a proof of gating.
+//
+// A passing check establishes that the referenced declaration exists and passes
+// something spelled like the feature constant to a call. It does not establish
+// that the identifier resolves to the license package's constant rather than a
+// local of the same spelling, that the call uses the value, that any result is
+// tested, or that the separately-checked enforcement selector names the same
+// feature. The two references are validated independently and nothing connects
+// them. Establishing any of that requires binding resolution through go/types
+// rather than a stricter spelling rule.
 //
 // Proof is often a dedicated license helper such as VerifyAgentsWithOptions,
 // but it does NOT have to be a separate declaration, and a feature whose
