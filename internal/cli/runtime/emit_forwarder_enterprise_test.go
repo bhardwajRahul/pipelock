@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/enterprise/siemforward"
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/emit"
 	"github.com/luckyPipewrench/pipelock/internal/testwait"
@@ -110,10 +112,10 @@ emit:
 	}
 }
 
-func TestServerReloadActivationFailureRetainsOldSinkAndReportsFailure(t *testing.T) {
+func TestServerReloadIgnoresEmitChangeBeforePolicyPublication(t *testing.T) {
 	t.Parallel()
 	s, buf := newTestServer(t, nil)
-	oldSink := &runtimeActivationSink{}
+	oldSink := &recordingRuntimeSink{events: make(chan emit.Event, 8)}
 	retired := s.emitter.ReloadSinks([]emit.Sink{oldSink})
 	for _, sink := range retired.Sinks() {
 		_ = sink.Close()
@@ -142,21 +144,87 @@ func TestServerReloadActivationFailureRetainsOldSinkAndReportsFailure(t *testing
 		}
 	})
 
+	initial := s.proxy.CurrentConfig().Clone()
+	initial.KillSwitch.Enabled = true
+	if err := s.Reload(initial); err != nil {
+		t.Fatalf("initial Reload: %v", err)
+	}
+	s.lastReloadAt = time.Time{}
+
 	reloaded := s.proxy.CurrentConfig().Clone()
-	reloaded.Emit.Forwarder = forwarderCfg
+	reloaded.KillSwitch.Enabled = false
+	reloaded.Emit = config.EmitConfig{
+		InstanceID: "candidate-instance",
+		Filter: config.EmitFilter{
+			Actions:       []string{config.ActionBlock},
+			DecisionTypes: []string{"candidate-decision"},
+			Agents:        []string{"candidate-agent"},
+		},
+		Webhook: config.WebhookConfig{
+			URL: "https://webhook.vendor.example/events",
+		},
+		Syslog: config.SyslogConfig{
+			Address: "udp://syslog.vendor.example:514",
+		},
+		OTLP: config.OTLPConfig{
+			Endpoint: "https://otel.vendor.example",
+			Headers:  map[string]string{"Authorization": "candidate"},
+		},
+		Forwarder: forwarderCfg,
+	}
+	wantAttemptedHash := reloaded.Emit.Fingerprint()
 	buf.reset()
 	err = s.Reload(reloaded)
-	if !errors.Is(err, siemforward.ErrActivationFailed) {
-		t.Fatalf("Reload error = %v, want ErrActivationFailed", err)
+	if err != nil {
+		t.Fatalf("Reload error = %v, want emit change ignored and unrelated policy applied", err)
 	}
-	if !strings.Contains(buf.String(), "WARNING: config reload degraded") || !strings.Contains(buf.String(), "previous sink set not swapped") {
-		t.Fatalf("reload output did not report degraded activation:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "emit settings changed") || !strings.Contains(buf.String(), "require restart, ignoring") {
+		t.Fatalf("reload output did not report restart-only emit change:\n%s", buf.String())
+	}
+	if got := s.proxy.CurrentConfig().Emit; !reflect.DeepEqual(got, initial.Emit) {
+		t.Fatalf("live Emit = %#v, want preserved %#v", got, initial.Emit)
+	}
+	if got := s.proxy.CurrentConfig().KillSwitch.Enabled; got {
+		t.Fatal("live kill_switch.enabled = true, want unrelated candidate change applied")
+	}
+	if got := s.killswitch.Sources()["config"]; got {
+		t.Fatal("kill-switch config source = true, want unrelated candidate change applied")
+	}
+	if oldSink.closed.Load() || oldSink.closeCount.Load() != 0 {
+		t.Fatalf("live sink closed=%v close_count=%d, want unchanged running generation", oldSink.closed.Load(), oldSink.closeCount.Load())
+	}
+	var ignoredReload emit.Event
+	for len(oldSink.events) > 0 {
+		event := <-oldSink.events
+		if event.Type == string(audit.EventConfigReload) && event.Fields["status"] == "ignored" {
+			ignoredReload = event
+		}
+	}
+	if ignoredReload.Type == "" {
+		t.Fatal("emit change did not produce an ignored config reload audit event")
+	}
+	attemptedHash, ok := ignoredReload.Fields["config_hash"].(string)
+	if !ok || attemptedHash != wantAttemptedHash || attemptedHash == reloaded.Hash() {
+		t.Fatalf("ignored emit config_hash = %q, want attempted-emit fingerprint %q distinct from the stale config hash", attemptedHash, wantAttemptedHash)
 	}
 	before := oldSink.emitted.Load()
 	s.emitter.EmitWithSeverity(t.Context(), emit.SeverityWarn, "post-reload", nil)
 	if got := oldSink.emitted.Load(); got != before+1 {
 		t.Fatalf("old sink emitted = %d after baseline %d, want retained sink to serve once", got, before)
 	}
+}
+
+type recordingRuntimeSink struct {
+	runtimeActivationSink
+	events chan emit.Event
+}
+
+func (s *recordingRuntimeSink) Emit(ctx context.Context, event emit.Event) error {
+	if err := s.runtimeActivationSink.Emit(ctx, event); err != nil {
+		return err
+	}
+	s.events <- event
+	return nil
 }
 
 func TestActivateReplacementEmitSinksSequencesSameSpoolLock(t *testing.T) {
