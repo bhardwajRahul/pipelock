@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
 )
 
@@ -289,12 +290,13 @@ func TestEmitter_EmitSessionOpenPopulatesPostureBinding(t *testing.T) {
 		ContainedUID:     "966",
 	}
 	e := NewEmitter(EmitterConfig{
-		Recorder:       rec,
-		PrivKey:        priv,
-		ConfigHash:     testConfigHash,
-		Principal:      testPrincipal,
-		Actor:          testActor,
-		PostureBinding: binding,
+		Recorder:            rec,
+		PrivKey:             priv,
+		ConfigHash:          testConfigHash,
+		Principal:           testPrincipal,
+		Actor:               testActor,
+		PostureBinding:      binding,
+		PostureAvailability: "unreadable",
 	})
 
 	if err := e.EmitSessionOpen(); err != nil {
@@ -318,9 +320,106 @@ func TestEmitter_EmitSessionOpenPopulatesPostureBinding(t *testing.T) {
 		open.ContainedUID != binding.ContainedUID {
 		t.Fatalf("posture binding = %+v, want %+v", open, binding)
 	}
+	var ext map[string]string
+	if err := json.Unmarshal(receipts[0].Ext, &ext); err != nil {
+		t.Fatalf("decode unsigned posture extension: %v", err)
+	}
+	if got := ext["posture_proof_availability"]; got != "unreadable" {
+		t.Fatalf("posture availability extension = %q, want unreadable", got)
+	}
+	// ext is intentionally outside the signature: changing its advisory value
+	// must not turn it into a verified containment claim.
+	receipts[0].Ext = json.RawMessage(`{"posture_proof_availability":"attested"}`)
+	if err := VerifyWithKey(receipts[0], hex.EncodeToString(pub)); err != nil {
+		t.Fatalf("signature unexpectedly covers advisory extension: %v", err)
+	}
 	if res := VerifyChain(receipts, hex.EncodeToString(pub)); !res.Valid {
 		t.Fatalf("VerifyChain: %s", res.Error)
 	}
+}
+
+func TestEmitter_PostureAvailabilityExtMutationBreaksSuccessorChain(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+	e := NewEmitter(EmitterConfig{
+		Recorder:            rec,
+		PrivKey:             priv,
+		ConfigHash:          testConfigHash,
+		Principal:           testPrincipal,
+		Actor:               testActor,
+		PostureAvailability: "unreadable",
+	})
+	if err := e.EmitSessionOpen(); err != nil {
+		t.Fatalf("EmitSessionOpen: %v", err)
+	}
+	if err := e.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Verdict:   config.ActionAllow,
+		Transport: testTransport,
+		Target:    testTarget,
+		Method:    http.MethodGet,
+	}); err != nil {
+		t.Fatalf("Emit successor: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	receipts := readAllReceiptsFromDir(t, dir, pub)
+	if len(receipts) != 2 {
+		t.Fatalf("receipts = %d, want 2", len(receipts))
+	}
+	receipts[0].Ext = json.RawMessage(`{"posture_proof_availability":"attested"}`)
+	if err := VerifyWithKey(receipts[0], hex.EncodeToString(pub)); err != nil {
+		t.Fatalf("individual signature unexpectedly covers advisory extension: %v", err)
+	}
+	if res := VerifyChain(receipts, hex.EncodeToString(pub)); res.Valid {
+		t.Fatal("mutated session_open extension left successor chain valid")
+	}
+}
+
+func TestMergePostureAvailabilityExtension(t *testing.T) {
+	t.Parallel()
+
+	t.Run("preserves existing metadata", func(t *testing.T) {
+		got, err := mergePostureAvailabilityExtension(
+			json.RawMessage(`{"vendor":"acme"}`),
+			"unreadable",
+		)
+		if err != nil {
+			t.Fatalf("mergePostureAvailabilityExtension: %v", err)
+		}
+		var fields map[string]string
+		if err := json.Unmarshal(got, &fields); err != nil {
+			t.Fatalf("decode merged extension: %v", err)
+		}
+		if fields["vendor"] != "acme" || fields["posture_proof_availability"] != "unreadable" {
+			t.Fatalf("merged extension = %#v", fields)
+		}
+	})
+
+	t.Run("rejects conflicting value", func(t *testing.T) {
+		_, err := mergePostureAvailabilityExtension(
+			json.RawMessage(`{"posture_proof_availability":"attested"}`),
+			"unreadable",
+		)
+		if err == nil || !strings.Contains(err.Error(), "conflicts") {
+			t.Fatalf("error = %v, want conflicting extension error", err)
+		}
+	})
+
+	t.Run("rejects duplicate keys", func(t *testing.T) {
+		_, err := mergePostureAvailabilityExtension(
+			json.RawMessage(`{"vendor":"a","vendor":"b"}`),
+			"unreadable",
+		)
+		if !errors.Is(err, jsonscan.ErrDuplicateKey) {
+			t.Fatalf("error = %v, want duplicate-key error", err)
+		}
+	})
 }
 
 func TestEmitter_EmitSessionCloseFinalReceiptAndRoot(t *testing.T) {

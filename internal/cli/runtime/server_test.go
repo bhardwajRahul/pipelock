@@ -32,6 +32,8 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/filesentry"
 	mcptools "github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/posture"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
@@ -3415,6 +3417,205 @@ func TestServer_Reload_IgnoresFlightRecorderHeartbeatIntervalChange(t *testing.T
 	}
 	if !buf.contains("flight_recorder settings changed") {
 		t.Fatalf("stderr missing flight_recorder restart-only warning:\n%s", buf.String())
+	}
+}
+
+func newContainmentEvidenceReloadServer(t *testing.T, require bool) (*Server, *syncBuffer) {
+	t.Helper()
+	dir := t.TempDir()
+	_, receiptKey, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair receipt: %v", err)
+	}
+	receiptKeyPath := filepath.Join(dir, "receipt.key")
+	if err := signing.SavePrivateKey(receiptKey, receiptKeyPath); err != nil {
+		t.Fatalf("SavePrivateKey receipt: %v", err)
+	}
+	posturePublicKey, postureKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey posture: %v", err)
+	}
+	capsule, err := posture.Emit(config.Defaults(), posture.Options{
+		SigningKey: postureKey,
+		Containment: &posture.ContainmentEvidence{
+			Mode:                     posture.ContainmentModeKernelNFTOwnerMatch,
+			BoundaryVerified:         true,
+			ProbeRefusedDirectEgress: true,
+			KernelRuleHash:           strings.Repeat("a", 64),
+			TargetUID:                "966",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit posture capsule: %v", err)
+	}
+	proof, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal posture capsule: %v", err)
+	}
+	proofPath := filepath.Join(dir, "proof.json")
+	if err := os.WriteFile(proofPath, proof, 0o600); err != nil {
+		t.Fatalf("Write posture capsule: %v", err)
+	}
+	t.Setenv(posturebinding.RuntimeProofEnv, proofPath)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"flight_recorder:",
+		"  enabled: true",
+		"  dir: " + strconv.Quote(filepath.Join(dir, "receipts")),
+		"  signing_key_path: " + strconv.Quote(receiptKeyPath),
+		"  posture_signer_key: " + strconv.Quote(hex.EncodeToString(posturePublicKey)),
+		"  require_containment_evidence: " + strconv.FormatBool(require),
+		"",
+	}, "\n"))
+	return newTestServer(t, func(opts *ServerOpts) { opts.ConfigFile = cfgPath })
+}
+
+func TestNewServer_RequiredContainmentEvidenceFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		proofKind string
+	}{
+		{name: "missing proof", proofKind: "missing"},
+		{name: "different signer", proofKind: "different-signer"},
+		{name: "no containment evidence", proofKind: "no-containment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, receiptKey, err := signing.GenerateKeyPair()
+			if err != nil {
+				t.Fatalf("GenerateKeyPair receipt: %v", err)
+			}
+			receiptKeyPath := filepath.Join(dir, "receipt.key")
+			if err := signing.SavePrivateKey(receiptKey, receiptKeyPath); err != nil {
+				t.Fatalf("SavePrivateKey receipt: %v", err)
+			}
+
+			posturePublicKey, postureKey, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				t.Fatalf("GenerateKey posture: %v", err)
+			}
+			proofPath := filepath.Join(dir, "proof.json")
+			if tc.proofKind != "missing" {
+				proofKey := postureKey
+				containment := (*posture.ContainmentEvidence)(nil)
+				if tc.proofKind == "different-signer" {
+					_, proofKey, err = ed25519.GenerateKey(nil)
+					if err != nil {
+						t.Fatalf("GenerateKey mismatched posture: %v", err)
+					}
+					containment = &posture.ContainmentEvidence{
+						Mode:                     posture.ContainmentModeKernelNFTOwnerMatch,
+						BoundaryVerified:         true,
+						ProbeRefusedDirectEgress: true,
+						KernelRuleHash:           strings.Repeat("a", 64),
+						TargetUID:                "966",
+					}
+				}
+				capsule, emitErr := posture.Emit(config.Defaults(), posture.Options{
+					SigningKey:  proofKey,
+					Containment: containment,
+				})
+				if emitErr != nil {
+					t.Fatalf("Emit posture capsule: %v", emitErr)
+				}
+				proof, marshalErr := json.Marshal(capsule)
+				if marshalErr != nil {
+					t.Fatalf("Marshal posture capsule: %v", marshalErr)
+				}
+				if err := os.WriteFile(proofPath, proof, 0o600); err != nil {
+					t.Fatalf("Write posture capsule: %v", err)
+				}
+			}
+			t.Setenv(posturebinding.RuntimeProofEnv, proofPath)
+
+			cfgPath := writeServerTestConfig(t, strings.Join([]string{
+				"mode: balanced",
+				"flight_recorder:",
+				"  enabled: true",
+				"  dir: " + strconv.Quote(filepath.Join(dir, "receipts")),
+				"  signing_key_path: " + strconv.Quote(receiptKeyPath),
+				"  posture_signer_key: " + strconv.Quote(hex.EncodeToString(posturePublicKey)),
+				"  require_containment_evidence: true",
+				"",
+			}, "\n"))
+			buf := &syncBuffer{}
+			s, err := NewServer(ServerOpts{
+				ConfigFile:                        cfgPath,
+				Stdout:                            buf,
+				Stderr:                            buf,
+				allowEphemeralListenersForTesting: true,
+			})
+			if s != nil {
+				s.cleanup()
+				t.Fatal("NewServer returned a server for invalid containment evidence")
+			}
+			if err == nil || !strings.Contains(err.Error(), "loading posture binding") {
+				t.Fatalf("NewServer error = %v, want fail-closed posture binding error", err)
+			}
+		})
+	}
+}
+
+func TestServer_Reload_ContainmentEvidenceRequirementIsRestartOnly(t *testing.T) {
+	s, buf := newContainmentEvidenceReloadServer(t, true)
+	oldLive := s.proxy.CurrentConfig()
+	if !oldLive.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("server did not start with required containment evidence")
+	}
+
+	changed := oldLive.Clone()
+	changed.FlightRecorder.RequireContainmentEvidence = false
+	if err := s.Reload(changed); err != nil {
+		t.Fatalf("Reload changed requirement: %v", err)
+	}
+	live := s.proxy.CurrentConfig()
+	if !live.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("containment evidence requirement was removed by reload")
+	}
+	s.stateMu.RLock()
+	runtimeRequire := s.cfg.FlightRecorder.RequireContainmentEvidence
+	s.stateMu.RUnlock()
+	if !runtimeRequire {
+		t.Fatal("server runtime state applied the restart-only containment evidence change")
+	}
+	if !buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("stderr missing restart-only requirement warning:\n%s", buf.String())
+	}
+
+	buf.reset()
+	if err := s.Reload(live.Clone()); err != nil {
+		t.Fatalf("Reload unchanged requirement: %v", err)
+	}
+	if buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("unchanged requirement produced a restart-only warning:\n%s", buf.String())
+	}
+}
+
+func TestServer_Reload_ContainmentEvidenceRequirementEnableIsRestartOnly(t *testing.T) {
+	s, buf := newContainmentEvidenceReloadServer(t, false)
+	oldLive := s.proxy.CurrentConfig()
+	if oldLive.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("server unexpectedly started with required containment evidence")
+	}
+
+	changed := oldLive.Clone()
+	changed.FlightRecorder.RequireContainmentEvidence = true
+	if err := s.Reload(changed); err != nil {
+		t.Fatalf("Reload enabled requirement: %v", err)
+	}
+	live := s.proxy.CurrentConfig()
+	if live.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("reload silently enabled containment evidence requirement without a restart")
+	}
+	s.stateMu.RLock()
+	runtimeRequire := s.cfg.FlightRecorder.RequireContainmentEvidence
+	s.stateMu.RUnlock()
+	if runtimeRequire {
+		t.Fatal("server runtime state applied the restart-only containment evidence change")
+	}
+	if !buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("stderr missing restart-only requirement warning:\n%s", buf.String())
 	}
 }
 
