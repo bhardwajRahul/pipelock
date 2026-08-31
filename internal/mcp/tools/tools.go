@@ -1147,6 +1147,92 @@ func extractToolText(t ToolDef) string {
 	return strings.Join(parts, ". ")
 }
 
+// extractToolRuleDescriptionText returns only fields that the rule-bundle
+// contract calls descriptions. Built-in scanners deliberately inspect every
+// agent-visible tool field, but a community rule scoped to "description" must
+// not turn metadata, titles, defaults, or extension values into description
+// matches. Input-schema description keywords remain part of this surface.
+func extractToolRuleDescriptionText(t ToolDef) string {
+	parts := make([]string, 0, 2)
+	if t.Description != "" {
+		parts = append(parts, t.Description)
+	}
+	if len(t.InputSchema) > 0 {
+		var schema any
+		if json.Unmarshal(t.InputSchema, &schema) == nil {
+			collectSchemaDescriptionFields(schema, &parts, 0)
+		}
+	}
+	return strings.Join(parts, ". ")
+}
+
+func collectSchemaDescriptionFields(value any, result *[]string, depth int) {
+	collectSchemaDescriptionFieldsMode(value, result, depth, false)
+}
+
+func collectSchemaDescriptionFieldsMode(value any, result *[]string, depth int, schemaMap bool) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	if schemas, ok := value.([]any); ok {
+		for _, schema := range schemas {
+			collectSchemaDescriptionFieldsMode(schema, result, depth+1, false)
+		}
+		return
+	}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if schemaMap {
+		for _, schema := range obj {
+			collectSchemaDescriptionFieldsMode(schema, result, depth+1, false)
+		}
+		return
+	}
+	if description, ok := obj["description"]; ok {
+		collectStringLeaves(description, result, depth+1)
+	}
+
+	for key, child := range obj {
+		switch key {
+		case "description", "default", "const", "enum", "examples":
+			// The description value was collected above. The other fields carry
+			// example data, not nested schemas, even when their data contains a
+			// property that happens to be named description.
+			continue
+		case "properties", "patternProperties", "dependentSchemas", "dependencies", "$defs", "definitions":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, true)
+		case "additionalItems", "additionalProperties", "contains", "contentSchema", "else", "if", "items", "not", "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, false)
+		case "allOf", "anyOf", "oneOf", "prefixItems":
+			collectSchemaDescriptionFieldsMode(child, result, depth+1, false)
+		case "links":
+			collectHyperSchemaDescriptions(child, result, depth+1)
+		}
+	}
+}
+
+func collectHyperSchemaDescriptions(value any, result *[]string, depth int) {
+	if depth > maxSchemaDepth {
+		return
+	}
+	links, ok := value.([]any)
+	if !ok {
+		return
+	}
+	for _, value := range links {
+		link, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		collectStringLeaves(link["description"], result, depth+1)
+		for _, key := range []string{"headerSchema", "hrefSchema", "submissionSchema", "targetSchema"} {
+			collectSchemaDescriptionFieldsMode(link[key], result, depth+1, false)
+		}
+	}
+}
+
 // extractToolGeneralText returns every supported agent-visible tool field
 // except Description. The response-scanning path deliberately omits all tool
 // descriptions to preserve tools/list compatibility; this dedicated tool
@@ -2182,7 +2268,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			// Community rule bundle extra-poison patterns.
 			if cfg != nil && len(cfg.ExtraPoison) > 0 {
 				normName := normalize.ForToolText(tool.Name)
-				normDesc := normalize.ForToolText(text)
+				normDesc := normalize.ForToolText(extractToolRuleDescriptionText(tool))
 				for _, ep := range cfg.ExtraPoison {
 					if ep == nil || ep.Re == nil || ep.Name == "" {
 						continue

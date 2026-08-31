@@ -3752,6 +3752,195 @@ func TestScanTools_ExtraPoisonDescription(t *testing.T) {
 	}
 }
 
+func TestScanTools_ExtraPoisonDescriptionScope(t *testing.T) {
+	const marker = "scope sentinel phrase"
+	sc := testScanner(t)
+	cfg := &ToolScanConfig{
+		Action: "warn",
+		ExtraPoison: []*ExtraPoisonPattern{
+			{
+				Name:      "description-only-rule",
+				RuleID:    "test/description-only",
+				Re:        regexp.MustCompile(`scope\s+sentinel\s+phrase`),
+				ScanField: "description",
+			},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		tool      string
+		wantMatch bool
+	}{
+		{
+			name:      "tool description",
+			tool:      `{"name":"helper","description":"` + marker + `"}`,
+			wantMatch: true,
+		},
+		{
+			name: "input schema description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object","properties":{` +
+				`"query":{"type":"string","description":"` + marker + `"}}}}`,
+			wantMatch: true,
+		},
+		{
+			name: "nested input schema description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"allOf":[{"type":"object",` +
+				`"properties":{"query":{"type":"string","description":"` + marker + `"}}}]}}`,
+			wantMatch: true,
+		},
+		{
+			name: "hyper schema nested description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"$schema":` +
+				`"https://json-schema.org/draft/2019-09/hyper-schema","links":[{"rel":"create",` +
+				`"submissionSchema":{"description":"` + marker + `"}}]}}`,
+			wantMatch: true,
+		},
+		{
+			name: "hyper schema link description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"$schema":` +
+				`"https://json-schema.org/draft/2019-09/hyper-schema","links":[{"rel":"create",` +
+				`"description":"` + marker + `"}]}}`,
+			wantMatch: true,
+		},
+		{
+			name: "non-string description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object","properties":{` +
+				`"query":{"type":"string","description":["` + marker + `"]}}}}`,
+			wantMatch: true,
+		},
+		{
+			name: "property named default description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object","properties":{` +
+				`"default":{"type":"string","description":"` + marker + `"}}}}`,
+			wantMatch: true,
+		},
+		{
+			name:      "tool title",
+			tool:      `{"name":"helper","description":"safe","title":"` + marker + `"}`,
+			wantMatch: false,
+		},
+		{
+			name:      "metadata",
+			tool:      `{"name":"helper","description":"safe","_meta":{"note":"` + marker + `"}}`,
+			wantMatch: false,
+		},
+		{
+			name:      "annotations",
+			tool:      `{"name":"helper","description":"safe","annotations":{"note":"` + marker + `"}}`,
+			wantMatch: false,
+		},
+		{
+			name: "input schema key",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object","properties":{` +
+				`"` + marker + `":{"type":"string"}}}}`,
+			wantMatch: false,
+		},
+		{
+			name: "input schema extension",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object",` +
+				`"x-agent-note":"` + marker + `"}}`,
+			wantMatch: false,
+		},
+		{
+			name: "unknown schema object description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object",` +
+				`"vendor":{"description":"` + marker + `"}}}`,
+			wantMatch: false,
+		},
+		{
+			name: "hyper schema link title",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"links":[{` +
+				`"title":"` + marker + `"}]}}`,
+			wantMatch: false,
+		},
+		{
+			name: "hyper schema link target hints",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"links":[{` +
+				`"targetHints":{"description":"` + marker + `"}}]}}`,
+			wantMatch: false,
+		},
+		{
+			name: "input schema default object description",
+			tool: `{"name":"helper","description":"safe","inputSchema":{"type":"object",` +
+				`"default":{"description":"` + marker + `"}}}`,
+			wantMatch: false,
+		},
+		{
+			name: "output schema description",
+			tool: `{"name":"helper","description":"safe","outputSchema":{"type":"object",` +
+				`"description":"` + marker + `"}}`,
+			wantMatch: false,
+		},
+		{
+			name:      "unknown extension field",
+			tool:      `{"name":"helper","description":"safe","x-vendor-note":"` + marker + `"}`,
+			wantMatch: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ScanTools(makeToolsResponse("["+tc.tool+"]"), sc, cfg)
+			matched := false
+			for _, match := range result.Matches {
+				matched = matched || slices.Contains(match.ToolPoison, "description-only-rule")
+			}
+			if matched != tc.wantMatch {
+				t.Fatalf("description-only rule matched = %t, want %t; result = %+v", matched, tc.wantMatch, result)
+			}
+		})
+	}
+}
+
+func TestCollectSchemaDescriptionFields_DialectsAndMalformed(t *testing.T) {
+	t.Run("hyper schema link fields", func(t *testing.T) {
+		var got []string
+		collectHyperSchemaDescriptions([]any{map[string]any{
+			"description":      "link",
+			"headerSchema":     map[string]any{"description": "header"},
+			"hrefSchema":       map[string]any{"description": "href"},
+			"submissionSchema": map[string]any{"description": "submission"},
+			"targetSchema":     map[string]any{"description": "target"},
+		}}, &got, 0)
+		for _, want := range []string{"link", "header", "href", "submission", "target"} {
+			if !slices.Contains(got, want) {
+				t.Fatalf("descriptions = %v, want %q", got, want)
+			}
+		}
+	})
+
+	t.Run("single schema keyword", func(t *testing.T) {
+		var got []string
+		collectSchemaDescriptionFields(map[string]any{
+			"contains": map[string]any{"description": "nested"},
+		}, &got, 0)
+		if !slices.Contains(got, "nested") {
+			t.Fatalf("descriptions = %v, want nested", got)
+		}
+	})
+
+	t.Run("depth limits", func(t *testing.T) {
+		var got []string
+		collectSchemaDescriptionFields(map[string]any{"description": "too deep"}, &got, maxSchemaDepth+1)
+		collectHyperSchemaDescriptions([]any{map[string]any{
+			"submissionSchema": map[string]any{"description": "too deep"},
+		}}, &got, maxSchemaDepth+1)
+		if len(got) != 0 {
+			t.Fatalf("descriptions = %v, want none", got)
+		}
+	})
+
+	t.Run("malformed hyper schema links", func(t *testing.T) {
+		var got []string
+		collectHyperSchemaDescriptions(map[string]any{"description": "not a link array"}, &got, 0)
+		collectHyperSchemaDescriptions([]any{"not a link object"}, &got, 0)
+		if len(got) != 0 {
+			t.Fatalf("descriptions = %v, want none", got)
+		}
+	})
+}
+
 func TestScanTools_ExtraPoisonName(t *testing.T) {
 	sc := testScanner(t)
 	cfg := &ToolScanConfig{
