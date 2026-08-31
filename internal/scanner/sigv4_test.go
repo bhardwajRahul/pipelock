@@ -99,6 +99,25 @@ func TestDetectValidSigV4(t *testing.T) {
 			wantExp:   259200,
 		},
 		{
+			name:      "valid_maximum_7_day_expiry",
+			rawURL:    buildSigV4URL(t, fakeAKIAExample, "604800", ""),
+			wantValid: true,
+			wantKeyID: fakeAKIAExample,
+			wantExp:   604800,
+		},
+		{
+			name:      "valid_sorted_signed_headers",
+			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=content-type%3Bhost", 1),
+			wantValid: true,
+			wantKeyID: fakeAKIAExample,
+			wantExp:   3600,
+		},
+		{
+			name:      "expiry_above_7_days_invalidates",
+			rawURL:    buildSigV4URL(t, fakeAKIAExample, "604801", ""),
+			wantValid: false,
+		},
+		{
 			name:      "missing_algorithm",
 			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "X-Amz-Algorithm="+sigV4AlgorithmValue, "X-Amz-Algorithm=other", 1),
 			wantValid: false,
@@ -161,6 +180,31 @@ func TestDetectValidSigV4(t *testing.T) {
 		{
 			name:      "duplicate_expires_silences_long_expiry_warn",
 			rawURL:    buildSigV4URL(t, fakeAKIAExample, "3600", "X-Amz-Expires=604800"),
+			wantValid: false,
+		},
+		{
+			name:      "missing_signed_headers_invalidates",
+			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "&X-Amz-SignedHeaders=host", "", 1),
+			wantValid: false,
+		},
+		{
+			name:      "duplicate_signed_headers_invalidates",
+			rawURL:    buildSigV4URL(t, fakeAKIAExample, "3600", "X-Amz-SignedHeaders=host"),
+			wantValid: false,
+		},
+		{
+			name:      "signed_headers_must_include_host",
+			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=content-type", 1),
+			wantValid: false,
+		},
+		{
+			name:      "signed_headers_must_be_sorted",
+			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=host%3Bcontent-type", 1),
+			wantValid: false,
+		},
+		{
+			name:      "signed_headers_reject_empty_member",
+			rawURL:    strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=host%3B%3Bx-amz-date", 1),
 			wantValid: false,
 		},
 		{
@@ -567,6 +611,24 @@ func TestSigV4CarveoutEndToEnd(t *testing.T) {
 			wantBlockReason: "AWS Access ID",
 		},
 		{
+			name:            "malformed_SigV4_missing_signed_headers_still_blocks_AKIA",
+			rawURL:          strings.Replace(buildSigV4URL(t, fakeAKIAExample, "3600", ""), "&X-Amz-SignedHeaders=host", "", 1),
+			wantAllowed:     false,
+			wantBlockReason: "AWS Access ID",
+		},
+		{
+			name:            "malformed_SigV4_duplicate_signed_headers_still_blocks_AKIA",
+			rawURL:          buildSigV4URL(t, fakeAKIAExample, "3600", "X-Amz-SignedHeaders=host"),
+			wantAllowed:     false,
+			wantBlockReason: "AWS Access ID",
+		},
+		{
+			name:            "malformed_SigV4_over_limit_expiry_still_blocks_AKIA",
+			rawURL:          buildSigV4URL(t, fakeAKIAExample, "604801", ""),
+			wantAllowed:     false,
+			wantBlockReason: "AWS Access ID",
+		},
+		{
 			name:            "AKIA_in_extra_query_param_blocks_even_with_valid_SigV4",
 			rawURL:          buildSigV4URL(t, fakeAKIAExample, "3600", "leaked="+fakeASIAExample),
 			wantAllowed:     false,
@@ -660,6 +722,144 @@ func TestSigV4CarveoutEndToEnd(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEmbeddedSigV4TextDLPCarveout(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	sc := MustNew(cfg)
+	t.Cleanup(sc.Close)
+
+	valid := buildSigV4URL(t, fakeAKIAExample, "3600", "")
+	malformed := strings.Replace(valid, "X-Amz-Signature="+validSigV4Signature, "X-Amz-Signature=short", 1)
+	nonAWS := strings.Replace(valid, "examplebucket.s3.amazonaws.com", "attacker.example", 1)
+	duplicate := valid + "&X-Amz-Credential=" + url.QueryEscape(fakeASIAExample+"/"+validSigV4Scope)
+	pathLeak := strings.Replace(valid, "/object/key.bin", "/object/"+fakeASIAExample, 1)
+
+	cases := []struct {
+		name      string
+		text      string
+		wantClean bool
+	}{
+		{
+			name:      "valid URL in GraphQL JSON body",
+			text:      `{"query":"mutation($url:String!){jobNoteAddAttachment(url:$url)}","variables":{"url":"` + valid + `"}}`,
+			wantClean: true,
+		},
+		{
+			name:      "valid URL plus separate leaked key",
+			text:      `{"url":"` + valid + `","leaked":"` + fakeASIAExample + `"}`,
+			wantClean: false,
+		},
+		{
+			name:      "malformed signature",
+			text:      `{"url":"` + malformed + `"}`,
+			wantClean: false,
+		},
+		{
+			name:      "non AWS host",
+			text:      `{"url":"` + nonAWS + `"}`,
+			wantClean: false,
+		},
+		{
+			name:      "duplicate credential field",
+			text:      `{"url":"` + duplicate + `"}`,
+			wantClean: false,
+		},
+		{
+			name:      "key outside credential field in URL path",
+			text:      `{"url":"` + pathLeak + `"}`,
+			wantClean: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := sc.ScanRequestBodyTextForDLP(context.Background(), tc.text)
+			if got.Clean != tc.wantClean {
+				t.Fatalf("Clean = %v, want %v; matches=%+v", got.Clean, tc.wantClean, got.Matches)
+			}
+			if !tc.wantClean {
+				found := false
+				for _, match := range got.Matches {
+					if match.PatternName == patternNameAWSAccessID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("blocked text lacks %q match: %+v", patternNameAWSAccessID, got.Matches)
+				}
+			}
+		})
+	}
+
+	if got := sc.ScanTextForDLP(context.Background(), `{"url":"`+valid+`"}`); got.Clean {
+		t.Fatal("ordinary text DLP must not apply the request-body route carve-out")
+	}
+
+	longLived := buildSigV4URL(t, fakeAKIAExample, "259200", "")
+	var warned bool
+	sc.SetDLPWarnHook(func(_ context.Context, patternName, severity string) {
+		warned = patternName == WarnPatternSigV4LongExpiry && severity == "info"
+	})
+	got := sc.ScanRequestBodyTextForDLP(context.Background(), `{"url":"`+longLived+`"}`)
+	if !got.Clean || len(got.InformationalMatches) != 1 || got.InformationalMatches[0].PatternName != WarnPatternSigV4LongExpiry || !warned {
+		t.Fatalf("long-lived body URL did not preserve SigV4 warning visibility: %+v warned=%v", got, warned)
+	}
+}
+
+func TestScanRequestBodyTextPartsForDLP(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	sc := MustNew(cfg)
+	t.Cleanup(sc.Close)
+
+	valid := buildSigV4URL(t, fakeAKIAExample, "3600", "")
+	clean := sc.ScanRequestBodyTextPartsForDLP(context.Background(), []string{"mutation", valid}, ".")
+	if !clean.Clean {
+		t.Fatalf("authorized URL split from another body field should remain clean: %+v", clean.Matches)
+	}
+
+	leaked := sc.ScanRequestBodyTextPartsForDLP(context.Background(), []string{
+		valid,
+		fakeASIAExample[:10],
+		fakeASIAExample[10:],
+	}, ".")
+	if leaked.Clean {
+		t.Fatal("AWS access key split across body fields must still block")
+	}
+	foundAWSKey := false
+	for _, match := range leaked.Matches {
+		if match.PatternName == patternNameAWSAccessID {
+			foundAWSKey = true
+			break
+		}
+	}
+	if !foundAWSKey {
+		t.Fatalf("split cross-field secret lacks %q match: %+v", patternNameAWSAccessID, leaked.Matches)
+	}
+
+	unsorted := strings.Replace(valid, "X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=host%3Bcontent-type", 1)
+	malformed := sc.ScanRequestBodyTextPartsForDLP(context.Background(), []string{unsorted}, ".")
+	if malformed.Clean {
+		t.Fatal("unsorted signed headers must leave the embedded AWS access key blocked")
+	}
+	foundAWSKey = false
+	for _, match := range malformed.Matches {
+		if match.PatternName == patternNameAWSAccessID {
+			foundAWSKey = true
+			break
+		}
+	}
+	if !foundAWSKey {
+		t.Fatalf("unsorted signed headers lack %q match: %+v", patternNameAWSAccessID, malformed.Matches)
 	}
 }
 
