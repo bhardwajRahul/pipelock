@@ -32,6 +32,106 @@ check_no_match() {
 	fi
 }
 
+check_conductor_serve_scope() {
+	local file="$1"
+	if ! awk -v file="$file" '
+		function is_serve_command(line, fields, count, i) {
+			gsub(/^[[:space:]]+/, "", line)
+			count = split(line, fields, /[[:space:]]+/)
+			i = 1
+			while (i <= count && fields[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+				i++
+			}
+			return i + 2 <= count && (fields[i] == "pipelock" || fields[i] == "/tmp/pipelock-ent") && fields[i + 1] == "conductor" && fields[i + 2] == "serve"
+		}
+		function scope_error(prefix) {
+			printf "docs-check: failed: %sconductor serve example in %s lacks required publisher, auditor, or admin organization scope\n", prefix, file > "/dev/stderr"
+			failed = 1
+			exit 1
+		}
+		function chaining_error() {
+			printf "docs-check: failed: conductor serve example in %s uses same-line command chaining\n", file > "/dev/stderr"
+			failed = 1
+			exit 1
+		}
+		function reset_serve() {
+			serve = 0
+			publisher_scope = 0
+			auditor_scope = 0
+			admin_scope = 0
+		}
+		function finish_serve(prefix) {
+			if (serve && (!publisher_scope || !auditor_scope || !admin_scope)) {
+				scope_error(prefix)
+			}
+			reset_serve()
+		}
+		/^```/ {
+			if (in_fence && shell_fence) {
+				finish_serve("")
+			}
+			if (in_fence) {
+				in_fence = 0
+				shell_fence = 0
+			} else {
+				in_fence = 1
+				shell_fence = ($0 ~ /^```(bash|sh|shell|console)[[:space:]]*$/)
+			}
+			reset_serve()
+			next
+		}
+		shell_fence && /conductor[[:space:]]+serve/ && /[;&|]/ {
+			chaining_error()
+		}
+		shell_fence && $0 !~ /--help/ && is_serve_command($0) {
+			finish_serve("")
+			serve = 1
+		}
+		serve && /--publisher-org([[:space:]\\]|$)/ { publisher_scope = 1 }
+		serve && /--auditor-org([[:space:]\\]|$)/ { auditor_scope = 1 }
+		serve && /--admin-org([[:space:]\\]|$)/ { admin_scope = 1 }
+		serve && $0 !~ /\\[[:space:]]*$/ { finish_serve("") }
+		END {
+			if (!failed && in_fence && shell_fence) {
+				finish_serve("unterminated ")
+			}
+		}
+	' "$file"; then
+		return 1
+	fi
+}
+
+if check_conductor_serve_scope <(
+	printf '%s\n' \
+		'```bash' \
+		'pipelock conductor serve \' \
+		'  --publisher-org org-a \' \
+		'  --auditor-org org-a' \
+		'pipelock conductor serve \' \
+		'  --admin-org org-b' \
+		'```'
+) 2>/dev/null; then
+	echo "docs-check: failed: cross-command scopes satisfied separate conductor serve examples" >&2
+	exit 1
+fi
+
+for chained_example in \
+	'pipelock conductor serve --help --publisher-org org-a --auditor-org org-a --admin-org org-a; pipelock conductor serve' \
+	'pipelock conductor serve --publisher-org org-a --auditor-org org-a --admin-org org-a && pipelock conductor serve' \
+	'pipelock conductor serve --publisher-org org-a --auditor-org org-a --admin-org org-a || pipelock conductor serve' \
+	'pipelock conductor serve --publisher-org org-a --auditor-org org-a --admin-org org-a | pipelock conductor serve' \
+	'pipelock conductor serve --publisher-org org-a --auditor-org org-a --admin-org org-a & pipelock conductor serve'; do
+	if check_conductor_serve_scope <(
+		printf '%s\n' \
+			'```bash' \
+			"$chained_example" \
+			'```'
+	) 2>/dev/null; then
+		echo "docs-check: failed: same-line conductor serve chaining bypassed scope validation" >&2
+		exit 1
+	fi
+done
+
 echo "docs-check: checking for stale public doc claims"
 
 python3 scripts/render_brand.py --check
@@ -53,6 +153,15 @@ check_no_match 'timeline (lists|of) every mediated decision' 'unprovable evidenc
 check_no_match 'stale_policy\.(grace_multiplier|after_grace).*\| Reserved' 'stale-policy-as-reserved claim'
 check_no_match 'Every signed bundle hash is written to an append-only transparency log' 'unshipped universal transparency-log claim'
 check_no_match 'No implementation should start until these are accepted' 'obsolete Conductor pre-implementation gate'
+
+for conductor_doc in \
+	docs/guides/conductor.md \
+	docs/guides/conductor-operator-runbook.md \
+	docs/guides/conductor-production-runbook.md \
+	docs/guides/enterprise-license-issuance-runbook.md \
+	docs/specs/pipelock-conductor-audit-sink.md; do
+	check_conductor_serve_scope "$conductor_doc"
+done
 
 echo "docs-check: printing canonical local stats"
 make stats

@@ -69,10 +69,14 @@ for overlapping_keyring_mount in \
 done
 
 expect_template_error "enterprise modes require explicit networkPolicy.ingress and networkPolicy.egress rules" \
-  --set mode=conductor \
-  --set networkPolicy.enabled=true \
-  --set networkPolicy.ingress=null \
-  --set networkPolicy.egress=null
+	--set mode=conductor \
+	--set networkPolicy.enabled=true \
+	--set networkPolicy.ingress=null \
+	--set networkPolicy.egress=null
+
+expect_template_error "conductor.orgID is required in conductor mode" \
+	-f "$chart/examples/values-enterprise-conductor.yaml" \
+	--set conductor.orgID=
 
 expect_template_error "conductor.replicaCount must be 1 when conductor.persistence.accessModes includes ReadWriteOnce" \
   -f "$chart/examples/values-enterprise-conductor.yaml" \
@@ -128,7 +132,21 @@ grep -q -- "- conductor" "$render_dir/values-enterprise-conductor.yaml"
 grep -q -- "- serve" "$render_dir/values-enterprise-conductor.yaml"
 grep -q -- "--probe-listen" "$render_dir/values-enterprise-conductor.yaml"
 grep -q -- "--publisher-token-file" "$render_dir/values-enterprise-conductor.yaml"
+for scope_flag in publisher-org auditor-org admin-org; do
+	grep -A1 -- "- --${scope_flag}" "$render_dir/values-enterprise-conductor.yaml" | grep -q -- 'org-prod'
+done
+for scope_flag in publisher-fleet auditor-fleet admin-fleet; do
+	grep -A1 -- "- --${scope_flag}" "$render_dir/values-enterprise-conductor.yaml" | grep -q -- 'fleet-prod'
+done
 grep -q -- "pipelock-conductor-probes" "$render_dir/values-enterprise-conductor.yaml"
+
+helm template pipelock "$chart" \
+	-f "$chart/examples/values-enterprise-conductor.yaml" \
+	--set conductor.fleetID= >"$render_dir/values-enterprise-conductor-org-wide.yaml"
+if grep -q -- '--publisher-fleet\|--auditor-fleet\|--admin-fleet' "$render_dir/values-enterprise-conductor-org-wide.yaml"; then
+	echo "org-wide conductor scope must not render fleet-scoped bearer flags" >&2
+	exit 1
+fi
 
 grep -q -- "- fleet-sink" "$render_dir/values-enterprise-devfleet.yaml"
 grep -q -- "--probe-listen" "$render_dir/values-enterprise-devfleet.yaml"
