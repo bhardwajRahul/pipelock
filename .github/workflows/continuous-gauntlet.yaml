@@ -15,9 +15,13 @@ permissions:
   contents: read
 
 env:
-  # Agent Egress Bench v0.1.1, the released revision. Prefer an exact
-  # released commit over a transient main pin.
-  AEB_REF: a3d56890487aed5fc5a01f46e8732d2ad73fcf53
+  # Agent Egress Bench release v1.0.0, the first release carrying promoted-record
+  # schema v4 and the source-baseline-origin argument the site promotion supplies.
+  # The checkout pins the commit so the run is reproducible even if a tag moves,
+  # and the verification step below resolves the tag and fails when the two
+  # disagree, so the release label is checked rather than merely asserted here.
+  AEB_REF: 06399746918ae0005f59a914fc9ec100a2f27fb8
+  AEB_RELEASE_TAG: v1.0.0
 
 jobs:
   candidate:
@@ -65,6 +69,10 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git -C "$AEB_ROOT" rev-parse HEAD)" = "$AEB_REF"
+          # Bind the release label to the pinned commit. Without this the tag in
+          # AEB_RELEASE_TAG is a comment: it can name any release, or a release
+          # that never existed, and nothing fails.
+          test "$(git -C "$AEB_ROOT" rev-parse "refs/tags/$AEB_RELEASE_TAG^{commit}")" = "$AEB_REF"
           for policy in "$PIPELOCK_RELEASE_PIN" "$PIPELOCK_GAUNTLET_BASELINE" "$PIPELOCK_GAUNTLET_ACCEPTANCE"; do
             test ! -L "$policy"
             test -f "$policy"

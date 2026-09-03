@@ -16,7 +16,8 @@ WORKFLOW = ROOT / ".github" / "workflows" / "continuous-gauntlet.yaml"
 RELEASE_PIN = ROOT / "benchmark" / "gauntlet-release.env"
 BASELINE = ROOT / "benchmark" / "gauntlet-baseline.json"
 ACCEPTANCE = ROOT / "benchmark" / "gauntlet-acceptance.json"
-EXPECTED_AEB_REF = "a3d56890487aed5fc5a01f46e8732d2ad73fcf53"
+EXPECTED_AEB_REF = "06399746918ae0005f59a914fc9ec100a2f27fb8"
+EXPECTED_AEB_RELEASE_TAG = "v1.0.0"
 GAUNTLET_WORKFLOW_URL = (
     "https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml"
 )
@@ -67,8 +68,28 @@ class GauntletCandidateWorkflowTest(unittest.TestCase):
         self.assertIn("repository: luckyPipewrench/agent-egress-bench", checkout)
         self.assertIn("ref: ${{ env.AEB_REF }}", checkout)
         self.assertNotRegex(checkout, r"ref:\s+(main|master|v[0-9])")
+        # The checkout needs full history for the tag resolution below to be possible.
+        self.assertIn("fetch-depth: 0", checkout)
         verify = step_block(self.workflow, "Verify immutable inputs")
         self.assertIn('git -C "$AEB_ROOT" rev-parse HEAD', verify)
+        self.assertIn('= "$AEB_REF"', verify)
+
+    def test_benchmark_release_tag_is_bound_to_the_pinned_commit(self):
+        """The release label must be checked, not asserted.
+
+        Naming a release in the workflow proves nothing on its own: the value
+        can name any release, or one that never existed, while the checkout
+        still uses the pinned commit. The workflow resolves the tag and
+        compares it, so this asserts both the declared tag and the comparison.
+        Without the comparison assertion, deleting that line leaves the label
+        as a comment and no test fails.
+        """
+        self.assertIn(f"AEB_RELEASE_TAG: {EXPECTED_AEB_RELEASE_TAG}", self.workflow)
+        verify = step_block(self.workflow, "Verify immutable inputs")
+        self.assertIn(
+            'git -C "$AEB_ROOT" rev-parse "refs/tags/$AEB_RELEASE_TAG^{commit}"',
+            verify,
+        )
         self.assertIn('= "$AEB_REF"', verify)
 
     def test_only_reviewed_pipelock_main_can_produce_a_candidate(self):
@@ -156,7 +177,7 @@ class GauntletCandidateWorkflowTest(unittest.TestCase):
             "PIPELOCK_VERSION=" + baseline["pipelock_version"], self.release_pin
         )
         self.assertEqual(baseline["corpus_version"], acceptance["corpus_version"])
-        self.assertEqual(baseline["corpus_git_sha"], acceptance["bench_release_commit"])
+        self.assertEqual(baseline["corpus_git_sha"], acceptance["bench_commit"])
         self.assertEqual(baseline["corpus_git_sha"], EXPECTED_AEB_REF)
         self.assertEqual(
             baseline["observed_case_count"]["total"], acceptance["active_case_count"]
