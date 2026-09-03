@@ -105,10 +105,15 @@ Three proxy modes share the main listener:
 9. DLP (65 built-in credential patterns + checksum validators + env/file leak detection)
 10. Path entropy analysis
 11. Subdomain entropy analysis
-12. SSRF / DNS resolution for private IPs, metadata, and rebinding
-13. Rate limiting
-14. Data budget
-15. Final context check
+12. Nested URL destinations in query parameters (allowlist, blocklist, SSRF on URL-shaped values)
+13. SSRF / DNS resolution for private IPs, metadata, and rebinding
+14. Rate limiting
+15. Data budget
+16. Final context check
+
+Nested destinations sit after every check that needs no network and before the
+first that does. A check that can time out must not run ahead of one that cannot,
+or a slow resolver decides the request before the content findings are made.
 
 Core and configured DLP run before DNS resolution; SSRF/DNS runs after them. `cfg.Internal = nil` disables DNS-based configured SSRF checks, not the literal-IP core SSRF floor.
 

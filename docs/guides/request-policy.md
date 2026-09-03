@@ -180,6 +180,60 @@ A `shadow` match never enforces; an enforced match always wins over a shadow mat
 of equal strictness. Promote to `action: block` (and drop `shadow`) once the logs
 show the rule matches only what you intend.
 
+## Fetch-only package registries
+
+An allowlisted helper with any-method access is a publish and relay channel: `GET`
+and `HEAD` are the package fetch, but `POST`/`PUT`/`PATCH`/`DELETE` and the WebDAV
+verbs that registries use to create or move artifacts turn the same host into a
+write path. That is operator intent about one host, not a scanner default. Defaulting
+the rail to "fetch only" would break `npm publish` and dataset pushes for operators
+who actually need those methods.
+
+The rail sees the method only with TLS interception on and the host not in
+`passthrough_domains`. Config validation already warns when a rule needs inner HTTP
+that the deployment cannot see.
+
+```yaml
+version: 1
+mode: balanced
+request_policy:
+  enabled: true
+  on_parse_error: block
+  on_opaque_operation: block
+  rules:
+    - name: "fetch-only-vendor-registry"
+      action: block
+      reason: "registry.vendor.example is allowlisted for package fetch only; write methods are a publish/relay channel"
+      route:
+        hosts: ["registry.vendor.example"]
+        methods: ["POST", "PUT", "PATCH", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"]
+```
+
+Read that rule as "these write methods are refused", not as "only fetch is permitted".
+`request_policy` is allow-by-default and has no allow-only method predicate, so a method
+absent from the list still reaches the host: `TRACE` and `OPTIONS` are accepted by
+validation, and any verb the validator does not recognise is rejected at load rather than
+silently blocked. A rule naming the write verbs a registry actually uses is the posture
+this rail can express today. If you need a true fetch-only boundary, terminate it where
+an allow-list exists, such as the registry's own credentials or an upstream gateway, and
+treat this rule as defence in depth rather than the boundary itself.
+
+
+### What this rule does and does not cover
+
+`request_policy` rules are a deny-list: a request forwards unless a rule matches
+it. This recipe therefore refuses exactly the methods it names. It is not an
+allow-only rail, and there is no `methods_except` form today. A method outside
+the list, including `OPTIONS` or any verb a future registry adds, is still
+forwarded.
+
+That is usually the right trade for a package mirror, because the risk being
+closed is publish and relocate rather than read. Name every write verb the
+registry actually accepts, and revisit the list when the registry's API changes.
+If a host genuinely needs read-only enforcement rather than a deny-list, put it
+behind an allowlist that names the paths it may serve instead of enumerating the
+methods it may not.
+
 ## Enforcement, audit, and receipts
 
 A matched rule records a decision metric and an audit event with bounded,

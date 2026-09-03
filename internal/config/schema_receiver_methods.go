@@ -248,6 +248,16 @@ func toSlash(s string) string {
 	return strings.ReplaceAll(s, "\\", "/")
 }
 
+// ScanNestedURLsEnabled reports whether URL-shaped query values are
+// evaluated as destinations. Omitting the field or setting YAML null keeps
+// the check enabled; only an explicit false disables it.
+// The name matches the ScanNestedURLs field so the config-consumption gate
+// can see the knob is read; that gate looks for .FieldName or
+// .FieldNameEnabled() outside internal/config.
+func (m Monitoring) ScanNestedURLsEnabled() bool {
+	return m.ScanNestedURLs == nil || *m.ScanNestedURLs
+}
+
 // SNIVerificationEnabled returns whether SNI verification is active.
 // Defaults to true when not explicitly set.
 func (f ForwardProxy) SNIVerificationEnabled() bool {

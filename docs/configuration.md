@@ -133,6 +133,7 @@ fetch_proxy:
       - "files.pythonhosted.org"
       - "pypi.org"
       - "objects.githubusercontent.com"
+    # scan_nested_urls: true  # default (nil); URL-shaped query values are destinations
 ```
 
 | Field | Default | Description |
@@ -147,6 +148,7 @@ fetch_proxy:
 | `monitoring.max_data_per_minute` | `0` | Per-domain byte budget (0 = disabled) |
 | `monitoring.blocklist` | 6 domains | Blocked exfiltration targets |
 | `monitoring.subdomain_entropy_exclusions` | `files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com` | Domains excluded from subdomain and path entropy checks; override to replace defaults, or set an empty list to disable exclusions entirely (query entropy still checked) |
+| `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query parameter values as destinations |
 | `monitoring.query_entropy_exclusions` | `[]` | Host-wide query-string entropy exclusions for hosts whose query values are broadly opaque by contract |
 | `monitoring.query_entropy_param_exclusions` | `[]` | Exact HTTPS endpoint+parameter query-value entropy exclusions; DLP, SSRF, query-key entropy, adjacent parameters, path/subdomain entropy, rate limits, and data budgets still apply |
 
@@ -198,6 +200,34 @@ fetch_proxy:
   monitoring:
     query_entropy_exclusions:
       - "provider.example"
+```
+
+**Nested URL destination scanning** treats an `http`/`https` URL in a query
+parameter as a destination of its own. After iterative percent-decoding, a
+value that parses as an absolute `http`/`https` URL with a hostname is run
+through the same allowlist, blocklist, and SSRF checks as the outer host.
+The check is one level deep: a nested URL that itself contains a nested URL
+is not expanded. Relative paths, bare words, `mailto:` values, and `data:`
+values are ignored, because none of them names an `http` or `https` destination.
+There is no cap on how many query components are examined; parsing and literal-IP
+checks need no I/O and are bounded by the URL length limit. Every nested DNS lookup a
+request needs shares one resolution budget equal to the single-lookup SSRF ceiling, and
+exhausting that budget refuses the request rather than forwarding it with nested
+destinations unverified. Both query keys and values are examined, in raw form, after
+percent-decoding, and through the same hex, base64, and base32 layers DLP applies; a
+scheme-relative `//host/...` value is evaluated as an https destination.
+
+CONNECT is out of scope: the CONNECT handler scans a synthetic `https://host/`
+URL with no query string, so nested query destinations never appear on that
+surface. Fetch, forward absolute-URI, TLS intercept, redirect follow, WebSocket
+(the `/ws?url=...` handler passes the caller-supplied URL to `Scan`), and
+reverse-proxy submit profile all call `Scan` on the real URL and inherit the
+check.
+
+```yaml
+fetch_proxy:
+  monitoring:
+    scan_nested_urls: true
 ```
 
 **Path entropy and governed API routes.** Path entropy is *also* skipped

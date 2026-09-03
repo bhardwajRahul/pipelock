@@ -4,6 +4,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -97,6 +99,14 @@ func TestValidateRequestPolicy_Errors(t *testing.T) {
 			want: "not a valid HTTP method",
 		},
 		{
+			// PROPFIND is a real WebDAV method and a read, so validate.go
+			// leaves it out of the accepted set on purpose. Rejecting it at
+			// load is that decision under test.
+			name: "unaccepted WebDAV read method rejected at load",
+			cfg:  enabledPolicy(RequestPolicyRule{Name: "r", Action: ActionBlock, Route: RequestPolicyRoute{Methods: []string{"PROPFIND"}}}),
+			want: "not a valid HTTP method",
+		},
+		{
 			name: "invalid path pattern",
 			cfg:  enabledPolicy(RequestPolicyRule{Name: "r", Action: ActionBlock, Route: RequestPolicyRoute{PathPatterns: []string{"("}}}),
 			want: "invalid path_pattern",
@@ -138,6 +148,105 @@ func TestValidHTTPMethodRecognizesQuery(t *testing.T) {
 	}
 	if validHTTPMethod("FOO") {
 		t.Fatal("validHTTPMethod(FOO) = true, want false")
+	}
+}
+
+func TestValidHTTPMethodRecognizesOptionsAndTrace(t *testing.T) {
+	t.Parallel()
+	for _, method := range []string{"OPTIONS", "TRACE"} {
+		if !validHTTPMethod(method) {
+			t.Fatalf("validHTTPMethod(%q) = false, want true", method)
+		}
+	}
+}
+
+func TestValidHTTPMethodRecognizesWebDAV(t *testing.T) {
+	for _, method := range []string{"MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"} {
+		if !validHTTPMethod(method) {
+			t.Fatalf("validHTTPMethod(%q) = false, want true for fetch-only registry recipes", method)
+		}
+	}
+}
+
+// A method rail is fail-closed: an unrecognised spelling must be rejected at
+// load rather than silently matching nothing at request time.
+func TestValidHTTPMethodRejectsNearMissWebDAV(t *testing.T) {
+	t.Parallel()
+	for _, m := range []string{"mkcol", "MKCOL ", " MKCOL", "MKCOLL", "MKCOL\t", "MOVE;", "COPY\n", "PROPATCH", "PROPPATCHH", ""} {
+		if validHTTPMethod(m) {
+			t.Errorf("validHTTPMethod(%q) = true, want false", m)
+		}
+	}
+}
+
+func TestFetchOnlyRegistryRecipeLoads(t *testing.T) {
+	body := readDocAccuracyFile(t, repoRootForDocsAccuracy(t), "docs/guides/request-policy.md")
+	marker := "## Fetch-only package registries"
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		t.Fatal("request-policy.md missing Fetch-only package registries section")
+	}
+	section := body[idx:]
+	start := strings.Index(section, "```yaml\n")
+	if start < 0 {
+		t.Fatal("section missing yaml fence")
+	}
+	start += len("```yaml\n")
+	end := strings.Index(section[start:], "```")
+	if end < 0 {
+		t.Fatal("section yaml fence is unclosed")
+	}
+	example := section[start : start+end]
+	if !strings.Contains(example, "registry.vendor.example") {
+		t.Fatalf("example host is not the documented placeholder:\n%s", example)
+	}
+	if strings.Contains(example, "npm") || strings.Contains(example, "pypi") {
+		t.Fatal("example must not name a real registry hostname")
+	}
+
+	path := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(path, []byte(example), 0o600); err != nil {
+		t.Fatalf("write example: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(fetch-only registry recipe): %v", err)
+	}
+	if !cfg.RequestPolicy.Enabled {
+		t.Fatal("recipe request_policy.enabled is false")
+	}
+	if len(cfg.RequestPolicy.Rules) != 1 {
+		t.Fatalf("recipe rules = %d, want 1", len(cfg.RequestPolicy.Rules))
+	}
+	rule := cfg.RequestPolicy.Rules[0]
+	// Assert the parsed rule, not the YAML text. Without this the test passes
+	// on a recipe that only warns, or one aimed at a different host, because
+	// the method list alone says nothing about what the rule does.
+	if rule.Action != ActionBlock {
+		t.Fatalf("recipe action = %q, want %q", rule.Action, ActionBlock)
+	}
+	if len(rule.Route.Hosts) != 1 || rule.Route.Hosts[0] != "registry.vendor.example" {
+		t.Fatalf("recipe hosts = %v, want [registry.vendor.example]", rule.Route.Hosts)
+	}
+	got := rule.Route.Methods
+	want := []string{"POST", "PUT", "PATCH", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("methods = %v, want %v", got, want)
+	}
+
+	warnings, err := cfg.ValidateWithWarnings()
+	if err != nil {
+		t.Fatalf("ValidateWithWarnings: %v", err)
+	}
+	var sawVisibility bool
+	for _, w := range warnings {
+		if strings.Contains(w.Field, "fetch-only-vendor-registry") &&
+			strings.Contains(w.Message, "tls_interception is disabled") {
+			sawVisibility = true
+		}
+	}
+	if !sawVisibility {
+		t.Fatalf("recipe must surface the inner-HTTP visibility warning when TLS interception is off: %+v", warnings)
 	}
 }
 

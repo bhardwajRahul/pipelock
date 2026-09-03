@@ -33,6 +33,39 @@ func apiWriteRule() config.RequestPolicyRule {
 	}
 }
 
+func TestEvaluate_FetchOnlyDenyListMissesUnlistedMethods(t *testing.T) {
+	t.Parallel()
+	m := mustMatcher(t, config.RequestPolicyRule{
+		Name:   "fetch-only-vendor-registry",
+		Action: config.ActionBlock,
+		Route: config.RequestPolicyRoute{
+			Hosts:   []string{"registry.vendor.example"},
+			Methods: []string{"POST", "PUT", "PATCH", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"},
+		},
+	})
+
+	blocked := []string{"POST", "PUT", "PATCH", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
+	for _, method := range blocked {
+		got := m.Evaluate(RequestMeta{Host: "registry.vendor.example", Method: method, Path: "/pkg"})
+		if got.Action != config.ActionBlock || !got.Enforced() {
+			t.Fatalf("method %q: want enforced block, got %+v", method, got)
+		}
+	}
+
+	// request_policy is allow-by-default: a method absent from the deny list
+	// reaches the host. Only reads and metadata verbs belong here. A
+	// state-changing method that this recipe fails to name is a gap in the
+	// recipe, not a property to assert, so LOCK and UNLOCK are in the blocked
+	// set above rather than here.
+	unlisted := []string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace}
+	for _, method := range unlisted {
+		got := m.Evaluate(RequestMeta{Host: "registry.vendor.example", Method: method, Path: "/pkg"})
+		if got.Matched() {
+			t.Fatalf("unlisted method %q matched the write-method deny list: %+v", method, got)
+		}
+	}
+}
+
 func TestEvaluate_RouteMatch(t *testing.T) {
 	m := mustMatcher(t, apiWriteRule())
 	tests := []struct {

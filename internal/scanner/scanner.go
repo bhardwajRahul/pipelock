@@ -234,6 +234,8 @@ type Scanner struct {
 	subdomainExclusions        []string // domains excluded from subdomain entropy checks
 	queryExclusions            []string // domains excluded from query parameter entropy checks (S3 pre-signed URLs, etc.)
 	queryParamExclusions       map[queryEntropyParamExclusionKey]struct{}
+	scanNestedURLs             bool          // fetch_proxy.monitoring.scan_nested_urls; nil/true = enabled
+	nestedURLResolveBudget     time.Duration // shared deadline for all nested lookups in one request
 	// pathEntropyExempt suppresses the path-entropy gate on paths the operator
 	// already governs with a request_policy route (explicit host + path
 	// constraints). A nil or disabled matcher keeps path entropy fully active.
@@ -391,6 +393,8 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Scanner, error) {
 		subdomainExclusions:       cfg.FetchProxy.Monitoring.SubdomainEntropyExclusions,
 		queryExclusions:           cfg.FetchProxy.Monitoring.QueryEntropyExclusions,
 		queryParamExclusions:      buildQueryEntropyParamExclusions(cfg.FetchProxy.Monitoring.QueryEntropyParamExclusions),
+		scanNestedURLs:            cfg.FetchProxy.Monitoring.ScanNestedURLsEnabled(),
+		nestedURLResolveBudget:    defaultNestedURLResolveBudget,
 		pathEntropyExempt:         buildPathEntropyExempt(cfg),
 		destinationGrants:         opts.DestinationGrants,
 	}
@@ -1066,6 +1070,18 @@ func (s *Scanner) scan(ctx context.Context, rawURL string) (result Result) {
 		return result
 	}
 
+	// Nested URL destinations in query parameters. Deliberately placed AFTER the
+	// no-I/O content scanners (core DLP, DLP, entropy) and immediately before
+	// DNS-based SSRF on the outer host. An earlier revision ran this before DLP,
+	// which let a request carrying both a credential and several slow nested
+	// hostnames return a nested-resolution timeout before DLP ever ran: the
+	// secret was still refused, but the DLP finding never reached audit and the
+	// timeout is adaptive-neutral, so nothing was recorded. Content findings that
+	// need no network must be established before any check that can time out.
+	if result := s.checkNestedURLs(ctx, parsed); !result.Allowed {
+		return result
+	}
+
 	// SSRF protection - DNS resolution happens here, safe after DLP.
 	// When active, core CIDRs are always included via mergedSSRFCIDRs()
 	// so private ranges (10.x, 172.16.x, 192.168.x, loopback, link-local)
@@ -1192,7 +1208,7 @@ func (s *Scanner) checkSSRF(ctx context.Context, dest destination.Destination) R
 
 	// Resolve hostname to IP for SSRF check.
 	// Fail closed: if we can't resolve DNS, we can't verify the IP is safe.
-	dnsCtx, dnsCancel := context.WithTimeout(ctx, 5*time.Second) // 5s: DNS resolution ceiling; inherits caller cancellation
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, ssrfLookupCeiling) // inherits caller cancellation
 	defer dnsCancel()
 	ips, err := s.resolver.LookupHost(dnsCtx, hostname)
 	if err != nil {
@@ -1335,6 +1351,193 @@ func (s *Scanner) checkBlocklist(hostname string) Result {
 		}
 	}
 	return Result{Allowed: true}
+}
+
+// ssrfLookupCeiling is the deadline one SSRF hostname resolution may take. The
+// outer host and the nested-destination budget share it so the two cannot drift.
+const ssrfLookupCeiling = 5 * time.Second
+
+// nestedURLResolveBudget bounds the total resolver time one request may spend on
+// nested destinations. It equals one lookup ceiling, so a request carrying nested
+// hostnames cannot hold more resolver time than one ordinary outer lookup. What
+// makes one ceiling sufficient in practice is that distinct destinations are
+// resolved once per request (see the seen set in checkNestedURLs): the common
+// shape, one callback URL repeated, costs a single lookup. A request naming many
+// DISTINCT slow hostnames can still exhaust it, which is why exhaustion is
+// classified as an infrastructure error rather than a threat.
+//
+// Exhausting the budget fails CLOSED: a nested destination that could not be
+// resolved in time is refused, never forwarded. Parsing and literal-IP checks
+// need no I/O and are bounded by the outer URL length, so there is deliberately
+// no cap on how many query values are examined; a count cap was a fail-open
+// (pad past it, then relay).
+// The value lives on the Scanner rather than in a package variable. A mutable
+// global would be shared by every concurrent scan, and a test that shortened it
+// would race every other test in the package.
+const defaultNestedURLResolveBudget = ssrfLookupCeiling
+
+const nestedURLReasonPrefix = "nested URL in query parameter"
+
+// nestedURLCandidate is one query component text that may be a nested URL, with
+// the parameter key it came from for the block reason.
+type nestedURLCandidate struct {
+	key  string
+	text string
+}
+
+// nestedURLCandidates enumerates every query component that could hide a nested
+// destination. It reads RawQuery directly rather than url.URL.Query(): Query()
+// percent-decodes and folds '+' to space, which destroys IPv6 zone ids (%25) and
+// hides the encodings the DLP query loop already sees. Both keys and values are
+// candidates, in raw form, iteratively percent-decoded, and through the same
+// hex/base64/base32 layers DLP applies. A scheme-relative "//host/..." is
+// completed with https so the host is evaluated like any other destination.
+func nestedURLCandidates(rawQuery string, maxLen int) []nestedURLCandidate {
+	var out []nestedURLCandidate
+	add := func(key, text string) {
+		text = strings.TrimSpace(text)
+		if text == "" || (maxLen > 0 && len(text) > maxLen) {
+			return
+		}
+		if strings.HasPrefix(text, "//") {
+			// A network-path reference names an authority (RFC 3986 4.2), so
+			// complete it and let the same parser the destination checks use
+			// decide whether a host is present. An earlier revision gated this
+			// on "contains an ASCII dot or parses as an IP literal", which read
+			// as caution and was a detection hole: it skipped every single-label
+			// internal name (localhost, consul, vault) and every host spelled
+			// with a non-ASCII dot. Deciding what is NOT a destination is an
+			// allow gate, and an invented shape rule for one is a bypass.
+			text = "https:" + text
+		}
+		out = append(out, nestedURLCandidate{key: key, text: text})
+	}
+	for _, pair := range strings.Split(rawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		decodedKey := IterativeDecode(key)
+		for _, component := range []string{key, value} {
+			if component == "" {
+				continue
+			}
+			add(decodedKey, component)
+			decoded := IterativeDecode(component)
+			if decoded != component {
+				add(decodedKey, decoded)
+			}
+			for _, d := range decodeEncodingsRecursive(decoded) {
+				add(decodedKey, d.text)
+			}
+		}
+	}
+	return out
+}
+
+// checkNestedURLs evaluates URL-shaped query components as destinations in
+// their own right, running the same allowlist, blocklist, and SSRF checks the
+// outer host receives. Decode is at most one level of nesting: a nested URL that
+// itself carries a nested URL is not expanded. Non-URL text, relative paths, and
+// non-http(s) schemes are ignored. All nested DNS lookups share one deadline.
+func (s *Scanner) checkNestedURLs(ctx context.Context, parsed *url.URL) Result {
+	if !s.scanNestedURLs || parsed == nil || parsed.RawQuery == "" {
+		return Result{Allowed: true}
+	}
+	candidates := nestedURLCandidates(parsed.RawQuery, s.maxURLLength)
+	if len(candidates) == 0 {
+		return Result{Allowed: true}
+	}
+	runDNSSSRF := len(s.internalCIDRs) > 0 || s.destinationGrants.Len() > 0
+	nestedCtx, cancel := context.WithTimeout(ctx, s.nestedURLResolveBudget)
+	defer cancel()
+	// One verdict per distinct destination. The same callback URL repeated
+	// across parameters, or reached through several encodings, is one
+	// destination and must cost one resolution, not one per occurrence.
+	seen := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		result := s.checkNestedURLValue(nestedCtx, c.key, c.text, runDNSSSRF, seen)
+		if result.Allowed {
+			continue
+		}
+		if nestedCtx.Err() != nil && ctx.Err() == nil {
+			// The shared budget ran out before every nested destination was
+			// resolved. Refuse the request, because an unverified nested
+			// destination is exactly what this step exists to stop. Classify it
+			// as an infrastructure error, not a threat: nothing was resolved, so
+			// there is no evidence of an adversary, and adaptive enforcement must
+			// not accumulate lockdown signal from resolver wobble. This matches
+			// how checkSSRF already classifies an outer-host resolver failure.
+			return Result{
+				Allowed: false,
+				Reason:  fmt.Sprintf("nested URL destinations exceeded the shared resolution budget (%s)", s.nestedURLResolveBudget),
+				Scanner: ScannerSSRF,
+				Score:   1.0,
+				Class:   ClassInfrastructureError,
+			}
+		}
+		return result
+	}
+	return Result{Allowed: true}
+}
+
+func (s *Scanner) checkNestedURLValue(ctx context.Context, key, text string, runDNSSSRF bool, seen map[string]struct{}) Result {
+	nestedParsed, err := url.Parse(text)
+	if err != nil {
+		return Result{Allowed: true}
+	}
+	scheme := strings.ToLower(nestedParsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return Result{Allowed: true}
+	}
+	nestedHost := strings.ToLower(nestedParsed.Hostname())
+	if nestedHost == "" {
+		return Result{Allowed: true}
+	}
+	// Canonicalize alternative IPv4 forms the same way scan does for the outer host.
+	if altIP := destination.ParseIPLiteral(nestedHost); altIP != nil && altIP.To4() != nil && net.ParseIP(nestedHost) == nil {
+		nestedHost = altIP.String()
+		port := nestedParsed.Port()
+		if port != "" {
+			nestedParsed.Host = nestedHost + ":" + port
+		} else {
+			nestedParsed.Host = nestedHost
+		}
+	}
+	nestedDest, ok := urlDestination(nestedParsed, nestedHost)
+	if !ok {
+		// Bad port: treat as not a URL rather than blocking.
+		return Result{Allowed: true}
+	}
+	// Key on host and port: the same name on a different port is a different
+	// destination for allowlist and grant purposes.
+	dedupKey := fmt.Sprintf("%s:%d", nestedDest.Host, nestedDest.Port)
+	if seen != nil {
+		if _, done := seen[dedupKey]; done {
+			return Result{Allowed: true}
+		}
+		seen[dedupKey] = struct{}{}
+	}
+	if result := s.checkAllowlist(nestedDest); !result.Allowed {
+		return prefixNestedURLResult(key, result)
+	}
+	if result := s.checkBlocklist(nestedHost); !result.Allowed {
+		return prefixNestedURLResult(key, result)
+	}
+	if result := s.checkCoreSSRFLiteral(nestedDest); !result.Allowed {
+		return prefixNestedURLResult(key, result)
+	}
+	if runDNSSSRF {
+		if result := s.checkSSRF(ctx, nestedDest); !result.Allowed {
+			return prefixNestedURLResult(key, result)
+		}
+	}
+	return Result{Allowed: true}
+}
+
+func prefixNestedURLResult(key string, result Result) Result {
+	result.Reason = fmt.Sprintf(nestedURLReasonPrefix+" %q: %s", key, result.Reason)
+	return result
 }
 
 // checkCRLF detects CRLF injection sequences in URLs. CR+LF bytes in a URL

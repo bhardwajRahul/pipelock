@@ -364,7 +364,47 @@ func OperatorHintFor(label string) string {
 // entropy, while ScannerDenialOfWallet distinguishes budget-limit reasons.
 // Every other label falls through to the label-keyed table. This is the single
 // place that disambiguation lives, so explain, audit, and future consumers agree.
-func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
+// stripNestedURLReasonPrefix removes the "nested URL in query parameter %q: "
+// prefix so guidance routes on the INNER scanner reason. The parameter key is
+// attacker-chosen, and the SSRF routing below matches substrings such as
+// "metadata"; without this, a request naming its parameter "metadata" would be
+// explained with the immutable cloud-metadata guidance no matter what the
+// nested destination actually was.
+func stripNestedURLReasonPrefix(reason string) string {
+	open := nestedURLReasonPrefix + " \""
+	if !strings.HasPrefix(reason, open) {
+		return reason
+	}
+	rest := reason[len(open):]
+	// The key is %q-quoted, so the terminating quote is the first one not
+	// preceded by an odd number of backslashes.
+	for i := 0; i < len(rest); i++ {
+		if rest[i] != '"' {
+			continue
+		}
+		slashes := 0
+		for j := i - 1; j >= 0 && rest[j] == '\\'; j-- {
+			slashes++
+		}
+		if slashes%2 == 1 {
+			continue
+		}
+		if strings.HasPrefix(rest[i:], "\": ") {
+			return rest[i+3:]
+		}
+		return reason
+	}
+	return reason
+}
+
+func GuidanceForResult(label, reason string) (g RemediationGuidance, ok bool) {
+	nested := reason
+	reason = stripNestedURLReasonPrefix(reason)
+	defer func() {
+		if ok {
+			g = annotateNestedURLGuidance(g, label, nested, reason)
+		}
+	}()
 	// Some transports retain historical audit labels for the same enforcing
 	// family. Normalize them before reason routing so alternate labels cannot
 	// drift to a less accurate hint.
@@ -598,6 +638,15 @@ func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
 	// knobs that cannot exempt these targets. Route those reason-specific SSRF
 	// blocks to the non-overridable guidance regardless of which SSRF label
 	// carried them.
+	// A nested-destination timeout is an availability condition wearing an SSRF
+	// label. Route it before the SSRF knobs below, which would otherwise offer
+	// ssrf.ip_allowlist and trusted_domains for a block no allowlist can lift.
+	if strings.Contains(reason, nestedURLBudgetReason) {
+		return RemediationGuidance{
+			OperatorKnob: nestedURLBudgetOperatorKnob,
+			AgentReason:  nestedURLBudgetAgentReason,
+		}, true
+	}
 	if label == ScannerSSRF || label == ScannerSSRFMetadata || label == ScannerCoreSSRF {
 		if strings.Contains(reason, "metadata") {
 			return RemediationGuidance{
@@ -615,6 +664,39 @@ func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
 		}
 	}
 	return GuidanceFor(label)
+}
+
+// nestedURLBudgetReason is the substring that identifies a nested-destination
+// resolution timeout. Guidance for it must never name an allowlist: no allowlist
+// entry makes a resolver answer faster, and naming one teaches an operator that
+// policy changed when nothing did.
+const nestedURLBudgetReason = "shared resolution budget"
+
+const nestedURLBudgetOperatorKnob = "Nested query destinations could not be resolved within the shared resolution budget, so the request was refused with a destination left unverified. This is resolver availability, not detection: check resolver health and latency for the hostnames named in the request. To stop evaluating query-parameter destinations entirely, set `fetch_proxy.monitoring.scan_nested_urls` to false."
+
+const nestedURLBudgetAgentReason = "a destination named inside this request could not be verified in time"
+
+func annotateNestedURLGuidance(g RemediationGuidance, label, reason, stripped string) RemediationGuidance {
+	// A resolution timeout already carries its own guidance and must not be
+	// annotated with the destination-knob sentence: no allowlist lifts a timeout.
+	// Test the STRIPPED reason, never the raw one. The raw reason still carries
+	// the query key, which the client chooses, so matching on it let a parameter
+	// named after the budget suppress the sentence on a genuine destination block.
+	if strings.Contains(strings.ToLower(stripped), strings.ToLower(nestedURLBudgetReason)) {
+		return g
+	}
+	if !strings.Contains(strings.ToLower(reason), "nested url in query parameter") {
+		return g
+	}
+	nestedKnob := " Nested query destinations are evaluated because `fetch_proxy.monitoring.scan_nested_urls` is enabled (nil/true). Set it false only for an endpoint whose contract legitimately carries private or blocklisted URLs in query strings."
+	switch label {
+	case ScannerSSRF, ScannerCoreSSRF:
+		if !g.Immutable {
+			nestedKnob += " The nested host consults `ssrf.ip_allowlist`, `trusted_domains`, and `dns.host_overrides` because it reuses the same destination checks as the outer host."
+		}
+	}
+	g.OperatorKnob += nestedKnob
+	return g
 }
 
 // OperatorHintForResult is OperatorHintFor with Reason-based disambiguation. Use
