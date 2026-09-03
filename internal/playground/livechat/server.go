@@ -606,6 +606,10 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 // session already torn down) cannot download.
 func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	s.setCORS(w)
+	// This is the owner-only artifact and can include real targets. The session
+	// token bounds retrieval at this server; no-store prevents an HTTP cache from
+	// extending that delivery channel after the token expires.
+	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -644,7 +648,11 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	// "finish and prove it" semantic. Fail closed if the run did not verify.
 	if err := s.seal(entry); err != nil {
 		s.releaseSessionResources(entry)
-		writeErr(w, http.StatusServiceUnavailable, "session bundle is not available")
+		// Say that nothing partial was released, because the visitor's next
+		// question is whether they were handed a half-made bundle. Do not name
+		// the target, policy, or layer that failed: the reason can itself be
+		// the sensitive part.
+		writeErr(w, http.StatusServiceUnavailable, "we could not create a verifiable bundle for this session; nothing partial was released")
 		return
 	}
 	s.releaseSessionResources(entry)

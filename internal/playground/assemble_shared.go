@@ -22,7 +22,14 @@ import (
 // When sc is nil the function falls back to deriving a bare Scenario from the
 // evidence path (identical to AssembleFromEvidence).
 func AssembleFromEvidenceWithScenario(evidenceFile, pubKeyHex string, sc *replaycapture.Scenario, outDir string, generatedAt time.Time) (*replaycapture.AssembleResult, error) {
-	return assembleFromEvidenceCore(evidenceFile, pubKeyHex, sc, outDir, generatedAt)
+	return assembleFromEvidenceCore(evidenceFile, pubKeyHex, sc, outDir, generatedAt, replaycapture.AudiencePublicGallery)
+}
+
+// AssembleSessionOwnerFromEvidence assembles a visitor's exact signed session
+// evidence, including receipts whose target is a real host. The caller must
+// authorize delivery over that session's short-lived channel.
+func AssembleSessionOwnerFromEvidence(evidenceFile, pubKeyHex string, sc *replaycapture.Scenario, outDir string, generatedAt time.Time) (*replaycapture.AssembleResult, error) {
+	return assembleFromEvidenceCore(evidenceFile, pubKeyHex, sc, outDir, generatedAt, replaycapture.AudienceSessionOwner)
 }
 
 // AssembleFromEvidence turns a live evidence JSONL file (written by a real
@@ -42,10 +49,10 @@ func AssembleFromEvidenceWithScenario(evidenceFile, pubKeyHex string, sc *replay
 // evidence alone. AssemblePacket uses only Scenario.ID; callers that also need
 // BuildManifest must supply the full Scenario separately.
 func AssembleFromEvidence(evidenceFile, pubKeyHex, outDir string, generatedAt time.Time) (*replaycapture.AssembleResult, error) {
-	return assembleFromEvidenceCore(evidenceFile, pubKeyHex, nil, outDir, generatedAt)
+	return assembleFromEvidenceCore(evidenceFile, pubKeyHex, nil, outDir, generatedAt, replaycapture.AudiencePublicGallery)
 }
 
-func assembleFromEvidenceCore(evidenceFile, pubKeyHex string, sc *replaycapture.Scenario, outDir string, generatedAt time.Time) (*replaycapture.AssembleResult, error) {
+func assembleFromEvidenceCore(evidenceFile, pubKeyHex string, sc *replaycapture.Scenario, outDir string, generatedAt time.Time, audience replaycapture.Audience) (*replaycapture.AssembleResult, error) {
 	cleanPath := filepath.Clean(evidenceFile)
 
 	if _, err := os.Stat(cleanPath); err != nil {
@@ -94,7 +101,7 @@ func assembleFromEvidenceCore(evidenceFile, pubKeyHex string, sc *replaycapture.
 		ChainResult:  chain,
 	}
 
-	result, err := replaycapture.AssemblePacket(cs, outDir, generatedAt)
+	result, err := replaycapture.AssemblePacketFor(cs, outDir, generatedAt, audience)
 	if err != nil {
 		return nil, fmt.Errorf("assemble packet: %w", err)
 	}
