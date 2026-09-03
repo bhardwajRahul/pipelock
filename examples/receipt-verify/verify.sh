@@ -129,21 +129,47 @@ print(len(blocks))
 PY
 }
 
-tamper_receipt() {
+tamper_captured_record() {
   local src="$1"
   local dst="$2"
   python3 - <<'PY' "$src" "$dst"
-import copy, json, sys
+import json, sys
 from pathlib import Path
 
 src, dst = sys.argv[1:3]
-receipt = json.loads(Path(src).read_text())
-tampered = copy.deepcopy(receipt)
-prefix, value = tampered["signature"].split(":", 1)
-first = value[:2]
-flipped = "00" if first.lower() != "00" else "ff"
-tampered["signature"] = f"{prefix}:{flipped}{value[2:]}"
-Path(dst).write_text(json.dumps(tampered, indent=2) + "\n")
+records = [json.loads(line) for line in Path(src).read_text().splitlines() if line.strip()]
+for record in records:
+    if record.get("type") != "action_receipt":
+        continue
+    detail = record.get("detail")
+    was_string = isinstance(detail, str)
+    if was_string:
+        detail = json.loads(detail)
+    action_record = detail.get("action_record") if isinstance(detail, dict) else None
+    if isinstance(action_record, dict) and action_record.get("verdict") == "block":
+        chain_seq = action_record.get("chain_seq")
+        if type(chain_seq) is not int:
+            raise SystemExit("blocked action_receipt has no numeric chain_seq")
+        same_seq_count = 0
+        for candidate in records:
+            if candidate.get("type") != "action_receipt":
+                continue
+            candidate_detail = candidate.get("detail")
+            if isinstance(candidate_detail, str):
+                candidate_detail = json.loads(candidate_detail)
+            candidate_action = candidate_detail.get("action_record") if isinstance(candidate_detail, dict) else None
+            if isinstance(candidate_action, dict) and candidate_action.get("chain_seq") == chain_seq:
+                same_seq_count += 1
+        if same_seq_count != 1:
+            raise SystemExit(f"blocked action_receipt chain_seq {chain_seq} is ambiguous in this capture")
+        action_record["verdict"] = "allow"
+        if was_string:
+            record["detail"] = json.dumps(detail, separators=(",", ":"))
+        print(chain_seq)
+        break
+else:
+    raise SystemExit("no blocked action_receipt record")
+Path(dst).write_text("".join(json.dumps(record) + "\n" for record in records))
 PY
 }
 
@@ -253,13 +279,20 @@ else
 fi
 
 # -- Test 5 -------------------------------------------------------------------
-step "Test 5: tampered receipt fails verification (required)"
-TAMPERED="$WORK/block-receipt.tampered.json"
-tamper_receipt "$BLOCK_RECEIPT" "$TAMPERED"
-if "$PIPELOCK" verify-receipt "$TAMPERED" --key "$PUB" >/dev/null 2>"$WORK/verify-tampered.err"; then
-  fail "tampered receipt unexpectedly verified"
+step "Test 5: tampered captured record fails verification (required)"
+TAMPERED="$WORK/evidence-proxy-0.tampered.jsonl"
+TAMPERED_RECEIPT_SEQ="$(tamper_captured_record "$EVIDENCE" "$TAMPERED")"
+if "$PIPELOCK" verify-receipt "$TAMPERED" --key "$PUB" >"$WORK/verify-tampered.out" 2>"$WORK/verify-tampered.err"; then
+  fail "tampered captured record unexpectedly verified"
+elif grep -q '^CHAIN BROKEN:' "$WORK/verify-tampered.out" \
+  && grep -q "^  Error:    seq ${TAMPERED_RECEIPT_SEQ}: signature: signature verification failed$" "$WORK/verify-tampered.out" \
+  && grep -q "^  Broke at: seq ${TAMPERED_RECEIPT_SEQ}$" "$WORK/verify-tampered.out"; then
+  cat "$WORK/verify-tampered.out"
+  pass "tampered captured record rejected by verify-receipt"
 else
-  pass "tampered receipt rejected by verify-receipt"
+  fail "tampered captured record had an unexpected verification failure"
+  cat "$WORK/verify-tampered.out" >&2 || true
+  cat "$WORK/verify-tampered.err" >&2 || true
 fi
 
 # -- Summary ------------------------------------------------------------------

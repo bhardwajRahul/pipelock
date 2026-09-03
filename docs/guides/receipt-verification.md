@@ -210,6 +210,26 @@ match their recorded hash. Those symptoms narrow the cause but do not by
 themselves establish it: a fork and a crafted edit can present the same
 structure.
 
+### Falsify a captured record
+
+The runnable [receipt verification example](../../examples/receipt-verify/README.md)
+captures a blocked request, verifies it with a pinned key, then in step 5 changes
+the blocked receipt's `detail.action_record.verdict` from `block` to `allow`.
+The verifier fails closed (exit 1) with this output shape from an actual run:
+
+```text
+CHAIN BROKEN: /tmp/.../evidence-proxy-0.tampered.jsonl
+  Error:    seq 2: signature: signature verification failed
+  Broke at: seq 2
+```
+
+Receipt-chain verification authenticates the signed `action_record` (including
+the action, policy hash, verdict, target, and chain linkage), not the outer
+flight-recorder hash chain. An entry's `seq` and `summary` are not checked in
+this mode. Its `type` is not signed, but it does select whether the entry is
+extracted as an action receipt; unknown types fail closed. Changing an outer
+field is therefore not a tamper demonstration for receipt-chain verification.
+
 ### Compacting an over-cap recorder directory
 
 Evidence readers refuse a session with more than 256 JSONL shards or an individual shard above 8 MiB. Stop the recorder before running the offline compaction ceremony. The compactor has its own bounded reader for legacy oversized shards, so a normal `pipelock evidence doctor` run isn't a prerequisite.
