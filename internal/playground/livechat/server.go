@@ -6,6 +6,7 @@ package livechat
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -77,8 +78,12 @@ type ServerConfig struct {
 	Containment playground.ContainmentVerifier
 	// OrchestratorKeyPath / ToyAgentBin / WebToolBin are forwarded to sessions.
 	OrchestratorKeyPath string
-	ToyAgentBin         string
-	WebToolBin          string
+	// RequireDelegatedSigning refuses a session that does not carry a
+	// broker-minted session key and root-signed delegation. Production VMs
+	// set this so the durable root never has to exist on the guest.
+	RequireDelegatedSigning bool
+	ToyAgentBin             string
+	WebToolBin              string
 	// ProxyPort is the fixed loopback port each session's in-process proxy binds.
 	// It must match the single port the kernel owner-match rule allows the
 	// contained agent uid to reach (`pipelock contain install --proxy-port`). 0 =
@@ -179,6 +184,15 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*liveEntry
+	// pending holds run nonces claimed by an in-flight start that does not yet
+	// have a session entry. Redeeming an invite keys its refund record by this
+	// same id, so without the reservation two concurrent starts on one nonce
+	// each consume an allocation while only one refund can find its record.
+	pending map[string]struct{}
+	// beforeGateRedeem provides a test-only rendezvous after a nonce has been
+	// reserved and before the invite allocation is spent. It is nil in every
+	// production server.
+	beforeGateRedeem func()
 }
 
 // defaultMaxMessagesPerSession bounds one session's model calls when the operator
@@ -236,6 +250,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		maxMsgPerSession: maxMsg,
 		roundTripsPerMsg: roundTripsPerMsg,
 		sessions:         make(map[string]*liveEntry),
+		pending:          make(map[string]struct{}),
 	}, nil
 }
 
@@ -271,7 +286,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type createReq struct {
-	Code string `json:"code"`
+	Code                   string          `json:"code"`
+	RunNonce               string          `json:"run_nonce,omitempty"`
+	SessionSigningKey      string          `json:"session_signing_key,omitempty"`
+	OrchestratorDelegation json.RawMessage `json:"orchestrator_delegation,omitempty"`
 }
 
 type createResp struct {
@@ -279,6 +297,22 @@ type createResp struct {
 	SessionID string `json:"session_id"`
 	ExpiresAt string `json:"expires_at"`
 	State     string `json:"state"`
+}
+
+// reserveRunNonce claims a run nonce for an in-flight start. It reports false
+// when the nonce already has a live session or another start in flight, which is
+// what keeps a duplicate from consuming a second invite allocation.
+func (s *Server) reserveRunNonce(sid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, live := s.sessions[sid]; live {
+		return false
+	}
+	if _, inflight := s.pending[sid]; inflight {
+		return false
+	}
+	s.pending[sid] = struct{}{}
+	return true
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -302,12 +336,17 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body createReq
-	if err := decodeJSON(r, &body, "code"); err != nil {
+	if err := decodeJSON(r, &body, "code", "run_nonce", "session_signing_key", "orchestrator_delegation"); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad request")
 		return
 	}
 	if body.Code == "" {
 		writeErr(w, http.StatusUnauthorized, "invite code required")
+		return
+	}
+	sessionPriv, delegation, err := parseSessionDelegation(body, s.cfg.RequireDelegatedSigning)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "session signing required")
 		return
 	}
 	if !s.budget.Open() {
@@ -329,14 +368,35 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if body.RunNonce != "" {
+		sid = body.RunNonce
+	}
+	// Claim the nonce before spending any invite budget. Gate.Redeem keys its
+	// refund record by this id, so a duplicate that got as far as redeeming
+	// would leave one of the two allocations permanently unrefundable.
+	if !s.reserveRunNonce(sid) {
+		release()
+		writeErr(w, http.StatusConflict, "a session for this run is already active")
+		return
+	}
+	releaseRunNonce := func() {
+		s.mu.Lock()
+		delete(s.pending, sid)
+		s.mu.Unlock()
+	}
+	if s.beforeGateRedeem != nil {
+		s.beforeGateRedeem()
+	}
 	token, claims, err := s.cfg.Gate.Redeem(body.Code, sid)
 	if err != nil {
+		releaseRunNonce()
 		release()
 		writeErr(w, gateErrStatus(err), "invite code rejected")
 		return
 	}
 	if !s.codeRate.Allow("code:" + claims.CodeID) {
 		s.cfg.Gate.Refund(claims)
+		releaseRunNonce()
 		release()
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -352,6 +412,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.cfg.Gate.Refund(claims)
 		cancel()
+		releaseRunNonce()
 		release()
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
@@ -362,6 +423,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		RequireContainment:  s.cfg.RequireContainment,
 		Containment:         s.cfg.Containment,
 		OrchestratorKeyPath: s.cfg.OrchestratorKeyPath,
+		SessionPrivateKey:   sessionPriv,
+		Delegation:          delegation,
 		ToyAgentBin:         s.cfg.ToyAgentBin,
 		WebToolBin:          s.cfg.WebToolBin,
 		ProxyPort:           s.cfg.ProxyPort,
@@ -371,6 +434,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(runDir)
 		s.cfg.Gate.Refund(claims)
 		cancel()
+		releaseRunNonce()
 		release()
 		// Containment refusal is the most likely cause and is fail-closed.
 		writeErr(w, http.StatusServiceUnavailable, "session could not be started")
@@ -390,6 +454,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(runDir)
 		s.cfg.Gate.Refund(claims)
 		cancel()
+		releaseRunNonce()
 		release()
 	}
 	ttl := time.Until(claims.ExpiresAt)
@@ -406,6 +471,18 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "the demo is paused")
 		return
 	}
+	// The session id is the caller-supplied run nonce, so two accepted requests
+	// can carry the same one. Overwriting would orphan the first session: its
+	// timer still closes over this id and would finalize the replacement
+	// instead, leaving the original running with nothing able to reap it.
+	// Refuse the duplicate and let this request's own cleanup run.
+	if _, exists := s.sessions[sid]; exists {
+		s.mu.Unlock()
+		cleanupStartedSession()
+		writeErr(w, http.StatusConflict, "a session for this run is already active")
+		return
+	}
+	delete(s.pending, sid)
 	s.sessions[sid] = entry
 	entry.timer = time.AfterFunc(ttl, func() { s.finalize(sid) })
 	s.mu.Unlock()
@@ -822,6 +899,46 @@ func gateErrStatus(err error) int {
 		// Unknown / exhausted codes are an auth failure from the client's view.
 		return http.StatusUnauthorized
 	}
+}
+
+// verifySessionDelegation is the package's single verification entry point. It
+// is a variable only so tests can observe that the request's own run nonce is
+// what reaches verification; nothing outside this package can replace it, so no
+// deployment can weaken the check.
+var verifySessionDelegation = playground.VerifySessionDelegation
+
+func parseSessionDelegation(body createReq, required bool) (ed25519.PrivateKey, *playground.OrchestratorDelegation, error) {
+	if len(body.SessionSigningKey) == 0 && len(body.OrchestratorDelegation) == 0 {
+		if required {
+			return nil, nil, errors.New("session signing required")
+		}
+		return nil, nil, nil
+	}
+	if body.SessionSigningKey == "" || len(body.OrchestratorDelegation) == 0 {
+		return nil, nil, errors.New("session signing key and delegation must both be present")
+	}
+	// The run nonce is what ties this delegation to this run. Without one the
+	// server would mint a random session id and sign a manifest for a run the
+	// delegation never authorized, so an absent nonce is a refusal rather than
+	// a skipped check.
+	if body.RunNonce == "" {
+		return nil, nil, errors.New("delegated session requires a run nonce")
+	}
+	priv, err := playground.ParseOrchestratorPrivateKeyHex(body.SessionSigningKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	d, err := playground.ParseOrchestratorDelegation(body.OrchestratorDelegation)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Parsing only proves the delegation is well formed. Verify it against the
+	// compiled published root, never against a root the delegation names, or a
+	// caller holding an invite code could authorize its own session key.
+	if err := verifySessionDelegation(priv, d, body.RunNonce); err != nil {
+		return nil, nil, err
+	}
+	return priv, &d, nil
 }
 
 func decodeJSON(r *http.Request, v any, allowedKeys ...string) error {

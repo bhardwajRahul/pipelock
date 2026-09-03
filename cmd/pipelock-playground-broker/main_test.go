@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/playground/broker"
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
 type fakeProvider struct{}
@@ -152,7 +154,6 @@ func TestBuildServerWithInjectedProvider(t *testing.T) {
 	gateSecret := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	gateSecretFile := writeTestFile(t, dir, "gate.b64", gateSecret+"\n")
 	modelFile := writeTestFile(t, dir, "model.key", "model-file-value\n")
-	orchestratorFile := writeTestFile(t, dir, "orchestrator.key", "orchestrator-file-value\n")
 
 	var gotProvider string
 	var gotToken string
@@ -186,8 +187,8 @@ func TestBuildServerWithInjectedProvider(t *testing.T) {
 		deadlineGrace:         defaultGrace,
 		vmDailyTurnBudget:     10,
 		modelKeyFile:          modelFile,
-		orchestratorKeyFile:   orchestratorFile,
-		requireSessionSecrets: true,
+		vmImageDigest:         "sha256:" + strings.Repeat("ab", 32),
+		requireSessionSecrets: false,
 	})
 	if err != nil {
 		t.Fatalf("buildServer: %v", err)
@@ -1799,6 +1800,77 @@ func TestNormalizeCFAccessTeamDomain(t *testing.T) {
 	}
 }
 
+// The delegation attests which image ran, so the resolved digest has to be the
+// digest the launched reference is pinned to. A mutable tag beside a valid but
+// unrelated digest would attest an image that never launched.
+func TestResolveImageDigest(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	other := "sha256:" + strings.Repeat("cd", 32)
+	pinned := "registry.example/playground:vm@" + digest
+
+	got, err := resolveImageDigest(&serveFlags{image: pinned, vmImageDigest: digest, requireSessionSecrets: true})
+	if err != nil {
+		t.Fatalf("pinned image with matching flag: %v", err)
+	}
+	if got != digest {
+		t.Fatalf("digest = %q, want %q", got, digest)
+	}
+
+	got, err = resolveImageDigest(&serveFlags{image: pinned, requireSessionSecrets: true})
+	if err != nil {
+		t.Fatalf("pinned image alone: %v", err)
+	}
+	if got != digest {
+		t.Fatalf("digest from image = %q, want %q", got, digest)
+	}
+
+	for _, tc := range []struct {
+		name string
+		f    serveFlags
+	}{
+		{name: "no_digest_anywhere", f: serveFlags{requireSessionSecrets: true}},
+		{name: "mutable_tag_with_flag_digest", f: serveFlags{image: "registry.example/playground:vm", vmImageDigest: digest, requireSessionSecrets: true}},
+		{name: "image_and_flag_disagree", f: serveFlags{image: pinned, vmImageDigest: other, requireSessionSecrets: true}},
+		{name: "short_digest", f: serveFlags{image: pinned, vmImageDigest: "sha256:deadbeef", requireSessionSecrets: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := resolveImageDigest(&tc.f); err == nil {
+				t.Fatal("expected a refusal")
+			}
+		})
+	}
+
+	got, err = resolveImageDigest(&serveFlags{requireSessionSecrets: false})
+	if err != nil || got != "" {
+		t.Fatalf("optional missing digest = %q err=%v", got, err)
+	}
+}
+
+// Every shipped verifier pins the published identity, so a broker configured
+// with any other root would sign bundles that fail offline verification for
+// every visitor. That is refused at resolution rather than discovered later by
+// someone downloading a kit.
+func TestResolveOrchestratorRoot(t *testing.T) {
+	_, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := writeTestFile(t, dir, "orch.key", hex.EncodeToString(priv)+"\n")
+
+	_, err = resolveOrchestratorRoot(&serveFlags{orchestratorKeyFile: path, requireSessionSecrets: true})
+	if err == nil {
+		t.Fatal("a root that is not the published identity must be refused")
+	}
+	if !strings.Contains(err.Error(), "published orchestrator identity") {
+		t.Fatalf("error %v must say the root is not the published identity", err)
+	}
+
+	if _, err := resolveOrchestratorRoot(&serveFlags{requireSessionSecrets: false}); err != nil {
+		t.Fatalf("optional missing root: %v", err)
+	}
+}
+
 func TestResolveSessionEnv(t *testing.T) {
 	dir := t.TempDir()
 	modelFile := writeTestFile(t, dir, "model.key", "model-file-value\n")
@@ -1813,8 +1885,8 @@ func TestResolveSessionEnv(t *testing.T) {
 	if env[envModelKey] != "model-file-value" {
 		t.Fatalf("model env = %q", env[envModelKey])
 	}
-	if env[envOrchestratorKey] != "orchestrator-env-value" {
-		t.Fatalf("orchestrator env = %q", env[envOrchestratorKey])
+	if _, ok := env[envOrchestratorKey]; ok {
+		t.Fatal("durable orchestrator key must not be copied into visitor VM env")
 	}
 }
 
@@ -2462,5 +2534,26 @@ func TestBuildVMBaseEnv(t *testing.T) {
 	empty := buildVMBaseEnv(&serveFlags{internalPort: 8080})
 	if len(empty) != 1 || empty["PLAYGROUND_LISTEN"] != "0.0.0.0:8080" {
 		t.Errorf("empty config should yield only PLAYGROUND_LISTEN, got %v", empty)
+	}
+}
+
+// Broker and visitor VMs are one Fly app, so a root stored under the
+// guest-facing name is delivered to every guest. The broker must refuse to
+// build a server while that name is populated.
+func TestRefuseGuestFacingRootSecret(t *testing.T) {
+	t.Setenv(envOrchestratorKey, "deadbeef")
+	err := refuseGuestFacingRootSecret()
+	if err == nil {
+		t.Fatal("broker must refuse to serve while the guest-facing root secret is set")
+	}
+	if !strings.Contains(err.Error(), envOrchestratorRoot) {
+		t.Fatalf("error %v must name the broker-only variable %s", err, envOrchestratorRoot)
+	}
+}
+
+func TestRefuseGuestFacingRootSecret_AllowsCleanEnv(t *testing.T) {
+	t.Setenv(envOrchestratorKey, "")
+	if err := refuseGuestFacingRootSecret(); err != nil {
+		t.Fatalf("clean environment rejected: %v", err)
 	}
 }

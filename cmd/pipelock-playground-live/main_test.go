@@ -260,15 +260,6 @@ func devServeFlags() *serveFlags {
 	}
 }
 
-func testOrchestratorKeyPath(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "demo-signing.key")
-	if _, err := playground.GenerateOrchestratorKey(path, false); err != nil {
-		t.Fatalf("GenerateOrchestratorKey: %v", err)
-	}
-	return path
-}
-
 func testExecutablePath(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "pipelock-playground-llm-agent")
@@ -315,7 +306,7 @@ func TestBuildServer_SelfManagedContainmentSelectsInVMVerifier(t *testing.T) {
 	f.selfManagedContainment = true
 	f.codes = []string{"good"}
 	f.toyAgentBin = "/usr/local/bin/pipelock-playground-toyagent"
-	f.orchestratorKey = testOrchestratorKeyPath(t)
+	f.requireDelegated = true
 	f.concurrency = 1
 	f.proxyPort = playground.DefaultContainedProxyPort
 	f.operatorUID = 1000
@@ -378,7 +369,7 @@ func TestBuildServer_PublicModelRequiresDailyBudget(t *testing.T) {
 	f.modelBaseURL = "http://provider.example/v1"
 	f.model = "test-model"
 	f.modelSecretFile = testModelSecretPath(t)
-	f.orchestratorKey = testOrchestratorKeyPath(t)
+	f.requireDelegated = true
 
 	var out bytes.Buffer
 	if _, _, err := buildServer(&out, f); err == nil {
@@ -404,11 +395,15 @@ func TestBuildServer_RequireModelFailsClosedWithoutModelConfig(t *testing.T) {
 	f.concurrency = 1
 	f.requireModel = true
 	f.codes = []string{"good"}
-	f.orchestratorKey = testOrchestratorKeyPath(t)
+	f.requireDelegated = true
 
 	var out bytes.Buffer
-	if _, _, err := buildServer(&out, f); err == nil {
+	_, _, err := buildServer(&out, f)
+	if err == nil {
 		t.Fatal("--require-model without model config should fail closed")
+	}
+	if !strings.Contains(err.Error(), "require-model") {
+		t.Fatalf("error = %v, want the --require-model refusal rather than some earlier check", err)
 	}
 }
 
@@ -423,12 +418,16 @@ func TestBuildServer_PublicModelValidatesRuntimeFiles(t *testing.T) {
 	f.modelBaseURL = "http://provider.example/v1"
 	f.model = "test-model"
 	f.modelSecretFile = filepath.Join(t.TempDir(), "missing-model.key")
-	f.orchestratorKey = testOrchestratorKeyPath(t)
+	f.requireDelegated = true
 	f.dailyTurnBudget = 10
 
 	var out bytes.Buffer
-	if _, _, err := buildServer(&out, f); err == nil {
+	_, _, err := buildServer(&out, f)
+	if err == nil {
 		t.Fatal("model-backed non-dev server with missing model key should fail before listening")
+	}
+	if !strings.Contains(err.Error(), "model") {
+		t.Fatalf("error = %v, want the missing model-secret refusal rather than some earlier check", err)
 	}
 
 	f.modelSecretFile = testModelSecretPath(t)
@@ -450,29 +449,57 @@ func TestBuildServer_NonDevRequiresContainment(t *testing.T) {
 	}
 }
 
-func TestBuildServer_NonDevValidatesOrchestratorKey(t *testing.T) {
+func TestBuildServer_DevValidatesOrchestratorKey(t *testing.T) {
 	t.Parallel()
 	f := devServeFlags()
-	f.dev = false
-	f.requireContainment = true
 	f.concurrency = 1
 	f.codes = []string{"good"}
 	f.orchestratorKey = filepath.Join(t.TempDir(), "missing.key")
 	var out bytes.Buffer
 	if _, _, err := buildServer(&out, f); err == nil {
-		t.Fatal("non-dev server with missing orchestrator key should fail before listening")
+		t.Fatal("dev server with missing orchestrator key should fail before listening")
 	}
 }
 
-func TestValidateServeSafety_NonDevRequiresOrchestratorKey(t *testing.T) {
+// A public guest must never hold the durable signing root, and must never be
+// able to opt out of demanding a broker-minted delegation. Both are the
+// pre-rotation shape that put the root on visitor VMs.
+func TestValidateServeSafety_PublicRefusesGuestHeldRoot(t *testing.T) {
 	t.Parallel()
-	f := serveFlags{requireContainment: true, concurrency: 1}
-	if err := validateServeSafety(&f, false); err == nil {
-		t.Fatal("non-dev server without orchestrator key should fail closed")
+	for _, tc := range []struct {
+		name string
+		f    serveFlags
+		want string
+	}{
+		{
+			name: "delegation_opt_out",
+			f:    serveFlags{requireContainment: true, concurrency: 1},
+			want: "--require-delegated-signing",
+		},
+		{
+			name: "durable_key_on_guest",
+			f:    serveFlags{requireContainment: true, concurrency: 1, requireDelegated: true, orchestratorKey: "/run/playground/orchestrator.key"},
+			want: "--orchestrator-key is refused outside --dev",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateServeSafety(&tc.f, false)
+			if err == nil {
+				t.Fatal("public serve must fail closed")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
 	}
-	f.orchestratorKey = filepath.Join(t.TempDir(), "demo-signing.key")
+}
+
+func TestValidateServeSafety_NonDevAllowsBrokerMintedSessionKey(t *testing.T) {
+	t.Parallel()
+	f := serveFlags{requireContainment: true, concurrency: 1, requireDelegated: true}
 	if err := validateServeSafety(&f, false); err != nil {
-		t.Fatalf("non-dev server with orchestrator key rejected: %v", err)
+		t.Fatalf("non-dev server without boot-time orchestrator key rejected: %v", err)
 	}
 }
 

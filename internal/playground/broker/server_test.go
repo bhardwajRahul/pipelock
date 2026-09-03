@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
 const (
@@ -409,6 +411,51 @@ func TestNewServerValidationDefaultsAndClose(t *testing.T) {
 	if _, err := NewServer(ServerConfig{Leases: lm, Gate: gate, PerIPDailyBudget: -1}); err == nil {
 		t.Fatal("negative daily budget should error")
 	}
+	if _, err := NewServer(ServerConfig{
+		Leases:     lm,
+		Gate:       gate,
+		SessionEnv: map[string]string{"PLAYGROUND_ORCHESTRATOR_" + "KEY": "durable-root"},
+	}); err == nil {
+		t.Fatal("SessionEnv carrying the durable orchestrator key should error")
+	}
+	leaseWithRoot, err := NewLeaseManager(LeaseConfig{
+		Provider:    &serverFakeProvider{},
+		Concurrency: livechat.NewConcurrencyLimiter(brokerTestCapacity),
+		Image:       brokerTestImage,
+		BaseEnv:     map[string]string{"PLAYGROUND_ORCHESTRATOR_" + "KEY": "durable-root"},
+	})
+	if err != nil {
+		t.Fatalf("NewLeaseManager with durable base environment: %v", err)
+	}
+	if _, err := NewServer(ServerConfig{Leases: leaseWithRoot, Gate: gate}); err == nil {
+		t.Fatal("LeaseConfig.BaseEnv carrying the durable orchestrator key should error")
+	} else if !strings.Contains(err.Error(), "LeaseConfig.BaseEnv") {
+		t.Fatalf("error = %v, want the BaseEnv source named", err)
+	}
+	if _, err := NewServer(ServerConfig{
+		Leases:           lm,
+		Gate:             gate,
+		OrchestratorRoot: ed25519.PrivateKey("short"),
+	}); err == nil {
+		t.Fatal("invalid OrchestratorRoot should error")
+	}
+	_, root, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServer(ServerConfig{Leases: lm, Gate: gate, OrchestratorRoot: root}); err == nil {
+		t.Fatal("OrchestratorRoot without ImageDigest should error")
+	}
+	delegated, err := NewServer(ServerConfig{
+		Leases:           lm,
+		Gate:             gate,
+		OrchestratorRoot: root,
+		ImageDigest:      "sha256:" + strings.Repeat("ab", 32),
+	})
+	if err != nil {
+		t.Fatalf("valid delegated root config rejected: %v", err)
+	}
+	delegated.Close()
 
 	customClient := &http.Client{}
 	srv, err := NewServer(ServerConfig{Leases: lm, Gate: gate, HTTPClient: customClient})
@@ -857,6 +904,22 @@ func TestServer_EndToEndProxyAndRelease(t *testing.T) {
 	_ = unknown.Body.Close()
 	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown token status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestNewServerOwnsSessionEnv(t *testing.T) {
+	vm := newFakeVM(t, "vm-owned-session-env")
+	provider := &serverFakeProvider{targets: []string{vm.targetHost(t)}}
+	sessionEnv := map[string]string{"PLAYGROUND_MODEL_" + "KEY": "model-test-key"}
+	_, ts := newBrokerTestServer(t, provider, ServerConfig{SessionEnv: sessionEnv})
+	sessionEnv["PLAYGROUND_ORCHESTRATOR_"+"KEY"] = "durable-root"
+
+	if status, _ := postBrokerSession(t, ts); status != http.StatusOK {
+		t.Fatalf("session status = %d, want 200", status)
+	}
+	env := provider.createdEnv(0)
+	if _, found := env["PLAYGROUND_ORCHESTRATOR_"+"KEY"]; found {
+		t.Fatal("lease inherited a SessionEnv mutation made after server construction")
 	}
 }
 

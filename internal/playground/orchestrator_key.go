@@ -26,12 +26,15 @@ import (
 // meaningful: a VERIFY OK means "signed by the key you already trust", not
 // "internally consistent with a key the download handed you".
 //
-// It is a FIXED demo identity with no security stakes — the demo proves the
-// Pipelock mechanism; the key only needs to be stable and published. It is
-// generated once and never rotated, and is deliberately NOT any production
-// signing key (not the license signer, not a customer key). Empty until the
-// stable keypair is generated and published (see `keygen-orchestrator`).
-const PublishedOrchestratorPubKeyHex = "539bda06995b228e55af68c05c41cee14b060041ff4d0c13fcf13544e922abcb"
+// It is a demo identity with no production security stakes — the demo proves
+// the Pipelock mechanism; the key only needs to be published so an offline
+// verifier can look it up ahead of time. It is deliberately NOT any production
+// signing key (not the license signer, not a customer key).
+//
+// Rotated 2026-09-03 after the previous private half was exposed in a
+// machine-inventory dump. Bundles signed by the prior identity
+// (539bda06…e922abcb) no longer verify against this key.
+const PublishedOrchestratorPubKeyHex = "99f16ec99b3f55180f75a025affa6a9cced3e559a38590fa6cac48a736221a2c"
 
 // orchestratorKeyConfigDir/File locate the stable orchestrator PRIVATE key on
 // disk. The private key is never committed (the demo key has no security stakes
@@ -93,6 +96,21 @@ func LoadOrchestratorSigningKey(path string) (ed25519.PrivateKey, error) {
 		return nil, fmt.Errorf("orchestrator key: %w", err)
 	}
 	return priv, nil
+}
+
+// PublishedOrchestratorPublicKey decodes the compiled published demo public
+// key. Every delegation is verified against this value rather than against a
+// root supplied by whoever sent the delegation, because a caller-chosen root
+// would let a caller authorize its own session key.
+func PublishedOrchestratorPublicKey() (ed25519.PublicKey, error) {
+	raw, err := hex.DecodeString(PublishedOrchestratorPubKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("published orchestrator key is not hex: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("published orchestrator key has wrong size: got %d bytes, want %d", len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
 }
 
 // OrchestratorKeyMatchesPublished reports whether priv derives the compiled

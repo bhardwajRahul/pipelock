@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/playground"
 	"github.com/luckyPipewrench/pipelock/internal/playground/broker"
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
 )
@@ -68,8 +70,18 @@ const (
 	cfAccessKeysTTL          = 5 * time.Minute
 	cfAccessNegativeCacheTTL = 30 * time.Second
 
-	envModelKey        = "PLAYGROUND_MODEL_" + "KEY"
+	envModelKey = "PLAYGROUND_MODEL_" + "KEY"
+	// envOrchestratorKey is the name a visitor VM reads for a durable signing
+	// key. The broker must never hold its root under this name: broker and
+	// guests are one Fly app and share app-level secrets, so a root stored
+	// here is delivered to every visitor VM. That sharing is what put the
+	// durable key on the guests before 2026-09-03. It survives only as the
+	// name checked when refusing to leak a root through SessionEnv.
 	envOrchestratorKey = "PLAYGROUND_ORCHESTRATOR_" + "KEY"
+	// envOrchestratorRoot is the broker-only name for the durable signing
+	// root. The guest entrypoint does not read it and refuses to boot if the
+	// guest-facing name is present at all.
+	envOrchestratorRoot = "PLAYGROUND_ORCHESTRATOR_" + "ROOT"
 
 	// warmPoolVMCodeBytes mirrors broker.vmInviteCodeBytes for warm-pool VM
 	// code generation. Kept in sync with the broker constant.
@@ -145,6 +157,7 @@ type serveFlags struct {
 	modelKeyEnv               string
 	orchestratorKeyFile       string
 	orchestratorKeyEnv        string
+	vmImageDigest             string
 	requireSessionSecrets     bool
 	warmPoolSize              int
 	// VM model/session config, passed into each per-visitor VM via PLAYGROUND_*
@@ -244,8 +257,9 @@ func newServeCmd() *cobra.Command {
 	fl.BoolVar(&f.trustForwardedFor, "trust-forwarded-for", false, "read client IP from X-Forwarded-For behind a trusted proxy")
 	fl.StringVar(&f.modelKeyFile, "model-key-file", "", "path to the model key file passed to the VM env")
 	fl.StringVar(&f.modelKeyEnv, "model-key-env", "", "environment variable holding the model key passed to the VM env")
-	fl.StringVar(&f.orchestratorKeyFile, "orchestrator-key-file", "", "path to the orchestrator key file passed to the VM env")
-	fl.StringVar(&f.orchestratorKeyEnv, "orchestrator-key-env", "", "environment variable holding the orchestrator key passed to the VM env")
+	fl.StringVar(&f.orchestratorKeyFile, "orchestrator-key-file", "", "path to the broker-held orchestrator root key; never copied into visitor VMs")
+	fl.StringVar(&f.orchestratorKeyEnv, "orchestrator-key-env", "", "environment variable holding the broker-held orchestrator root key (default "+envOrchestratorRoot+"); never copied into visitor VMs")
+	fl.StringVar(&f.vmImageDigest, "vm-image-digest", "", "immutable sha256 digest of the visitor VM image bound into session delegations")
 	fl.BoolVar(&f.requireSessionSecrets, "require-session-secrets", true, "require model and orchestrator keys from file/env")
 	fl.StringVar(&f.vmModelBaseURL, "vm-model-base-url", "", "model API base URL passed to each VM (enables the model-backed agent)")
 	fl.StringVar(&f.vmModel, "vm-model", "", "model name passed to each VM")
@@ -276,6 +290,12 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 			return err
 		}
 		if _, err := newCFAccessVerifier(f); err != nil {
+			return err
+		}
+		if _, err := resolveImageDigest(f); err != nil {
+			return err
+		}
+		if err := refuseGuestFacingRootSecret(); err != nil {
 			return err
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "broker flags, access gates, public hosts, access policy, and static UI valid; secrets and provider not contacted")
@@ -332,6 +352,12 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 }
 
 func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Server, http.Handler, func(context.Context), *broker.Pool, error) {
+	// Refuse before resolving any secret or contacting a provider: a broker
+	// holding the guest-facing signing variable would hand the durable root to
+	// every visitor VM through shared app secrets.
+	if err := refuseGuestFacingRootSecret(); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	if err := validateFlags(f); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -365,6 +391,14 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	providerHealth := broker.NewProviderHealth(nil, out)
 	provider = broker.NewHealthTrackingProvider(provider, providerHealth)
 	sessionEnv, err := resolveSessionEnv(f)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	rootKey, err := resolveOrchestratorRoot(f)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	imageDigest, err := resolveImageDigest(f)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -435,6 +469,8 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		PerCodeDailyBudget: f.perCodeDailyBudget,
 		GlobalDailyBudget:  f.globalDailyBudget,
 		SessionEnv:         sessionEnv,
+		OrchestratorRoot:   rootKey,
+		ImageDigest:        imageDigest,
 		InternalPort:       f.internalPort,
 		DeadlineGrace:      f.deadlineGrace,
 		TrustForwardedFor:  f.trustForwardedFor,
@@ -1684,9 +1720,10 @@ func resolveBrokerCodes(f *serveFlags) ([]livechat.CodeSpec, string, error) {
 // buildVMBaseEnv assembles the PLAYGROUND_* environment shared by every
 // per-visitor VM. The deploy entrypoint (deploy/fly-playground/entrypoint.sh)
 // consumes these env vars into `serve` flags — keep the names in sync with it.
-// The per-session invite code (PLAYGROUND_CODE) and the secrets
-// (PLAYGROUND_MODEL_KEY / PLAYGROUND_ORCHESTRATOR_KEY) are layered in elsewhere
-// (broker sessionEnv / resolveSessionEnv), not here.
+// The per-session invite code (PLAYGROUND_CODE) and the model key
+// (PLAYGROUND_MODEL_KEY) are layered in elsewhere (broker sessionEnv /
+// resolveSessionEnv), not here. The durable orchestrator root stays on the
+// broker and is never copied into visitor VM env.
 func buildVMBaseEnv(f *serveFlags) map[string]string {
 	env := map[string]string{
 		"PLAYGROUND_LISTEN": fmt.Sprintf("0.0.0.0:%d", f.internalPort),
@@ -1766,18 +1803,102 @@ func resolveSessionEnv(f *serveFlags) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	orchestrator, err := resolveSessionSecret(f.orchestratorKeyFile, f.orchestratorKeyEnv, "--orchestrator-key-file", envOrchestratorKey, f.requireSessionSecrets)
-	if err != nil {
-		return nil, err
-	}
 	env := make(map[string]string)
 	if model != "" {
 		env[envModelKey] = model
 	}
-	if orchestrator != "" {
-		env[envOrchestratorKey] = orchestrator
-	}
 	return env, nil
+}
+
+// refuseGuestFacingRootSecret fails closed while the guest-facing signing-key
+// variable is set in the broker own environment. Broker and visitor VMs are
+// one Fly app and share app-level secrets, so a value under that name reaches
+// every guest and turns delegation off with no other signal. Refusing here
+// makes that deployment state impossible to hold silently.
+func refuseGuestFacingRootSecret() error {
+	if strings.TrimSpace(os.Getenv(envOrchestratorKey)) == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is set in the broker environment; visitor VMs share app secrets and would receive the durable signing root. Clear that secret and store the root under %s instead",
+		envOrchestratorKey, envOrchestratorRoot)
+}
+
+func resolveOrchestratorRoot(f *serveFlags) (ed25519.PrivateKey, error) {
+	raw, err := resolveSessionSecret(f.orchestratorKeyFile, f.orchestratorKeyEnv, "--orchestrator-key-file", envOrchestratorRoot, f.requireSessionSecrets)
+	if err != nil {
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	priv, err := playground.ParseOrchestratorPrivateKeyHex(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Every shipped verifier, the browser verifier, and the downloadable kits
+	// all pin the published identity. A broker signing under any other root
+	// produces bundles that fail offline verification for every visitor, which
+	// is a silent break that only shows up after someone downloads a kit.
+	if !playground.OrchestratorKeyMatchesPublished(priv) {
+		return nil, fmt.Errorf("%s does not derive the published orchestrator identity; bundles signed by it would fail every shipped verifier", envOrchestratorRoot)
+	}
+	return priv, nil
+}
+
+// imageRefDigest returns the digest a reference is pinned to, or empty when the
+// reference names a mutable tag.
+func imageRefDigest(image string) string {
+	idx := strings.LastIndex(image, "@sha256:")
+	if idx < 0 {
+		return ""
+	}
+	return "sha256:" + image[idx+len("@sha256:"):]
+}
+
+func validateCanonicalDigest(digest string) error {
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
+		return fmt.Errorf("image digest %q is not a canonical sha256 digest", digest)
+	}
+	for _, c := range digest[len("sha256:"):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("image digest %q is not a canonical sha256 digest", digest)
+		}
+	}
+	return nil
+}
+
+// resolveImageDigest returns the immutable image each session delegation binds.
+// The delegation attests which image ran, so the digest has to describe the
+// image the broker actually launches. A mutable --image tag beside an unrelated
+// --vm-image-digest would attest one image while launching another, so both are
+// refused rather than reconciled.
+func resolveImageDigest(f *serveFlags) (string, error) {
+	digest := strings.TrimSpace(f.vmImageDigest)
+	refDigest := imageRefDigest(f.image)
+	if digest == "" {
+		digest = refDigest
+	}
+	if digest == "" {
+		if f.requireSessionSecrets {
+			return "", errors.New("--vm-image-digest is required so session delegations bind an immutable image")
+		}
+		return "", nil
+	}
+	if err := validateCanonicalDigest(digest); err != nil {
+		return "", err
+	}
+	// Outside dev the launched reference must be pinned to exactly the digest
+	// the delegation attests.
+	if f.requireSessionSecrets {
+		if refDigest == "" {
+			return "", fmt.Errorf("--image %q must be pinned by digest so the delegated image is the image that launches", f.image)
+		}
+		if refDigest != digest {
+			return "", fmt.Errorf("--image is pinned to %s but --vm-image-digest is %s; a delegation would attest an image that never launched", refDigest, digest)
+		}
+	}
+	return digest, nil
 }
 
 func resolveSessionSecret(file, envName, flagName, defaultEnv string, required bool) (string, error) {
