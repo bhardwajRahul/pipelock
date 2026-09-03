@@ -75,39 +75,62 @@ func TestScanner_Close_BlocksUntilDrain(t *testing.T) {
 	cfg.Internal = nil
 	sc := scanner.MustNew(cfg)
 
-	release, ok := sc.BeginUse()
+	// Two in-flight users, so the drain can be exercised in two steps. Releasing
+	// one is a real drain event that a correct Close must observe and keep
+	// waiting through; a single user cannot distinguish "still draining" from
+	// "never drained".
+	releaseFirst, ok := sc.BeginUse()
 	if !ok {
 		t.Fatal("BeginUse on fresh scanner returned ok=false")
 	}
+	releaseSecond, ok := sc.BeginUse()
+	if !ok {
+		t.Fatal("second BeginUse on fresh scanner returned ok=false")
+	}
 
-	// Start Close in a goroutine. It must block on the in-flight user.
 	closeReturned := make(chan struct{})
 	go func() {
 		sc.Close()
 		close(closeReturned)
 	}()
 
-	// Allow the goroutine to publish closed=true and start the drain.
+	// Wait for closed=true rather than sleeping: under load a fixed window
+	// expires before the goroutine is scheduled, which fails the test for a
+	// scheduling artifact. The timeout is a hang backstop, not the assertion.
+	//
+	// This is also what makes the two negative checks below sound rather than
+	// timing guesses. Close publishes closed=true BEFORE it starts draining, so
+	// once publication is observable, a Close that does not drain has already
+	// reached its return path. Waiting on publication therefore gives a broken
+	// implementation its full opportunity to return early.
+	testwait.For(t, 5*time.Second, sc.Closed, "Close goroutine did not publish closed=true")
+
+	if release3, ok3 := sc.BeginUse(); ok3 {
+		t.Error("BeginUse succeeded while Close was draining")
+		release3()
+	}
+
 	select {
 	case <-closeReturned:
-		t.Fatal("Close returned before in-flight release was invoked")
-	case <-time.After(50 * time.Millisecond):
+		t.Fatal("Close returned with two users still in flight")
+	default:
 	}
 
-	// Once closed=true is published, BeginUse must reject newcomers.
-	if !sc.Closed() {
-		t.Fatal("Close goroutine did not publish closed=true within 50ms")
-	}
-	if release2, ok2 := sc.BeginUse(); ok2 {
-		t.Error("BeginUse succeeded while Close was draining")
-		release2()
+	// Partial drain: the in-flight count drops but does not reach zero, so Close
+	// must still be blocked. This catches a Close that waits for the first
+	// release rather than for all of them.
+	releaseFirst()
+	select {
+	case <-closeReturned:
+		t.Fatal("Close returned after a partial drain, with one user still in flight")
+	default:
 	}
 
-	release()
+	releaseSecond()
 	select {
 	case <-closeReturned:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return after in-flight release was invoked")
+		t.Fatal("Close did not return after the final in-flight release")
 	}
 }
 

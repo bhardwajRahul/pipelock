@@ -57,7 +57,7 @@ make test           # Run the OSS race suite as sequential CI-shaped shards
 make test-cover     # Write coverage.html
 make lint           # go vet + golangci-lint v2 + gofumpt check
 make bench          # Scanner and MCP benchmarks
-make fmt            # gofumpt -w .
+make fmt            # gofumpt via the pinned golangci-lint formatter
 make vet            # Static analysis
 make tidy-check     # Verify go.mod/go.sum
 make docker         # Docker image
@@ -174,7 +174,7 @@ net.ListenConfig{}.Listen(ctx, ...)   // free port binding
 | gosec | G304 | `filepath.Clean(path)`; validate containment across trust boundaries |
 | noctx | bare listener | `net.ListenConfig{}.Listen(ctx, ...)` |
 | unparam | unused param | `_` prefix |
-| gofumpt | formatting | `gofumpt -w <file>` |
+| gofumpt | formatting | `make fmt` (uses the pinned formatter) |
 
 ## Non-Obvious Task Traps
 
