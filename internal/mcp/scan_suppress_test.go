@@ -6,11 +6,18 @@ package mcp
 import (
 	"bytes"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
 )
 
 // nonCoreResponseFinding trips the configurable New Instructions response
@@ -91,6 +98,115 @@ func TestScanResponseOpts_PerServerSuppression(t *testing.T) {
 				t.Fatalf("clean=%v want %v (matches=%v)", v.Clean, tc.wantClean, v.Matches)
 			}
 		})
+	}
+}
+
+func TestMCPStdioSuppressedResponseRecordsDroppedDLP(t *testing.T) {
+	sc := testScanner(t)
+	line := suppressResponse(6)
+	base := ScanResponse(line, sc)
+	if base.Clean {
+		t.Fatal("baseline response must block before suppression")
+	}
+
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New("json", "file", auditPath, false, true)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	m := metrics.New()
+	opts := MCPProxyOpts{
+		ServerName:  "code-assistant",
+		AuditLogger: logger,
+		Metrics:     m,
+		Suppress: []config.SuppressEntry{{
+			Rule: base.Matches[0].PatternName,
+			Path: "mcp://code-assistant/response",
+		}},
+	}.responseScanOptions()
+
+	if verdict := ScanResponseOpts(line, sc, opts); !verdict.Clean {
+		t.Fatalf("suppressed response verdict changed: %+v", verdict)
+	}
+	logger.Close()
+
+	metricOut := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(metricOut, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	assertMCPMetricSampleValue(t, metricOut.Body.String(), `pipelock_response_suppressed_matches_total{pattern="New Instructions",reason="suppressed",surface="mcp_stdio"} `, 1)
+	auditData, err := os.ReadFile(filepath.Clean(auditPath))
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if !strings.Contains(string(auditData), `"event":"response_scan_suppressed"`) || !strings.Contains(string(auditData), `"scanner":"response_scan"`) || !strings.Contains(string(auditData), `"pattern":"New Instructions"`) || !strings.Contains(string(auditData), `"surface":"mcp_stdio"`) || !strings.Contains(string(auditData), `"reason":"suppressed"`) {
+		t.Fatalf("suppressed response audit record missing: %s", auditData)
+	}
+	if strings.Contains(string(auditData), `"event":"dlp_warn"`) {
+		t.Fatalf("response suppression was misclassified as DLP: %s", auditData)
+	}
+}
+
+func assertMCPMetricSampleValue(t *testing.T, body, prefix string, want float64) {
+	t.Helper()
+	for line := range strings.SplitSeq(body, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		got, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix), 64)
+		if err != nil {
+			t.Fatalf("parse metric sample %q: %v", line, err)
+		}
+		if got != want {
+			t.Fatalf("metric sample %q = %v, want %v", prefix, got, want)
+		}
+		return
+	}
+	t.Fatalf("metric sample %q missing from:\n%s", prefix, body)
+}
+
+func TestMCPStdioLowConfidenceInboundDLPRecordsDropped(t *testing.T) {
+	sc := testScanner(t)
+	lowConfidenceAWS := strings.Join([]string{
+		"AIDA", "in", "product", "name", "generated", "by", "random",
+		"OCR", "context", "for", "assistant", "safety", "review",
+	}, " ")
+	line := []byte(makeResponse(7, lowConfidenceAWS))
+
+	if verdict := ScanResponseOpts(line, sc, MCPProxyOpts{ServerName: "code-assistant"}.responseScanOptions()); !verdict.Clean {
+		t.Fatalf("unobserved low-confidence verdict = %+v, want clean", verdict)
+	}
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New("json", "file", auditPath, false, true)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	m := metrics.New()
+	opts := MCPProxyOpts{ServerName: "code-assistant", AuditLogger: logger, Metrics: m}.responseScanOptions()
+	if verdict := ScanResponseOpts(line, sc, opts); !verdict.Clean {
+		t.Fatalf("observed low-confidence verdict = %+v, want clean", verdict)
+	}
+	logger.Close()
+
+	metricOut := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(metricOut, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	assertMCPMetricSampleValue(t, metricOut.Body.String(), `pipelock_dlp_dropped_matches_total{pattern="AWS Access ID",reason="low_confidence",surface="mcp_stdio"} `, 1)
+	auditData, err := os.ReadFile(filepath.Clean(auditPath))
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if !strings.Contains(string(auditData), `"pattern":"AWS Access ID"`) || !strings.Contains(string(auditData), `"transport":"mcp_stdio"`) || !strings.Contains(string(auditData), `"reason":"low_confidence"`) {
+		t.Fatalf("dropped DLP audit record missing: %s", auditData)
+	}
+}
+
+func TestMCPStdioLowConfidenceInboundDLPNilObservabilityKeepsVerdict(t *testing.T) {
+	sc := testScanner(t)
+	line := []byte(makeResponse(8, strings.Join([]string{
+		"AIDA", "in", "product", "name", "generated", "by", "random",
+		"OCR", "context", "for", "assistant", "safety", "review",
+	}, " ")))
+
+	if verdict := ScanResponseOpts(line, sc, MCPProxyOpts{ServerName: "code-assistant"}.responseScanOptions()); !verdict.Clean {
+		t.Fatalf("nil observability changed low-confidence verdict: %+v", verdict)
 	}
 }
 

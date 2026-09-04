@@ -313,6 +313,69 @@ func TestScanGenericSSEStream_SuppressRuleSkipsFinding(t *testing.T) {
 	}
 }
 
+func TestScanGenericSSEStream_DeduplicatesDroppedDLPAcrossPasses(t *testing.T) {
+	key := "sk-ant-api03-" + strings.Repeat("A", 40)
+	body := "data: " + key + "\n\ndata: clean follow-up\n\n"
+	var dropped []scanner.TextDLPMatch
+	var out bytes.Buffer
+	err := ScanGenericSSEStreamWithOptions(
+		context.Background(),
+		strings.NewReader(body),
+		&out,
+		nil,
+		testA2AScanner(t),
+		enabledSSECfg(),
+		GenericSSEScanOptions{
+			Target:   "/stream",
+			Suppress: []config.SuppressEntry{{Rule: "Anthropic API Key", Path: "/stream", Reason: "test"}},
+			OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+				if reason != "suppressed" {
+					t.Fatalf("drop reason = %q, want suppressed", reason)
+				}
+				dropped = append(dropped, match)
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("suppressed generic SSE DLP finding should pass, got %v", err)
+	}
+	if len(dropped) != 1 {
+		t.Fatalf("dropped callbacks = %d, want 1 logical finding: %+v", len(dropped), dropped)
+	}
+	if out.String() != body {
+		t.Fatalf("forwarded stream = %q, want %q", out.String(), body)
+	}
+}
+
+func TestScanGenericSSEStream_CountsRepeatedDroppedDLPEvents(t *testing.T) {
+	key := "sk-ant-api03-" + strings.Repeat("A", 40)
+	body := "data: " + key + "\n\ndata: " + key + "\n\n"
+	dropped := 0
+	var out bytes.Buffer
+	err := ScanGenericSSEStreamWithOptions(
+		context.Background(), strings.NewReader(body), &out, nil, testA2AScanner(t), enabledSSECfg(),
+		GenericSSEScanOptions{
+			Target:   "/stream",
+			Suppress: []config.SuppressEntry{{Rule: "Anthropic API Key", Path: "/stream", Reason: "test"}},
+			OnDroppedDLP: func(_ scanner.TextDLPMatch, reason string) {
+				if reason != "suppressed" {
+					t.Fatalf("drop reason = %q, want suppressed", reason)
+				}
+				dropped++
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("suppressed generic SSE DLP findings should pass, got %v", err)
+	}
+	if dropped != 2 {
+		t.Fatalf("dropped callbacks = %d, want one per event", dropped)
+	}
+	if out.String() != body {
+		t.Fatalf("forwarded stream = %q, want %q", out.String(), body)
+	}
+}
+
 func TestScanGenericSSEStream_CoreDLPIgnoresInjectedSuppress(t *testing.T) {
 	body := fmt.Sprintf("data: %s\n\n", fakeAWSKey())
 

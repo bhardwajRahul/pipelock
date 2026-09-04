@@ -57,6 +57,7 @@ type Metrics struct {
 	bodyRedactions     *prometheus.CounterVec
 	headerDLPHits      *prometheus.CounterVec
 	dlpWarnMatches     *prometheus.CounterVec
+	dlpDroppedMatches  *prometheus.CounterVec
 	AddressFindings    *prometheus.CounterVec
 	FileSentryFindings *prometheus.CounterVec
 
@@ -112,6 +113,7 @@ type Metrics struct {
 	shieldOversizeScanHead                  *prometheus.CounterVec
 	shieldLatency                           *prometheus.HistogramVec
 	responseScanExemptTotal                 *prometheus.CounterVec
+	responseSuppressedMatches               *prometheus.CounterVec
 	responseScanExemptOverCapUnscannedTotal *prometheus.CounterVec
 
 	// Capture (capture.go).

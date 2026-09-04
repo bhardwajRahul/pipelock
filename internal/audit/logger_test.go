@@ -3275,43 +3275,44 @@ func TestEmit_SecurityEventsUseWarnSeverity(t *testing.T) {
 
 func TestAuditEmitLookupEventsHaveExplicitSeverity(t *testing.T) {
 	lookupEvents := map[EventType]string{
-		EventStartup:               emit.EventStartup,
-		EventShutdown:              emit.EventShutdown,
-		EventAllowed:               emit.EventAllowed,
-		EventBlocked:               emit.EventBlocked,
-		EventDLPWarn:               emit.EventDLPWarn,
-		EventAuthorityVerification: emit.EventAuthorityVerification,
-		EventError:                 emit.EventError,
-		EventAnomaly:               emit.EventAnomaly,
-		EventResponseScanExempt:    emit.EventResponseScanExempt,
-		EventMediaExposure:         emit.EventMediaExposure,
-		EventResponseScan:          emit.EventResponseScan,
-		EventTaintDecision:         emit.EventTaintDecision,
-		EventTunnelOpen:            emit.EventTunnelOpen,
-		EventTunnelClose:           emit.EventTunnelClose,
-		EventForwardHTTP:           emit.EventForwardHTTP,
-		EventRedirect:              emit.EventRedirect,
-		EventToolRedirect:          emit.EventToolRedirect,
-		EventConfigReload:          emit.EventConfigReload,
-		EventAgentListener:         emit.EventAgentListener,
-		EventWSOpen:                emit.EventWSOpen,
-		EventWSClose:               emit.EventWSClose,
-		EventWSBlocked:             emit.EventWSBlocked,
-		EventWSScan:                emit.EventWSScan,
-		EventSessionAnomaly:        emit.EventSessionAnomaly,
-		EventAdaptiveRecovery:      emit.EventAdaptiveRecovery,
-		EventMCPUnknownTool:        emit.EventMCPUnknownTool,
-		EventSNIMismatch:           emit.EventSNIMismatch,
-		EventKillSwitchDeny:        emit.EventKillSwitchDeny,
-		EventBodyDLP:               emit.EventBodyDLP,
-		EventBodyPromptInjection:   emit.EventBodyPromptInjection,
-		EventAddressProtection:     emit.EventAddressProtection,
-		EventHeaderDLP:             emit.EventHeaderDLP,
-		EventSessionAdmin:          emit.EventSessionAdmin,
-		EventAirlockEnter:          emit.EventAirlockEnter,
-		EventAirlockDeny:           emit.EventAirlockDeny,
-		EventAirlockDeescalate:     emit.EventAirlockDeescalate,
-		EventShieldRewrite:         emit.EventShieldRewrite,
+		EventStartup:                emit.EventStartup,
+		EventShutdown:               emit.EventShutdown,
+		EventAllowed:                emit.EventAllowed,
+		EventBlocked:                emit.EventBlocked,
+		EventDLPWarn:                emit.EventDLPWarn,
+		EventAuthorityVerification:  emit.EventAuthorityVerification,
+		EventError:                  emit.EventError,
+		EventAnomaly:                emit.EventAnomaly,
+		EventResponseScanExempt:     emit.EventResponseScanExempt,
+		EventMediaExposure:          emit.EventMediaExposure,
+		EventResponseScan:           emit.EventResponseScan,
+		EventResponseScanSuppressed: emit.EventResponseScanSuppressed,
+		EventTaintDecision:          emit.EventTaintDecision,
+		EventTunnelOpen:             emit.EventTunnelOpen,
+		EventTunnelClose:            emit.EventTunnelClose,
+		EventForwardHTTP:            emit.EventForwardHTTP,
+		EventRedirect:               emit.EventRedirect,
+		EventToolRedirect:           emit.EventToolRedirect,
+		EventConfigReload:           emit.EventConfigReload,
+		EventAgentListener:          emit.EventAgentListener,
+		EventWSOpen:                 emit.EventWSOpen,
+		EventWSClose:                emit.EventWSClose,
+		EventWSBlocked:              emit.EventWSBlocked,
+		EventWSScan:                 emit.EventWSScan,
+		EventSessionAnomaly:         emit.EventSessionAnomaly,
+		EventAdaptiveRecovery:       emit.EventAdaptiveRecovery,
+		EventMCPUnknownTool:         emit.EventMCPUnknownTool,
+		EventSNIMismatch:            emit.EventSNIMismatch,
+		EventKillSwitchDeny:         emit.EventKillSwitchDeny,
+		EventBodyDLP:                emit.EventBodyDLP,
+		EventBodyPromptInjection:    emit.EventBodyPromptInjection,
+		EventAddressProtection:      emit.EventAddressProtection,
+		EventHeaderDLP:              emit.EventHeaderDLP,
+		EventSessionAdmin:           emit.EventSessionAdmin,
+		EventAirlockEnter:           emit.EventAirlockEnter,
+		EventAirlockDeny:            emit.EventAirlockDeny,
+		EventAirlockDeescalate:      emit.EventAirlockDeescalate,
+		EventShieldRewrite:          emit.EventShieldRewrite,
 	}
 
 	for auditEvent, emitEvent := range lookupEvents {
@@ -3970,6 +3971,38 @@ func TestEmit_LogResponseScan(t *testing.T) {
 	}
 	if ev.Fields["mitre_technique"] != mitreT1059 {
 		t.Errorf("fields[mitre_technique] = %v, want T1059", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogResponseScanSuppressed(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanSuppressed(
+		LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-suppressed", agent: testAgentName},
+		"new-instructions",
+		"forward",
+		"destination policy",
+	)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanSuppressed) {
+		t.Errorf("type = %q, want %q", ev.Type, EventResponseScanSuppressed)
+	}
+	for field, want := range map[string]any{
+		"scanner":         scannerpkg.AuditResponseScan,
+		"mode":            "informational",
+		"pattern":         "new-instructions",
+		"surface":         "forward",
+		"reason":          "destination policy",
+		"mitre_technique": mitreT1059,
+	} {
+		if got := ev.Fields[field]; got != want {
+			t.Errorf("fields[%s] = %v, want %v", field, got, want)
+		}
 	}
 }
 

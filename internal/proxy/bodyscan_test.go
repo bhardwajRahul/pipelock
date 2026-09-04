@@ -2635,6 +2635,103 @@ func TestScanRequestHeadersForTarget_SuppressedValueDoesNotMaskLaterUnsuppressed
 	}
 }
 
+func TestScanBodyTextsForDLP_DeduplicatesDroppedMatches(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	key := fakeAnthropicKey()
+	var dropped []scanner.TextDLPMatch
+	matches := scanBodyTextsForDLP(
+		context.Background(),
+		sc,
+		[]string{key},
+		"https://api.vendor.example/v1/messages",
+		[]config.SuppressEntry{{Rule: "Anthropic API Key", Path: "https://api.vendor.example/*", Reason: "test"}},
+		nil,
+		false,
+		func(match scanner.TextDLPMatch, reason string) {
+			if reason != "suppressed" {
+				t.Fatalf("drop reason = %q, want suppressed", reason)
+			}
+			dropped = append(dropped, match)
+		},
+	)
+	if len(matches) != 0 {
+		t.Fatalf("enforceable matches = %+v, want none", matches)
+	}
+	if len(dropped) != 1 {
+		t.Fatalf("dropped callbacks = %d, want 1 logical finding: %+v", len(dropped), dropped)
+	}
+}
+
+func TestRecordUniqueBodyDLPDrops_PreservesMatchVariants(t *testing.T) {
+	dropped := []droppedBodyDLPMatch{
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: ""}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "base64"}, reason: "suppressed"},
+	}
+	var got []scanner.TextDLPMatch
+	recordUniqueBodyDLPDrops(dropped, func(match scanner.TextDLPMatch, _ string) {
+		got = append(got, match)
+	})
+	if len(got) != 2 {
+		t.Fatalf("dropped callbacks = %d, want raw and encoded variants", len(got))
+	}
+	encoded := map[string]bool{}
+	for _, match := range got {
+		encoded[match.Encoded] = true
+	}
+	if !encoded[""] || !encoded["base64"] {
+		t.Fatalf("encoded variants = %v, want raw and base64", encoded)
+	}
+}
+
+func TestRecordUniqueHeaderDLPDrops_NormalizesJoinedWhitespaceOnly(t *testing.T) {
+	dropped := []droppedBodyDLPMatch{
+		{match: scanner.TextDLPMatch{PatternName: "API Key"}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "whitespace"}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "base64"}, reason: "suppressed"},
+	}
+	var got []scanner.TextDLPMatch
+	recordUniqueHeaderDLPDrops(dropped, func(match scanner.TextDLPMatch, _ string) {
+		got = append(got, match)
+	})
+	if len(got) != 2 || got[0].Encoded != "" || got[1].Encoded != "base64" {
+		t.Fatalf("header variants = %+v, want raw and base64", got)
+	}
+}
+
+func TestScanRequestHeadersForTargetWithDropped_ReportsSuppressedMatch(t *testing.T) {
+	cfg := testScannerConfig()
+	cfg.Suppress = []config.SuppressEntry{{Rule: "Anthropic API Key", Path: "https://api.vendor.example/*", Reason: "test"}}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	headers := http.Header{
+		"Authorization": []string{"Bearer " + fakeAnthropicKey(), "ordinary value"},
+	}
+	var dropped []scanner.TextDLPMatch
+	result := scanRequestHeadersForTargetWithDropped(
+		context.Background(),
+		headers,
+		cfg,
+		sc,
+		"https://api.vendor.example/v1/messages",
+		func(match scanner.TextDLPMatch, reason string) {
+			if reason != "suppressed" {
+				t.Fatalf("drop reason = %q, want suppressed", reason)
+			}
+			dropped = append(dropped, match)
+		},
+	)
+	if result != nil && !result.Clean {
+		t.Fatalf("suppressed header remained enforceable: %+v", result.DLPMatches)
+	}
+	if len(dropped) != 1 {
+		t.Fatalf("dropped callbacks = %d, want 1 logical finding: %+v", len(dropped), dropped)
+	}
+}
+
 func TestScanRequestHeadersForTarget_CoreDLPIgnoresInjectedSuppress(t *testing.T) {
 	cfg := testScannerConfig()
 	cfg.Suppress = []config.SuppressEntry{

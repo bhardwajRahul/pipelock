@@ -1372,6 +1372,12 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			Action:           cfg.RequestBodyScanning.Action,
 			DisablePatterns:  cfg.RequestBodyScanning.DisablePatterns,
 			PatternActions:   cfg.RequestBodyScanning.PatternActions,
+			OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+				if p.logger != nil {
+					p.logger.LogDLPDropped(actx, match.PatternName, match.Severity, "body", reason)
+				}
+				p.metrics.RecordDLPDroppedMatch(match.PatternName, "body", reason)
+			},
 		}
 		applyContentEntropyConfig(&bodyReq, cfg)
 		applySigV4CredentialRouteConfig(&bodyReq, cfg)
@@ -2187,6 +2193,12 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					hasFinding = true
 					p.logger.LogAnomaly(actx, LayerSSEStream, err.Error(), 0)
 				},
+				OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+					if p.logger != nil {
+						p.logger.LogDLPDropped(actx, match.PatternName, match.Severity, "mcp_sse", reason)
+					}
+					p.metrics.RecordDLPDroppedMatch(match.PatternName, "mcp_sse", reason)
+				},
 			},
 		}
 		sseLayer := SSEStreamLayer(sseOpts)
@@ -2681,6 +2693,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		if sc.ResponseScanningEnabled() && !fwdAuthenticatedArtifact {
 			scanResult := sc.ScanResponseBodyWithSuppress(r.Context(), respBody, resp.Request.URL.String(), cfg.Suppress)
 			recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportForward)
+			recordDroppedResponseScanMatches(p.metrics, p.logger, actx, scanResult.SuppressedMatches, TransportForward)
 			if !scanResult.Clean {
 				responsePromptHit = true
 			}

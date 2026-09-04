@@ -5667,6 +5667,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if hidden != "" {
 			rawResult := sc.ScanResponseWithSuppress(r.Context(), hidden, finalResponseURL, cfg.Suppress)
 			recordSuppressedResponseScanExempts(p.metrics, rawResult.SuppressedMatches, TransportFetch)
+			recordDroppedResponseScanMatches(p.metrics, log, actx, rawResult.SuppressedMatches, TransportFetch)
 			// Use live escalation level so mid-request CEE escalations are reflected.
 			// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
 			blocked, _, found := p.filterAndActOnResponseScan(responseScanContext{
@@ -5755,6 +5756,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			scanResult = sc.ScanResponseBodyWithSuppress(r.Context(), []byte(content), finalResponseURL, cfg.Suppress)
 		}
 		recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportFetch)
+		recordDroppedResponseScanMatches(p.metrics, log, actx, scanResult.SuppressedMatches, TransportFetch)
 		if !scanResult.Clean {
 			responsePromptHit = true
 		}
@@ -5871,6 +5873,18 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 func recordSuppressedResponseScanExempts(m *metrics.Metrics, matches []scanner.ResponseMatch, transport string) {
 	for range matches {
 		m.RecordResponseScanExempt(ExemptReasonSuppress, transport)
+	}
+}
+
+// recordDroppedResponseScanMatches records only pattern metadata for findings
+// deliberately suppressed by policy. It is observational: nil dependencies are
+// accepted and the response verdict has already been decided by the caller.
+func recordDroppedResponseScanMatches(m *metrics.Metrics, log *audit.Logger, actx audit.LogContext, matches []scanner.ResponseMatch, surface string) {
+	for _, match := range matches {
+		if log != nil {
+			log.LogResponseScanSuppressed(actx, match.PatternName, surface, "suppressed")
+		}
+		m.RecordResponseSuppressedMatch(match.PatternName, surface, "suppressed")
 	}
 }
 

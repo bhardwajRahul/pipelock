@@ -2071,6 +2071,23 @@ func TestRecordResponseScanExempt_NilSafe(t *testing.T) {
 	m.RecordResponseScanExempt("exempt_domain", "fetch") // must not panic
 }
 
+func TestRecordResponseSuppressedMatch(t *testing.T) {
+	m := New()
+	m.RecordResponseSuppressedMatch("New Instructions", "fetch", "suppressed")
+
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	want := `pipelock_response_suppressed_matches_total{pattern="New Instructions",reason="suppressed",surface="fetch"} 1`
+	if !strings.Contains(w.Body.String(), want+"\n") {
+		t.Fatalf("response suppressed metric missing %q: %s", want, w.Body.String())
+	}
+}
+
+func TestRecordResponseSuppressedMatch_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordResponseSuppressedMatch("New Instructions", "fetch", "suppressed")
+}
+
 func TestRecordResponseScanExemptOverCapUnscanned(t *testing.T) {
 	m := New()
 	m.RecordResponseScanExemptOverCapUnscanned("forward")
@@ -2108,6 +2125,21 @@ func TestRecordDLPWarnMatch(t *testing.T) {
 func TestRecordDLPWarnMatch_NilSafe(t *testing.T) {
 	var m *Metrics
 	m.RecordDLPWarnMatch("warn-url", "fetch") // must not panic
+}
+
+func TestRecordDLPDroppedMatch(t *testing.T) {
+	m := New()
+	m.RecordDLPDroppedMatch("test-pattern", "fetch", "suppressed")
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `pipelock_dlp_dropped_matches_total{pattern="test-pattern",reason="suppressed",surface="fetch"} 1`) {
+		t.Fatalf("dropped-match metric was not exported: %s", body)
+	}
+}
+
+func TestRecordDLPDroppedMatch_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordDLPDroppedMatch("test-pattern", "fetch", "suppressed")
 }
 
 func scrapeMetrics(t *testing.T, m *Metrics) string {
