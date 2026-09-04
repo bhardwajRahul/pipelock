@@ -133,10 +133,14 @@ type LiveRun struct {
 	// Keys
 	orchestratorPub  ed25519.PublicKey
 	orchestratorPriv ed25519.PrivateKey
-	collectorPub     ed25519.PublicKey
-	collectorPriv    ed25519.PrivateKey
-	pipelockPub      ed25519.PublicKey
-	pipelockPriv     ed25519.PrivateKey
+	// delegationRoot is the durable root that authenticated orchestratorPub when
+	// this run uses delegated signing. It is retained so sealing verifies the
+	// delegation against the root rather than against the delegated signer.
+	delegationRoot ed25519.PublicKey
+	collectorPub   ed25519.PublicKey
+	collectorPriv  ed25519.PrivateKey
+	pipelockPub    ed25519.PublicKey
+	pipelockPriv   ed25519.PrivateKey
 
 	// Infrastructure
 	safeTarget   *SafeTarget
@@ -314,13 +318,30 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 		}
 		// Verify at the signing boundary too. A direct caller reaches this
 		// path without passing through the server's check, and an unverified
-		// delegation would sign a run no published key authorized.
-		if delErr := VerifySessionDelegation(opts.SessionPrivateKey, *opts.Delegation, opts.RunNonce); delErr != nil {
+		// delegation would sign a run no published key authorized. Retain the
+		// verified root: the session key signs the manifest, but it must never
+		// be presented as the root that signed the delegation at seal time.
+		resolved, rootErr := trustedDelegationRoot()
+		if rootErr != nil {
+			err = rootErr
+			return nil, err
+		}
+		// Copy and size-check BEFORE verifying, then use only the copy. The
+		// resolver hands back a slice this function does not own, so verifying
+		// the caller's slice and retaining a copy taken afterwards would let the
+		// bytes that were authenticated differ from the bytes kept for sealing
+		// and for the trust root stamped into the downloaded archive.
+		// Size is checked downstream by delegation verification, which owns that
+		// error contract; duplicating it here would only give the same refusal
+		// two different messages.
+		root := append(ed25519.PublicKey(nil), resolved...)
+		if delErr := verifySessionDelegationWithRoot(root, opts.SessionPrivateKey, *opts.Delegation, opts.RunNonce); delErr != nil {
 			err = fmt.Errorf("session delegation: %w", delErr)
 			return nil, err
 		}
 		lr.orchestratorPriv = opts.SessionPrivateKey
 		lr.orchestratorPub = lr.orchestratorPriv.Public().(ed25519.PublicKey)
+		lr.delegationRoot = root
 	case opts.OrchestratorKeyPath != "":
 		var loadErr error
 		lr.orchestratorPriv, loadErr = LoadOrchestratorSigningKey(opts.OrchestratorKeyPath)
@@ -903,7 +924,7 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 	}
 
 	// --- Verify ---
-	rep, err := VerifyRun(runDir, hex.EncodeToString(lr.orchestratorPub))
+	rep, err := VerifyRun(runDir, lr.OrchestratorPubHex())
 	if err != nil {
 		return VerifyReport{}, fmt.Errorf("verify run: %w", err)
 	}
@@ -917,6 +938,9 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 // OrchestratorPubHex returns the run's trust-root (orchestrator) public key as
 // hex -- the key a downloaded session bundle is verified against offline.
 func (lr *LiveRun) OrchestratorPubHex() string {
+	if len(lr.delegationRoot) != 0 {
+		return hex.EncodeToString(lr.delegationRoot)
+	}
 	return hex.EncodeToString(lr.orchestratorPub)
 }
 

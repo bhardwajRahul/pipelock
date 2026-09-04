@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +69,46 @@ func TestStartLiveRun_DelegatedSessionBindsManifest(t *testing.T) {
 	}
 	if lr.manifest.ImageDigest != testRunImageDigest {
 		t.Fatalf("manifest image digest = %q, want %q", lr.manifest.ImageDigest, testRunImageDigest)
+	}
+}
+
+// A delegated run has two identities: its session key signs the manifest, while
+// the root authorizes that session key. Final sealing and a downloaded verifier
+// must receive the latter, or they compare root_key_id against the session key
+// and reject a valid delegation.
+func TestLiveRun_DelegatedSessionReportsDelegationRoot(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "delegated-trust-root"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          nonce,
+		SessionPrivateKey: minted.PrivateKey,
+		Delegation:        &minted.Delegation,
+	})
+	if err != nil {
+		t.Fatalf("StartLiveRun: %v", err)
+	}
+	defer lr.Close()
+
+	if got, want := lr.OrchestratorPubHex(), hex.EncodeToString(root.Public().(ed25519.PublicKey)); got != want {
+		t.Fatalf("OrchestratorPubHex = %q, want delegation root %q", got, want)
+	}
+	if got := lr.OrchestratorPubHex(); got == minted.Delegation.SessionPublicKey {
+		t.Fatal("delegated session key must not be reported as the delegation trust root")
+	}
+
+	sessionPub := minted.PrivateKey.Public().(ed25519.PublicKey)
+	if err := VerifyOrchestratorDelegation(sessionPub, minted.Delegation, DelegationExpectations{RunNonce: nonce, ImageDigest: testRunImageDigest}); err == nil || !strings.Contains(err.Error(), "root_key_id does not match expected root") {
+		t.Fatalf("session signer verification error = %v, want root key id mismatch", err)
+	}
+	if err := VerifyOrchestratorDelegation(root.Public().(ed25519.PublicKey), minted.Delegation, DelegationExpectations{RunNonce: nonce, ImageDigest: testRunImageDigest}); err != nil {
+		t.Fatalf("delegation root verification: %v", err)
 	}
 }
 
@@ -271,5 +312,166 @@ func TestParseOrchestratorPrivateKeyHex_RejectsMalformedShapes(t *testing.T) {
 				t.Fatalf("%q must be refused", tc.name)
 			}
 		})
+	}
+}
+
+// A delegated run cannot be authorized when the trusted root itself is
+// unreadable. Refusing is the only safe direction: continuing would sign a run
+// under a session key nothing verified, which is the state that produced a
+// bundle no visitor could verify.
+func TestStartLiveRun_RefusesWhenTrustedRootUnavailable(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "unreadable-root-nonce"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	previous := trustedDelegationRoot
+	trustedDelegationRoot = func() (ed25519.PublicKey, error) {
+		return nil, errors.New("published root unavailable")
+	}
+	t.Cleanup(func() { trustedDelegationRoot = previous })
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          nonce,
+		SessionPrivateKey: minted.PrivateKey,
+		Delegation:        &minted.Delegation,
+	})
+	if err == nil {
+		lr.Close()
+		t.Fatal("an unreadable trusted root must refuse the run")
+	}
+	if !strings.Contains(err.Error(), "published root unavailable") {
+		t.Fatalf("error = %v, want the trusted-root failure surfaced", err)
+	}
+}
+
+// A resolver returning bytes that are not an Ed25519 public key must fail
+// closed. It is not enough to reject a resolver error: a partial key is just
+// as incapable of authenticating a delegation.
+func TestStartLiveRun_RefusesMalformedTrustedRoot(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "malformed-root-nonce"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	previous := trustedDelegationRoot
+	trustedDelegationRoot = func() (ed25519.PublicKey, error) {
+		return ed25519.PublicKey("short"), nil
+	}
+	t.Cleanup(func() { trustedDelegationRoot = previous })
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          nonce,
+		SessionPrivateKey: minted.PrivateKey,
+		Delegation:        &minted.Delegation,
+	})
+	if err == nil {
+		lr.Close()
+		t.Fatal("a malformed trusted root must refuse the run")
+	}
+	if !strings.Contains(err.Error(), "delegation root public key has wrong size") {
+		t.Fatalf("error = %v, want malformed-root refusal", err)
+	}
+}
+
+// The delegation root is resolved from a caller-owned byte slice. Retaining
+// that slice would let later mutation change the root shown to the offline
+// verifier after the delegation was authenticated.
+func TestLiveRun_DelegationRootIsCopied(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "copied-root-nonce"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          nonce,
+		SessionPrivateKey: minted.PrivateKey,
+		Delegation:        &minted.Delegation,
+	})
+	if err != nil {
+		t.Fatalf("StartLiveRun: %v", err)
+	}
+	defer lr.Close()
+
+	want := hex.EncodeToString(root.Public().(ed25519.PublicKey))
+	resolved, err := trustedDelegationRoot()
+	if err != nil {
+		t.Fatalf("trustedDelegationRoot: %v", err)
+	}
+	resolved[0] ^= 0xff
+
+	if got := lr.OrchestratorPubHex(); got != want {
+		t.Fatalf("OrchestratorPubHex after root mutation = %q, want retained root %q", got, want)
+	}
+}
+
+// VerifySessionDelegation is a package entry point as well as StartLiveRun's
+// internal guard. A malformed direct caller must receive a refusal rather than
+// causing PrivateKey.Public to panic before a delegation can be checked.
+func TestVerifySessionDelegation_RefusesMalformedPrivateKey(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "malformed-session-private-key"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	if err := VerifySessionDelegation(ed25519.PrivateKey("short"), minted.Delegation, nonce); err == nil {
+		t.Fatal("a malformed session private key must be refused")
+	}
+}
+
+// The resolver hands back a slice the run does not own. Verification and the
+// retained root must therefore read the same immutable bytes: if the run kept a
+// copy taken after verification, a resolver that reused or mutated its buffer
+// could authenticate one key and stamp a different one into the sealed archive.
+func TestStartLiveRun_RetainedRootIgnoresResolverMutation(t *testing.T) {
+	root := testRunRoot(t)
+	const nonce = "resolver-mutation-nonce"
+
+	minted, err := MintSessionDelegation(root, nonce, testRunImageDigest, time.Now().UTC(), 0)
+	if err != nil {
+		t.Fatalf("MintSessionDelegation: %v", err)
+	}
+
+	// Hand back one shared, mutable buffer on every call.
+	previous := trustedDelegationRoot
+	shared := append(ed25519.PublicKey(nil), root.Public().(ed25519.PublicKey)...)
+	trustedDelegationRoot = func() (ed25519.PublicKey, error) { return shared, nil }
+	t.Cleanup(func() { trustedDelegationRoot = previous })
+
+	want := hex.EncodeToString(shared)
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          nonce,
+		SessionPrivateKey: minted.PrivateKey,
+		Delegation:        &minted.Delegation,
+	})
+	if err != nil {
+		t.Fatalf("StartLiveRun: %v", err)
+	}
+	defer lr.Close()
+
+	// Corrupt the resolver's buffer after the run started.
+	for i := range shared {
+		shared[i] ^= 0xff
+	}
+
+	if got := lr.OrchestratorPubHex(); got != want {
+		t.Fatalf("retained root = %s, want %s; the run kept the resolver's buffer instead of its own copy", got, want)
 	}
 }
