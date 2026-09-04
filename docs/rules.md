@@ -98,6 +98,15 @@ At startup, pipelock scans the rules directory for installed bundles. Each bundl
 
 Bundle rules cannot override or disable built-in patterns. They are additive only.
 
+### Version-gate outcomes
+
+| Bundle check | Outcome |
+|---|---|
+| The running build version cannot be proven against `min_pipelock` | Warn and load the bundle by default. Set `rules.allow_unversioned_bundle_load: false` to refuse it. |
+| A released running version is below `min_pipelock` | Refuse the bundle. |
+| The bundle format is incompatible | Refuse the bundle. |
+
+During a rolling upgrade, set `allow_unversioned_bundle_load` explicitly on every instance. A binary from before this behavior treats an omitted value as refuse, so an omitted setting reads differently across a mixed fleet and the effective policy hash differs with it.
 ## Configuration
 
 ```yaml

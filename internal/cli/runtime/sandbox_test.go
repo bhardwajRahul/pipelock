@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/sandbox"
 )
@@ -100,6 +102,139 @@ func TestSandboxCmdRejectsStrictBestEffortTogether(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("SandboxCmd strict+best-effort err = %v, want mutual exclusion", err)
+	}
+}
+
+func TestSandboxCmdDryRunRejectsInvalidBestEffortOverride(t *testing.T) {
+	for _, args := range [][]string{
+		{"--dry-run", "--best-effort", "--best-effort-expiry", "1h", "--", "echo", "ok"},
+		{"--dry-run", "--best-effort", "--best-effort-reason", "test", "--best-effort-expiry", "0s", "--", "echo", "ok"},
+	} {
+		cmd := SandboxCmd()
+		cmd.SilenceUsage = true
+		cmd.SetArgs(args)
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("SandboxCmd(%v) succeeded, want invalid best-effort override rejection", args)
+		}
+		if bytes.Contains(out.Bytes(), []byte("CAPABILITIES_OK")) {
+			t.Fatalf("SandboxCmd(%v) reported launchable capabilities: %s", args, out.String())
+		}
+	}
+}
+
+func TestSandboxCmdDryRunValidatesEnvFlags(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "empty key", args: []string{"--env", "=value"}, wantErr: "non-empty variable name"},
+		{name: "dangerous key", args: []string{"--env", "LD_PRELOAD=/tmp/x.so"}, wantErr: "subvert sandbox containment"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := SandboxCmd()
+			cmd.SilenceUsage = true
+			cmd.SetArgs(append(append([]string{"--dry-run"}, tt.args...), "--", "echo", "ok"))
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("SandboxCmd(%v) error = %v, want %q", tt.args, err, tt.wantErr)
+			}
+			if bytes.Contains(out.Bytes(), []byte("CAPABILITIES_OK")) {
+				t.Fatalf("dry-run reported launchable capabilities despite a rejected --env: %s", out.String())
+			}
+		})
+	}
+}
+
+func TestSandboxCmdDryRunAcceptsEnvAndFilesystemPolicy(t *testing.T) {
+	t.Setenv("PIPELOCK_SANDBOX_TEST_INHERIT", "inherited")
+	workspace := t.TempDir()
+	extraRead := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+	cfg := "sandbox:\n  filesystem:\n    allow_read:\n      - " + extraRead + "\n"
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cmd := SandboxCmd()
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{
+		"--dry-run", "--json", "--config", configPath, "--workspace", workspace,
+		"--env", "PIPELOCK_SANDBOX_TEST_INHERIT", "--env", "PIPELOCK_SANDBOX_TEST_UNSET", "--env", "FOO=bar",
+		"--", "echo", "ok",
+	})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	err := cmd.Execute()
+	// The preflight verdict depends on the host's namespace support; what this
+	// test pins is that valid --env forms and a merged filesystem policy reach
+	// the preflight instead of being refused as flag or configuration errors.
+	if err != nil && (strings.Contains(err.Error(), "--env") || strings.Contains(err.Error(), "config")) {
+		t.Fatalf("dry-run refused valid --env or fs policy: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte(`"status"`)) {
+		t.Fatalf("dry-run produced no preflight JSON: %s", out.String())
+	}
+}
+
+func TestSandboxCmdRejectsMixedBestEffortProvenance(t *testing.T) {
+	futureExpiry := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	for _, tt := range []struct {
+		name     string
+		config   string
+		flagArgs []string
+	}{
+		{
+			name:     "command line override with configuration expiry",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--best-effort", "--best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "command line override with configuration reason",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--best-effort", "--best-effort-expiry", "1h"},
+		},
+		{
+			name:     "configuration override with command line reason",
+			config:   "sandbox:\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "configuration override with command line expiry",
+			config:   "sandbox:\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--best-effort-expiry", "1h"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+			if err := os.WriteFile(configPath, []byte(tt.config), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cmd := SandboxCmd()
+			cmd.SilenceUsage = true
+			args := append([]string{"--dry-run", "--config", configPath}, tt.flagArgs...)
+			args = append(args, "--", "echo", "ok")
+			cmd.SetArgs(args)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "command-line") || !strings.Contains(err.Error(), "configuration") {
+				t.Fatalf("SandboxCmd(%v) error = %v, want command-line/configuration refusal", args, err)
+			}
+			if bytes.Contains(out.Bytes(), []byte("CAPABILITIES_OK")) {
+				t.Fatalf("SandboxCmd(%v) reported launchable capabilities: %s", args, out.String())
+			}
+		})
 	}
 }
 

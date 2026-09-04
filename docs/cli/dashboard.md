@@ -81,6 +81,20 @@ umask 077
 openssl rand -hex 32 > /etc/pipelock/dashboard.token
 ```
 
+### Failed authentication audit events
+
+When `--config` supplies `emit` sinks and token or OIDC authentication is
+enabled, each rejected dashboard request emits the warning event
+`dashboard_auth_failed`. Its structured fields are the event timestamp,
+`remote_addr` as the dashboard server received it, `path`, `failure_reason`
+(`missing`, `malformed`, or `mismatch`), and `auth_mode` (`operator_token`,
+`oidc`, or `none` when no credential was presented). The presented credential
+is never included. A count of
+`auth_mode=operator_token` events is the operator-token attack count; OIDC
+failures are attributed separately. Delivery is asynchronous and does not
+delay the authentication response. The dashboard does not apply rate limiting,
+throttling, or lockout to authentication attempts.
+
 ### Authentication modes
 
 The dashboard requires at least one of three authenticators, and each is a

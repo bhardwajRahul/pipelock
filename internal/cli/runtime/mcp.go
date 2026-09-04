@@ -732,6 +732,8 @@ func mcpProxyCmdWithAuditLoggerFactory(newAuditLogger mcpAuditLoggerFactory) *co
 	var sandboxEnabled bool
 	var sandboxStrict bool
 	var sandboxBestEffort bool
+	var sandboxBestEffortReason string
+	var sandboxBestEffortExpiry string
 	var sandboxWorkspace string
 	var captureOutput string
 	var captureEscrowKey string
@@ -825,6 +827,17 @@ Key-free evidence capture:
 			}
 			if adaptiveResetFile != "" && (hasUpstream || hasListen) {
 				return errors.New("--adaptive-reset-file is only supported with local subprocess MCP servers")
+			}
+			// Any sandbox flag is sandbox intent. Checking here, before the
+			// remote-mode branches, means a best-effort flag on --upstream or
+			// --listen is refused instead of silently ignored.
+			sandboxIntent := sandboxEnabled || sandboxStrict || sandboxBestEffort ||
+				cmd.Flags().Changed("sandbox-best-effort-reason") || cmd.Flags().Changed("sandbox-best-effort-expiry")
+			if sandboxIntent && hasListen {
+				return errors.New("--sandbox cannot be used with --listen (cannot sandbox a remote server)")
+			}
+			if sandboxIntent && hasUpstream {
+				return errors.New("--sandbox cannot be used with --upstream (cannot sandbox a remote server)")
 			}
 			if adaptiveResetFile == "" && (adaptiveResetAuthorityPublicKeyFile != "" || adaptiveResetTarget != "") {
 				return errors.New("--adaptive-reset-authority-public-key-file and --adaptive-reset-target require --adaptive-reset-file")
@@ -1603,20 +1616,39 @@ Key-free evidence capture:
 				defer stopDeferAPI()
 
 				mcpStrict := sandboxStrict || cfg.Sandbox.Strict
-				mcpBestEffort := sandboxBestEffort || cfg.Sandbox.BestEffort
-
-				if mcpStrict && mcpBestEffort {
+				if mcpStrict && (sandboxBestEffort || cfg.Sandbox.BestEffort) {
 					return errors.New("--sandbox-strict and --sandbox-best-effort are mutually exclusive")
+				}
+				mcpBestEffort, mcpBestEffortReason, mcpBestEffortExpiry, err := resolveBestEffortOverride(
+					sandboxBestEffort,
+					sandboxBestEffortReason,
+					sandboxBestEffortExpiry,
+					cmd.Flags().Changed("sandbox-best-effort-reason"),
+					cmd.Flags().Changed("sandbox-best-effort-expiry"),
+					cfg.Sandbox.BestEffort,
+					cfg.Sandbox.BestEffortReason,
+					cfg.Sandbox.BestEffortExpiry,
+				)
+				if err != nil {
+					return err
+				}
+				if mcpBestEffort {
+					mcpBestEffortExpiry, err = anchorBestEffortExpiry(mcpBestEffortReason, mcpBestEffortExpiry)
+					if err != nil {
+						return err
+					}
 				}
 
 				launchCfg := sandbox.LaunchConfig{
-					Ctx:             ctx,
-					Command:         serverCmd,
-					Workspace:       workspace,
-					Strict:          mcpStrict,
-					BestEffort:      mcpBestEffort,
-					ExtraEnv:        extraEnv,
-					GateTargetStart: true,
+					Ctx:              ctx,
+					Command:          serverCmd,
+					Workspace:        workspace,
+					Strict:           mcpStrict,
+					BestEffort:       mcpBestEffort,
+					BestEffortReason: mcpBestEffortReason,
+					BestEffortExpiry: mcpBestEffortExpiry,
+					ExtraEnv:         extraEnv,
+					GateTargetStart:  true,
 				}
 				if cfg.Sandbox.FS != nil {
 					p := sandbox.DefaultPolicy(workspace)
@@ -1636,6 +1668,9 @@ Key-free evidence capture:
 					if err := mcp.VerifyBinaryIntegrity(serverCmd, &cfg.MCPBinaryIntegrity, cmd.ErrOrStderr(), workspace); err != nil {
 						return err
 					}
+				}
+				if mcpBestEffort {
+					reportBestEffortAdmission(cmd.ErrOrStderr())
 				}
 
 				closeBridge, bridgeErr := setupMCPSandboxBridge(mcpSandboxBridgeSetupOptions{
@@ -1894,6 +1929,8 @@ Key-free evidence capture:
 	cmd.Flags().BoolVar(&sandboxEnabled, "sandbox", false, "run child in sandbox (Landlock + network namespace on Linux, plus seccomp on linux/amd64)")
 	cmd.Flags().BoolVar(&sandboxStrict, "sandbox-strict", false, "strict sandbox: error on missing layers, private /dev/shm, block clone3 (implies --sandbox)")
 	cmd.Flags().BoolVar(&sandboxBestEffort, "sandbox-best-effort", false, "degrade gracefully when namespace isolation is unavailable (implies --sandbox)")
+	cmd.Flags().StringVar(&sandboxBestEffortReason, "sandbox-best-effort-reason", "", "reason for a command-line best-effort override (must be supplied with --sandbox-best-effort)")
+	cmd.Flags().StringVar(&sandboxBestEffortExpiry, "sandbox-best-effort-expiry", "", "admission-time duration or RFC3339 expiry for a command-line best-effort override; does not stop a running child; later launches require re-authorization")
 	cmd.Flags().StringVar(&sandboxWorkspace, "workspace", "", "sandbox workspace directory (default: current directory)")
 	return cmd
 }

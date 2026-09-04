@@ -29,6 +29,11 @@ type StandaloneLaunchConfig struct {
 	Strict bool
 	// BestEffort permits supported degraded containment.
 	BestEffort bool
+	// BestEffortReason and BestEffortExpiry authorize an advisory network
+	// override at launch admission. Expiry never terminates a running child;
+	// each later launch needs a fresh authorization.
+	BestEffortReason string
+	BestEffortExpiry string
 	// RequireNetNS rejects launches without a network namespace.
 	RequireNetNS bool
 	// ExtraEnv contains additional KEY=VALUE pairs for the child.

@@ -2555,7 +2555,7 @@ rules:
   include_experimental: false     # only load stable rules by default
   allow_degraded: false           # emergency strict-mode degraded startup/reload override
   trust_embedded_keys: true       # trust the compiled official rules keyring
-  allow_unversioned_bundle_load: false  # load min_pipelock bundles on a build with no released version
+  allow_unversioned_bundle_load: true   # warn and load when this build cannot prove its version
   trusted_keys:                   # additional signing keys (beyond embedded keyring)
     - name: "vendor-security"
       public_key: "64-char-hex-encoded-ed25519-public-key"
@@ -2567,7 +2567,7 @@ rules:
 | `min_confidence` | `""` (all) | Skip rules below this confidence level |
 | `include_experimental` | `false` | Include experimental rules from bundles |
 | `allow_degraded` | `false` | Explicit emergency override that lets strict mode start or reload with degraded rule-bundle integrity/coverage after emitting warnings and audit events |
-| `allow_unversioned_bundle_load` | `false` | Lets a build that does not report a released version load bundles that declare a `min_pipelock` requirement. An unstamped source build made directly with `go build` has no released version, so the requirement cannot be checked. The runtime **refuses to load** such a bundle by default; `pipelock rules install` still installs it but prints a warning, since an operator is present there to read it and the runtime remains the enforcement point. Set this to load it unverified at runtime. Bundles that declare no `min_pipelock` are unaffected either way |
+| `allow_unversioned_bundle_load` | `true` | Warn and load a bundle with `min_pipelock` when the running build cannot prove its released version. Set `false` to refuse that bundle until the binary reports a released version. |
 | `trust_embedded_keys` | `true` | Trust the compiled official rules keyring. Set to `false` for private-root-only deployments that trust only `trusted_keys`; unsigned local bundles are rejected in this mode. |
 | `trusted_keys` | `[]` | Additional Ed25519 public keys to trust for signature verification |
 
@@ -2580,7 +2580,9 @@ Process containment for agent commands using Linux kernel primitives. The agent 
 ```yaml
 sandbox:
   enabled: true
-  best_effort: false              # degrade gracefully when namespace isolation unavailable
+  best_effort: false              # temporary advisory network override only
+  best_effort_reason: ""          # required when best_effort is true
+  best_effort_expiry: ""          # admission-time RFC3339 timestamp; command-line flags also accept durations
   strict: false                   # error if any layer unavailable (mutually exclusive with best_effort)
   workspace: /home/user/project   # agent working directory (default: CWD)
   filesystem:                     # optional Landlock overrides (default policy works for most agents)
@@ -2594,7 +2596,9 @@ sandbox:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable sandbox containment |
-| `best_effort` | `false` | Skip namespace isolation when unavailable (e.g. containers). Landlock still applies, and seccomp on `linux/amd64`. |
+| `best_effort` | `false` | Temporary advisory override when a network namespace cannot be created. Requires `best_effort_reason` and `best_effort_expiry`. Direct egress may bypass Pipelock. |
+| `best_effort_reason` | `""` | Operator reason for the advisory network override. Required with `best_effort: true`. |
+| `best_effort_expiry` | `""` | Admission-time RFC3339 expiry for the advisory override. Command-line flags also accept a Go duration such as `30m`, but configuration requires RFC3339 so copied, touched, or rewritten files cannot renew an authorization through filesystem metadata. An expired override refuses that launch; it does not stop a child already running, and every later launch requires re-authorization. Required with `best_effort: true`. |
 | `strict` | `false` | Error if any containment layer is unavailable. Mutually exclusive with `best_effort`. |
 | `workspace` | CWD | Agent working directory (resolved to absolute at startup) |
 | `filesystem.allow_read` | `[]` | Additional read-only filesystem paths |
@@ -2609,7 +2613,7 @@ If `filesystem` is omitted, the default Landlock policy is used (safe for Python
 
 For sandboxed MCP stdio servers on Linux, the bridge enables forward-proxy handling internally even when `forward_proxy.enabled` is false in YAML. This is scoped to the sandbox bridge only and does not expose the normal forward proxy listener.
 
-In `--best-effort` mode (for containers without user-namespace support), the bridge still scans traffic but network enforcement is cooperative: a child process that clears `HTTP_PROXY` / `HTTPS_PROXY` can bypass Pipelock.
+In `--best-effort` mode (for containers without user-namespace support), the bridge still scans traffic but network enforcement is cooperative: a child process that clears `HTTP_PROXY` / `HTTPS_PROXY` can bypass Pipelock. This is an advisory override, not a contained launch: supply all three values from one source—`--best-effort`, `--best-effort-reason`, and `--best-effort-expiry`, or the matching YAML fields. Its expiry bounds launch admission only: an expired override refuses that launch, a running child is not stopped at expiry, and every later launch requires re-authorization. YAML requires an RFC3339 expiry; command-line durations are evaluated at admission and are not stored in configuration.
 
 **Usage:**
 ```bash
@@ -2625,8 +2629,8 @@ pipelock sandbox --config pipelock.yaml -- python agent.py
 # Pass environment variables to sandboxed process
 pipelock sandbox --env API_KEY --env HOME=/app -- node server.js
 
-# Best-effort mode for containers (Landlock, plus seccomp on linux/amd64, no namespace)
-pipelock sandbox --best-effort -- python agent.py
+# Temporary advisory override for containers (Landlock, plus seccomp on linux/amd64, no namespace)
+pipelock sandbox --best-effort --best-effort-reason "container user namespaces disabled" --best-effort-expiry 30m -- python agent.py
 
 # Check sandbox capabilities without launching
 pipelock sandbox --dry-run --json -- python agent.py
@@ -2638,8 +2642,8 @@ pipelock sandbox --dry-run --json -- python agent.py
 |-------------|--------|-------|
 | Bare metal / VM (Linux, amd64) | 3/3 | Full containment: Landlock + seccomp + network namespace |
 | Bare metal / VM (Linux, non-amd64) | 2/3 | Landlock + network namespace. Seccomp reports unavailable; see below. |
-| Containers, amd64 (`--best-effort`) | 2/3 | Landlock + seccomp. Network via HTTP_PROXY + NetworkPolicy. |
-| Containers, non-amd64 (`--best-effort`) | 1/3 | Landlock only. Seccomp reports unavailable; network via HTTP_PROXY + NetworkPolicy. |
+| Containers, amd64 (authorized `--best-effort`) | advisory-override | Landlock + seccomp. Direct egress may bypass Pipelock. |
+| Containers, non-amd64 (authorized `--best-effort`) | advisory-override + partial | Landlock only. Direct egress may bypass Pipelock; seccomp is separately unavailable. |
 | macOS | sandbox-exec | Apple SBPL profiles for filesystem + network restriction |
 
 **Requirements:** Linux 5.13+ (Landlock ABI v1). Unprivileged on bare metal. macOS 13+ for sandbox-exec. Containers may need `--best-effort` if default seccomp blocks `CLONE_NEWUSER`.

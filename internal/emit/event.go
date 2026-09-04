@@ -145,6 +145,9 @@ const (
 	EventShieldRewrite         = "shield_rewrite"
 	EventRuleBundleDegraded    = "rule_bundle_degraded"
 	EventAuthorityVerification = "authority_verification"
+	// EventDashboardAuthFailed records a rejected dashboard authentication
+	// attempt without including the credential itself.
+	EventDashboardAuthFailed = "dashboard_auth_failed"
 )
 
 // instanceIDFallback is the default instance identifier when hostname lookup fails.
@@ -186,11 +189,12 @@ var EventSeverity = map[string]Severity{
 	EventError:           SeverityWarn, // errors are suspicious
 
 	// Warn: security-relevant operational events
-	EventResponseScanExempt: SeverityWarn, // scanning was skipped; operators need visibility
-	EventMediaExposure:      SeverityWarn, // media reached agent; provenance signal for taint system
-	EventTextStego:          SeverityWarn, // suspicious combining-mark density; exposure signal
-	EventLicenseExpiry:      SeverityWarn, // overridden by caller with threshold-specific severity
-	EventRuleBundleDegraded: SeverityWarn, // overridden by caller for startup/reload rejection
+	EventResponseScanExempt:  SeverityWarn, // scanning was skipped; operators need visibility
+	EventMediaExposure:       SeverityWarn, // media reached agent; provenance signal for taint system
+	EventTextStego:           SeverityWarn, // suspicious combining-mark density; exposure signal
+	EventLicenseExpiry:       SeverityWarn, // overridden by caller with threshold-specific severity
+	EventRuleBundleDegraded:  SeverityWarn, // overridden by caller for startup/reload rejection
+	EventDashboardAuthFailed: SeverityWarn,
 
 	// Info: normal operations
 	EventStartup:               SeverityInfo,

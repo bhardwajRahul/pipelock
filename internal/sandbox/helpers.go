@@ -41,10 +41,11 @@ const sandboxReadinessFDEnv = "__PIPELOCK_SANDBOX_READINESS_FD"
 type AppliedLaunchOutcome string
 
 const (
-	LaunchOutcomeFull             AppliedLaunchOutcome = "full"
-	LaunchOutcomePartial          AppliedLaunchOutcome = "partial"
-	LaunchOutcomeAdvisoryOverride AppliedLaunchOutcome = "advisory_override"
-	LaunchOutcomeRefused          AppliedLaunchOutcome = "refused"
+	LaunchOutcomeFull                    AppliedLaunchOutcome = "full"
+	LaunchOutcomePartial                 AppliedLaunchOutcome = "partial"
+	LaunchOutcomeAdvisoryOverride        AppliedLaunchOutcome = "advisory_override"
+	LaunchOutcomeAdvisoryOverridePartial AppliedLaunchOutcome = "advisory_override_partial"
+	LaunchOutcomeRefused                 AppliedLaunchOutcome = "refused"
 )
 
 // IsStrictMode returns true if the child process should enforce strict
@@ -138,6 +139,9 @@ func appliedLaunchOutcome(strict, noNetNS, seccompSupported bool, landlock, secc
 		return LaunchOutcomeRefused, fmt.Errorf("strict mode requires a network namespace")
 	}
 	if noNetNS {
+		if !seccomp.Active {
+			return LaunchOutcomeAdvisoryOverridePartial, nil
+		}
 		return LaunchOutcomeAdvisoryOverride, nil
 	}
 	if !seccomp.Active {
@@ -154,7 +158,41 @@ func reportAppliedLaunchOutcome(w io.Writer, outcome AppliedLaunchOutcome) {
 		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: PARTIAL (Landlock + network namespace applied; seccomp filter unavailable in this build)")
 	case LaunchOutcomeAdvisoryOverride:
 		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (no network namespace; direct egress may bypass Pipelock)")
+	case LaunchOutcomeAdvisoryOverridePartial:
+		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (network) + PARTIAL (seccomp unavailable in this build; direct egress may bypass Pipelock)")
 	}
+}
+
+// validateBestEffortOverride requires a bounded, operator-attributable
+// exception before a launch may fall back from kernel-enforced network
+// isolation to cooperative proxy environment variables.
+func validateBestEffortOverride(reason, expiry string, now time.Time) (time.Time, error) {
+	if strings.TrimSpace(reason) == "" {
+		return time.Time{}, errors.New("best-effort override requires a reason")
+	}
+	if strings.TrimSpace(expiry) == "" {
+		return time.Time{}, errors.New("best-effort override requires an expiry (duration or RFC3339 timestamp)")
+	}
+	if duration, err := time.ParseDuration(expiry); err == nil {
+		if duration <= 0 {
+			return time.Time{}, errors.New("best-effort override has expired")
+		}
+		return now.Add(duration), nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339, expiry)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("best-effort override expiry must be a duration or RFC3339 timestamp: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return time.Time{}, errors.New("best-effort override has expired")
+	}
+	return expiresAt, nil
+}
+
+// ValidateBestEffortOverride validates a best-effort override against the
+// current time. CLI preflight uses this before reporting a launchable posture.
+func ValidateBestEffortOverride(reason, expiry string) (time.Time, error) {
+	return validateBestEffortOverride(reason, expiry, time.Now())
 }
 
 // removeEnvKey removes all entries with the given key from an env slice.

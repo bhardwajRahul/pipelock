@@ -37,7 +37,7 @@ type LoadOptions struct {
 	TrustedKeys          []config.TrustedKey // additional trusted signing keys
 	SkipEmbeddedKeys     bool                // exclude compiled official keyring from trust
 	PipelockVersion      string              // current binary version for min_pipelock check
-	AllowUnversionedLoad bool                // load min_pipelock bundles on a build with no released version
+	AllowUnversionedLoad bool                // load min_pipelock bundles with a warning on an unprovable version
 	AllowStale           bool                // accept expired bundles with warning
 	TierKeyMapping       map[string]string   // tier → expected signing key fingerprint
 	saveFreshnessState   func(string, *FreshnessState) error
@@ -392,10 +392,17 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 	}
 	bundleWarnings := make([]string, 0, 1)
 
-	// Check min_pipelock version requirement.
-	if err := CheckMinPipelock(bundle.MinPipelock, opts.PipelockVersion, opts.AllowUnversionedLoad); err != nil {
-		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassAvailability})
-		return
+	// Check min_pipelock version requirement. An unprovable development version
+	// warns and loads by default, while the strict opt-in and all checked
+	// compatibility failures refuse.
+	if err := CheckMinPipelockVerdict(bundle.MinPipelock, opts.PipelockVersion); err != nil {
+		if !errors.Is(err, ErrUnverifiableVersion) || !opts.AllowUnversionedLoad {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassAvailability})
+			return
+		}
+		bundleWarnings = append(bundleWarnings, fmt.Sprintf(
+			"bundle %q loaded although min_pipelock %q could not be verified: running version %q is not a released version",
+			bundle.Name, bundle.MinPipelock, opts.PipelockVersion))
 	}
 	if warning, err := TestedThroughPipelockWarning(bundle.TestedThroughPipelock, opts.PipelockVersion); err != nil {
 		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassIntegrity})

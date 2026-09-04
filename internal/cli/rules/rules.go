@@ -40,34 +40,46 @@ var (
 
 var discoverRulesConfigPath = cliutil.DiscoverConfigPathStrict
 
-// rulesAllowUnversionedLoad reports whether the operator opted into loading
-// bundles that declare a min_pipelock requirement on a build that cannot prove
-// its version. It mirrors rulesTrustPolicy's config resolution and defaults to
-// false (refuse) when no config is readable, so an unreadable config cannot
-// silently relax the requirement.
+// rulesAllowUnversionedLoad reads the retained compatibility setting for the
+// min-version gate. Unprovable development versions now always load with a
+// warning, so the value no longer changes that outcome.
 func rulesAllowUnversionedLoad(configFile string, stderr io.Writer) bool {
 	cfg, err := loadRulesConfig(configFile, stderr)
-	if err != nil || cfg == nil {
+	if err != nil {
+		// An unreadable configuration cannot prove the operator relaxed the
+		// gate, so the command keeps the strict refusal.
 		return false
+	}
+	if cfg == nil {
+		// No configuration at all means the shipped default applies, exactly
+		// as the runtime loader would apply it.
+		return config.Defaults().Rules.AllowUnversionedBundleLoad
 	}
 	return cfg.Rules.AllowUnversionedBundleLoad
 }
 
-// warnUnverifiableBundleVersion downgrades an unverifiable-version refusal to a
-// warning on operator-driven CLI paths. Refusing here would block install on a
-// locally built binary for any bundle that declares a minimum, and the operator
-// running the command is present to read a warning.
-//
-// The requirement is not dropped: the runtime load path refuses the same
-// bundle. Note what that refusal actually does, because it is not an abort. The
-// refusal is classed as an availability error, which strict startup tolerates,
-// so the process starts WITHOUT that bundle's rules and reports the shortfall
-// through the rule_bundle_degraded audit event, /stats, and the
-// pipelock_rule_bundles_degraded metric. Hot reload is stricter: it rejects a
-// reload whose bundle errors would drop rules that are already live.
+// checkBundleMinVersion applies the same strict-or-warn decision the runtime
+// loader makes: a checked failure refuses, an unprovable running version
+// refuses when the operator kept the strict setting and otherwise warns and
+// continues. Install and update must not stage a bundle the runtime would
+// refuse to load.
+func checkBundleMinVersion(w io.Writer, minPipelock string, allowUnversioned bool) error {
+	err := domrules.CheckMinPipelockVerdict(minPipelock, cliutil.Version)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, domrules.ErrUnverifiableVersion) || !allowUnversioned {
+		return err
+	}
+	warnUnverifiableBundleVersion(w, err)
+	return nil
+}
+
+// warnUnverifiableBundleVersion reports an unchecked development-build gate.
+// The runtime loader makes the same warning and keeps the bundle loaded.
 func warnUnverifiableBundleVersion(w io.Writer, err error) {
 	_, _ = fmt.Fprintf(w, "warning: %v\n", err)
-	_, _ = fmt.Fprintf(w, "warning: the bundle is installed, but this build will refuse to LOAD it at runtime until rules.allow_unversioned_bundle_load is set\n")
+	_, _ = fmt.Fprintf(w, "warning: the bundle remains eligible to load at runtime, but its minimum version was not proven\n")
 }
 
 func warnTestedThroughPipelock(w io.Writer, testedThrough, currentVersion string) error {
@@ -820,11 +832,8 @@ func installLocal(out io.Writer, rulesDir, localPath string, allowUnsigned, allo
 		return fmt.Errorf("local unsigned installs support only format_version 1; format_version %d bundles must be signed and installed from HTTPS", bundle.FormatVersion)
 	}
 
-	if err := domrules.CheckMinPipelock(bundle.MinPipelock, cliutil.Version, allowUnversioned); err != nil {
-		if !errors.Is(err, domrules.ErrUnverifiableVersion) {
-			return err
-		}
-		warnUnverifiableBundleVersion(out, err)
+	if err := checkBundleMinVersion(out, bundle.MinPipelock, allowUnversioned); err != nil {
+		return err
 	}
 	if err := warnTestedThroughPipelock(out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
 		return err
@@ -964,11 +973,8 @@ func installRemote(opts installRemoteOptions) error {
 		return fmt.Errorf("bundle name %q uses reserved prefix %q but signer is not official", bundle.Name, "pipelock-")
 	}
 
-	if err := domrules.CheckMinPipelock(bundle.MinPipelock, cliutil.Version, allowUnversioned); err != nil {
-		if !errors.Is(err, domrules.ErrUnverifiableVersion) {
-			return err
-		}
-		warnUnverifiableBundleVersion(out, err)
+	if err := checkBundleMinVersion(out, bundle.MinPipelock, allowUnversioned); err != nil {
+		return err
 	}
 	if err := warnTestedThroughPipelock(out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
 		return err
@@ -1455,11 +1461,8 @@ func updateBundle(opts updateBundleOpts) error {
 		return fmt.Errorf("update %s: bundle name %q uses reserved prefix %q but signer is not official", opts.Name, bundle.Name, "pipelock-")
 	}
 
-	if err := domrules.CheckMinPipelock(bundle.MinPipelock, cliutil.Version, opts.AllowUnversioned); err != nil {
-		if !errors.Is(err, domrules.ErrUnverifiableVersion) {
-			return err
-		}
-		warnUnverifiableBundleVersion(opts.Out, err)
+	if err := checkBundleMinVersion(opts.Out, bundle.MinPipelock, opts.AllowUnversioned); err != nil {
+		return err
 	}
 	if err := warnTestedThroughPipelock(opts.Out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
 		return err

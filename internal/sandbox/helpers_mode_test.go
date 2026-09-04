@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsStrictMode(t *testing.T) {
@@ -242,6 +243,7 @@ func TestAppliedLaunchOutcome(t *testing.T) {
 		{name: "full", landlock: activeLandlock, seccomp: activeSeccomp, seccompSupported: true, want: LaunchOutcomeFull},
 		{name: "arm64 partial", landlock: activeLandlock, seccomp: inactiveSeccomp, want: LaunchOutcomePartial},
 		{name: "network advisory override", noNetNS: true, landlock: activeLandlock, seccomp: activeSeccomp, seccompSupported: true, want: LaunchOutcomeAdvisoryOverride},
+		{name: "network advisory override and seccomp partial", noNetNS: true, landlock: activeLandlock, seccomp: inactiveSeccomp, want: LaunchOutcomeAdvisoryOverridePartial},
 		{name: "missing landlock refuses", landlock: inactiveLandlock, seccomp: activeSeccomp, seccompSupported: true, want: LaunchOutcomeRefused, wantErr: true},
 		{name: "unexpected seccomp failure refuses", landlock: activeLandlock, seccomp: inactiveSeccomp, seccompSupported: true, want: LaunchOutcomeRefused, wantErr: true},
 		{name: "strict arm64 refuses", strict: true, landlock: activeLandlock, seccomp: inactiveSeccomp, want: LaunchOutcomeRefused, wantErr: true},
@@ -267,6 +269,7 @@ func TestReportAppliedLaunchOutcome(t *testing.T) {
 		{name: "full", outcome: LaunchOutcomeFull, want: []string{"FULL", "Landlock + seccomp + network namespace applied"}},
 		{name: "partial", outcome: LaunchOutcomePartial, want: []string{"PARTIAL", "seccomp filter unavailable in this build"}},
 		{name: "advisory override", outcome: LaunchOutcomeAdvisoryOverride, want: []string{"ADVISORY-OVERRIDE", "direct egress may bypass Pipelock"}},
+		{name: "advisory override and partial", outcome: LaunchOutcomeAdvisoryOverridePartial, want: []string{"ADVISORY-OVERRIDE (network) + PARTIAL", "seccomp unavailable", "direct egress may bypass Pipelock"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
@@ -275,6 +278,34 @@ func TestReportAppliedLaunchOutcome(t *testing.T) {
 				if got := buf.String(); !strings.Contains(got, want) {
 					t.Fatalf("outcome output = %q, want substring %q", got, want)
 				}
+			}
+		})
+	}
+}
+
+func TestValidateBestEffortOverride(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name    string
+		reason  string
+		expires string
+		wantErr string
+	}{
+		{name: "duration", reason: "container user namespaces are disabled", expires: "30m"},
+		{name: "timestamp", reason: "temporary compatibility exception", expires: "2026-09-03T12:30:00Z"},
+		{name: "missing reason", expires: "30m", wantErr: "reason"},
+		{name: "missing expiry", reason: "temporary compatibility exception", wantErr: "expiry"},
+		{name: "expired duration", reason: "temporary compatibility exception", expires: "0s", wantErr: "expired"},
+		{name: "expired timestamp", reason: "temporary compatibility exception", expires: "2026-09-03T11:59:59Z", wantErr: "expired"},
+		{name: "invalid expiry", reason: "temporary compatibility exception", expires: "tomorrow", wantErr: "duration or RFC3339"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateBestEffortOverride(tt.reason, tt.expires, now)
+			if tt.wantErr == "" && err != nil {
+				t.Fatalf("validateBestEffortOverride() error = %v", err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("validateBestEffortOverride() error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}

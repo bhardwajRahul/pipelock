@@ -33,6 +33,8 @@ func SandboxCmd() *cobra.Command {
 	var configFile string
 	var strict bool
 	var bestEffort bool
+	var bestEffortReason string
+	var bestEffortExpiry string
 	var dryRun bool
 	var jsonOutput bool
 	var envVars []string
@@ -57,7 +59,7 @@ instead of kernel-enforced isolation and may be bypassed by direct egress.
 Examples:
   pipelock sandbox -- python agent.py
   pipelock sandbox --workspace /home/user/project -- node server.js
-  pipelock sandbox --best-effort -- python agent.py  # inside containers
+  pipelock sandbox --best-effort --best-effort-reason "container user namespaces disabled" --best-effort-expiry 30m -- python agent.py
   pipelock sandbox --config pipelock.yaml -- bash -c "curl https://example.com"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dashIdx := cmd.ArgsLenAtDash()
@@ -85,21 +87,76 @@ Examples:
 			workspace, _ = filepath.Abs(workspace)
 
 			useStrict := strict || cfg.Sandbox.Strict
-			useBestEffort := bestEffort || cfg.Sandbox.BestEffort
-
-			if useStrict && useBestEffort {
+			if useStrict && (bestEffort || cfg.Sandbox.BestEffort) {
 				return errors.New("--strict and --best-effort are mutually exclusive")
+			}
+			useBestEffort, useBestEffortReason, useBestEffortExpiry, err := resolveBestEffortOverride(
+				bestEffort,
+				bestEffortReason,
+				bestEffortExpiry,
+				cmd.Flags().Changed("best-effort-reason"),
+				cmd.Flags().Changed("best-effort-expiry"),
+				cfg.Sandbox.BestEffort,
+				cfg.Sandbox.BestEffortReason,
+				cfg.Sandbox.BestEffortExpiry,
+			)
+			if err != nil {
+				return err
+			}
+
+			if useBestEffort {
+				useBestEffortExpiry, err = anchorBestEffortExpiry(useBestEffortReason, useBestEffortExpiry)
+				if err != nil {
+					return err
+				}
+			}
+
+			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+
+			// Resolve --env flags: KEY=VALUE passes as-is, bare KEY inherits from parent.
+			var extraEnv []string
+			for _, e := range envVars {
+				key, _, hasValue := strings.Cut(e, "=")
+				if key == "" {
+					return errors.New("--env requires a non-empty variable name")
+				}
+				if sandbox.IsDangerousEnvKey(key) {
+					return fmt.Errorf("--env %s is blocked: this variable can subvert sandbox containment", key)
+				}
+				if hasValue {
+					extraEnv = append(extraEnv, e)
+				} else if val, found := os.LookupEnv(e); found {
+					extraEnv = append(extraEnv, e+"="+val)
+				}
+			}
+
+			// The launch configuration is assembled before the dry-run exit so a
+			// preflight validates the same --env flags and override fields a real
+			// launch would use; only the proxy handler is attached after the
+			// proxy exists.
+			launchCfg := sandbox.StandaloneLaunchConfig{
+				Ctx:              ctx,
+				Command:          command,
+				Workspace:        workspace,
+				Strict:           useStrict,
+				BestEffort:       useBestEffort,
+				BestEffortReason: useBestEffortReason,
+				BestEffortExpiry: useBestEffortExpiry,
+				ExtraEnv:         extraEnv,
+			}
+
+			// Merge custom filesystem policy from config into defaults.
+			if cfg.Sandbox.FS != nil {
+				p := sandbox.DefaultPolicy(workspace)
+				p.AllowReadDirs = append(p.AllowReadDirs, cfg.Sandbox.FS.AllowRead...)
+				p.AllowRWDirs = append(p.AllowRWDirs, cfg.Sandbox.FS.AllowWrite...)
+				launchCfg.Policy = &p
 			}
 
 			// Dry-run: preflight check without launching.
 			if dryRun {
-				result := sandbox.Preflight(workspace, command, nil, useStrict)
-				if cfg.Sandbox.FS != nil {
-					p := sandbox.DefaultPolicy(workspace)
-					p.AllowReadDirs = append(p.AllowReadDirs, cfg.Sandbox.FS.AllowRead...)
-					p.AllowRWDirs = append(p.AllowRWDirs, cfg.Sandbox.FS.AllowWrite...)
-					result = sandbox.Preflight(workspace, command, &p, useStrict)
-				}
+				result := sandbox.Preflight(workspace, command, launchCfg.Policy, useStrict)
 				if jsonOutput {
 					if err := printJSON(cmd.OutOrStdout(), result); err != nil {
 						return err
@@ -140,9 +197,6 @@ Examples:
 				"pipelock: launching sandboxed process %v (workspace=%s, mode=%s)\n",
 				command, workspace, cfg.Mode)
 
-			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
-			defer cancel()
-
 			// ProxyHandler: each connection from the sandboxed agent goes
 			// through pipelock's full scanner pipeline via an HTTP server
 			// that handles both CONNECT tunnels and plain HTTP forwarding.
@@ -159,39 +213,9 @@ Examples:
 				_ = srv.Serve(&singleConnListener{conn: conn})
 			}
 
-			// Resolve --env flags: KEY=VALUE passes as-is, bare KEY inherits from parent.
-			var extraEnv []string
-			for _, e := range envVars {
-				key, _, hasValue := strings.Cut(e, "=")
-				if key == "" {
-					return errors.New("--env requires a non-empty variable name")
-				}
-				if sandbox.IsDangerousEnvKey(key) {
-					return fmt.Errorf("--env %s is blocked: this variable can subvert sandbox containment", key)
-				}
-				if hasValue {
-					extraEnv = append(extraEnv, e)
-				} else if val, found := os.LookupEnv(e); found {
-					extraEnv = append(extraEnv, e+"="+val)
-				}
-			}
-
-			launchCfg := sandbox.StandaloneLaunchConfig{
-				Ctx:          ctx,
-				Command:      command,
-				Workspace:    workspace,
-				Strict:       useStrict,
-				BestEffort:   useBestEffort,
-				ExtraEnv:     extraEnv,
-				ProxyHandler: proxyHandler,
-			}
-
-			// Merge custom filesystem policy from config into defaults.
-			if cfg.Sandbox.FS != nil {
-				p := sandbox.DefaultPolicy(workspace)
-				p.AllowReadDirs = append(p.AllowReadDirs, cfg.Sandbox.FS.AllowRead...)
-				p.AllowRWDirs = append(p.AllowRWDirs, cfg.Sandbox.FS.AllowWrite...)
-				launchCfg.Policy = &p
+			launchCfg.ProxyHandler = proxyHandler
+			if useBestEffort {
+				reportBestEffortAdmission(cmd.ErrOrStderr())
 			}
 
 			return sandbox.LaunchStandalone(launchCfg)
@@ -202,6 +226,8 @@ Examples:
 	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
 	cmd.Flags().BoolVar(&strict, "strict", false, "strict mode: error if any containment layer is unavailable, mount private /dev/shm, block clone3")
 	cmd.Flags().BoolVar(&bestEffort, "best-effort", false, "degrade gracefully when namespace isolation is unavailable (e.g. inside containers)")
+	cmd.Flags().StringVar(&bestEffortReason, "best-effort-reason", "", "reason for a command-line best-effort override (must be supplied with --best-effort)")
+	cmd.Flags().StringVar(&bestEffortExpiry, "best-effort-expiry", "", "admission-time duration or RFC3339 expiry for a command-line best-effort override; does not stop a running child; later launches require re-authorization")
 	cmd.Flags().StringArrayVar(&envVars, "env", nil, "pass environment variable to sandboxed process (KEY or KEY=VALUE, repeatable)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "check sandbox capabilities without launching (exit 0=capabilities ok, 1=degraded, 2=error)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output dry-run result as JSON")

@@ -24,7 +24,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/enterprise/dashboard"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtime"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/emit"
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/securefile"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
@@ -285,6 +287,21 @@ func runDashboardServe(cmd *cobra.Command, opts dashboardServeOptions, lic licen
 			return fmt.Errorf("--config: %w", err)
 		}
 	}
+	instanceID := emit.DefaultInstanceID()
+	var dashboardEventSinks []emit.Sink
+	if loadedConfig != nil {
+		sinks, buildErr := runtime.BuildEmitSinks(loadedConfig)
+		if buildErr != nil {
+			return fmt.Errorf("--config emit sinks: %w", buildErr)
+		}
+		dashboardEventSinks = sinks
+		instanceID = loadedConfig.Emit.InstanceID
+		if instanceID == "" {
+			instanceID = emit.DefaultInstanceID()
+		}
+	}
+	dashboardEventEmitter := emit.NewEmitter(instanceID, dashboardEventSinks...)
+	defer func() { _ = dashboardEventEmitter.Close() }()
 	runtimeSnapshotMaxAge := 3 * config.DefaultDashboardSnapshotInterval
 	if loadedConfig != nil {
 		runtimeSnapshotMaxAge = 3 * loadedConfig.DashboardSnapshot.IntervalDuration()
@@ -368,7 +385,11 @@ func runDashboardServe(cmd *cobra.Command, opts dashboardServeOptions, lic licen
 			return dashboardClientCertAuthAuditInfo(clientCertAuth, r)
 		}
 	}
-	handler := dashboardAuthHandler(authenticated, authAuditInfo, auditWriter, inner)
+	var authFailureMode func(*http.Request) string
+	if clientCertAuth == nil {
+		authFailureMode = authorization.failedAuthMode
+	}
+	handler := dashboardAuthHandler(authenticated, authAuditInfo, auditWriter, dashboardEventEmitter, authFailureMode, inner)
 	if oidcAuthenticator != nil {
 		handler = oidcAuthenticator.middleware(handler)
 	}
@@ -553,11 +574,14 @@ func dashboardAuthHandler(
 	authorized func(*http.Request) bool,
 	authInfo func(*http.Request) dashboard.AuthAuditInfo,
 	auditWriter io.Writer,
+	eventEmitter *emit.Emitter,
+	authFailureMode func(*http.Request) string,
 	next http.Handler,
 ) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r) {
 			recordDashboardAuthDenied(auditWriter, r, authInfo)
+			recordDashboardAuthFailure(eventEmitter, r, authFailureMode)
 			w.Header().Set("WWW-Authenticate", `Basic realm="pipelock dashboard", charset="UTF-8"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -567,6 +591,68 @@ func dashboardAuthHandler(
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// recordDashboardAuthFailure sends the structured event outside the
+// request path. Authentication remains available if a sink is slow or fails.
+func recordDashboardAuthFailure(emitter *emit.Emitter, r *http.Request, authFailureMode func(*http.Request) string) {
+	if emitter == nil || authFailureMode == nil {
+		return
+	}
+	authMode := authFailureMode(r)
+	if authMode == "" {
+		return
+	}
+	fields := map[string]any{
+		"remote_addr":    r.RemoteAddr,
+		"path":           r.URL.Path,
+		"failure_reason": dashboardAuthFailureReason(r),
+		"auth_mode":      authMode,
+	}
+	// Bounded: an unauthenticated client can generate failures faster than a
+	// slow sink drains them. When every slot is busy the event is dropped
+	// rather than queued, so a flood cannot grow goroutines without limit.
+	select {
+	case dashboardAuthEventSlots <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-dashboardAuthEventSlots }()
+		emitter.Emit(context.Background(), emit.EventDashboardAuthFailed, fields)
+	}()
+}
+
+// dashboardAuthEventSlots caps in-flight asynchronous auth-failure emits.
+// Delivery already fails open for the HTTP response; this caps its cost.
+var dashboardAuthEventSlots = make(chan struct{}, dashboardAuthEventMaxInflight)
+
+// dashboardAuthEventMaxInflight bounds concurrent failure emits. Sixty-four
+// covers a burst of retries from a misconfigured client while keeping a
+// credential-guessing flood from holding more than a handful of goroutines.
+const dashboardAuthEventMaxInflight = 64
+
+func dashboardAuthFailureReason(r *http.Request) string {
+	if r == nil {
+		return "missing"
+	}
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authorization == "" {
+		return "missing"
+	}
+	parts := strings.Fields(authorization)
+	if len(parts) != 2 || parts[1] == "" {
+		return "malformed"
+	}
+	if strings.EqualFold(parts[0], "Bearer") {
+		return "mismatch"
+	}
+	if strings.EqualFold(parts[0], "Basic") {
+		if _, _, ok := r.BasicAuth(); ok {
+			return "mismatch"
+		}
+	}
+	return "malformed"
 }
 
 func dashboardClientCertAuthAuditInfo(auth *dashboardClientCertAuthorizer, r *http.Request) dashboard.AuthAuditInfo {

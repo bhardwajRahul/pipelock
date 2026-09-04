@@ -407,13 +407,27 @@ func NamespacedID(bundleName, ruleID string) string {
 // ErrUnverifiableVersion reports that the running build does not carry a
 // released version, so a bundle's min_pipelock requirement could not be checked
 // either way. It is deliberately distinct from a requirement that was checked
-// and genuinely not met: the runtime load path refuses both, but the operator
-// CLI can downgrade only this one to a warning, because at install time the
-// operator is present to read it. A requirement that IS met or genuinely unmet
-// never produces this error.
+// and genuinely not met: callers load and warn only for this availability case.
+// A requirement that IS met or genuinely unmet never produces this error.
 var ErrUnverifiableVersion = errors.New("check min pipelock")
 
+// CheckMinPipelock keeps the contract every caller outside the loader relied on before the
+// warn-and-load change: an unprovable running version is ACCEPTED when allowUnversioned is
+// true and REFUSED otherwise. A genuinely unmet or malformed requirement always refuses. The
+// parameter was briefly ignored, which made fleet policy delivery refuse a development
+// follower that used to be accepted; the wrapper restores that behavior exactly.
 func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) error {
+	err := CheckMinPipelockVerdict(minVersion, currentVersion)
+	if err != nil && allowUnversioned && errors.Is(err, ErrUnverifiableVersion) {
+		return nil
+	}
+	return err
+}
+
+// CheckMinPipelockVerdict reports the raw verdict. An unprovable running version returns an
+// error wrapping ErrUnverifiableVersion so the caller can choose between warn-and-load and
+// refusal; the rule-bundle loader is the caller that makes that choice from configuration.
+func CheckMinPipelockVerdict(minVersion, currentVersion string) error {
 	if minVersion == "" {
 		return nil
 	}
@@ -433,11 +447,10 @@ func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) 
 
 	if isDevelopmentCurrentVersion(effectiveVersion) {
 		// A source build carries no release stamp, so the requirement cannot
-		// be verified. Refuse by default rather than loading rules whose
-		// prerequisites are unchecked, and name the way out.
-		if allowUnversioned {
-			return nil
-		}
+		// be verified. Keep the actionable refusal text that predated the
+		// warn-and-load loader path: non-loader callers expose this error to
+		// their operators, while the loader turns this sentinel into a warning
+		// when its setting allows the bundle.
 		return fmt.Errorf(
 			"%w: this build does not report a released version (%q), so the bundle requirement min_pipelock %q cannot be verified; install a released binary, or set rules.allow_unversioned_bundle_load: true to load it unverified",
 			ErrUnverifiableVersion, currentVersion, minVersion)

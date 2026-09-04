@@ -57,6 +57,93 @@ const (
 	mcpProxyCancelGrace = 5 * time.Second
 )
 
+func TestMCPProxyCmdRejectsMixedBestEffortProvenance(t *testing.T) {
+	futureExpiry := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	for _, tt := range []struct {
+		name     string
+		config   string
+		flagArgs []string
+	}{
+		{
+			name:     "command line override with configuration expiry",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--sandbox-best-effort", "--sandbox-best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "command line override with configuration reason",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--sandbox-best-effort", "--sandbox-best-effort-expiry", "1h"},
+		},
+		{
+			name:     "configuration override with command line reason",
+			config:   "sandbox:\n  enabled: true\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--sandbox-best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "configuration override with command line expiry",
+			config:   "sandbox:\n  enabled: true\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--sandbox-best-effort-expiry", "1h"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+			if err := os.WriteFile(configPath, []byte(tt.config), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cmd := McpCmd()
+			cmd.SilenceUsage = true
+			args := append([]string{"proxy", "--config", configPath}, tt.flagArgs...)
+			args = append(args, "--", "/bin/true")
+			cmd.SetArgs(args)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "command-line") || !strings.Contains(err.Error(), "configuration") {
+				t.Fatalf("McpCmd(%v) error = %v, want command-line/configuration refusal", args, err)
+			}
+		})
+	}
+}
+
+func TestMCPProxyCmdRejectsInvalidBestEffortOverrideBeforeReporting(t *testing.T) {
+	cmd := McpCmd()
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{
+		"proxy",
+		"--sandbox-best-effort",
+		"--sandbox-best-effort-reason", "test override",
+		"--sandbox-best-effort-expiry", "0s",
+		"--", "/bin/true",
+	})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("McpCmd() error = %v, want expired override refusal", err)
+	}
+	if strings.Contains(out.String(), "best-effort expiry bounds launch admission") {
+		t.Fatalf("McpCmd() reported launch admission before refusing the override: %s", out.String())
+	}
+}
+
+func TestMCPProxyCmdRejectsStrictBestEffortTogetherBeforeMetadataValidation(t *testing.T) {
+	cmd := McpCmd()
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{"proxy", "--sandbox-strict", "--sandbox-best-effort", "--", "/bin/true"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("McpCmd() error = %v, want strict/best-effort mutual exclusion", err)
+	}
+}
+
 func TestSafeWriter(t *testing.T) {
 	var buf bytes.Buffer
 	sw := &safeWriter{w: &buf}
@@ -2040,5 +2127,30 @@ func TestReadHeaderFile_Strict(t *testing.T) {
 	}
 	if hdrs.Get("X-Group") != "ok" {
 		t.Errorf("X-Group = %q, want ok", hdrs.Get("X-Group"))
+	}
+}
+
+func TestMCPProxyCmdRejectsBestEffortFlagsInRemoteModes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{name: "upstream with best-effort", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort"}},
+		{name: "upstream with expiry only", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort-expiry", "1h"}},
+		{name: "listen with best-effort metadata", args: []string{"--listen", "127.0.0.1:0", "--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort", "--sandbox-best-effort-reason", "x", "--sandbox-best-effort-expiry", "1h"}},
+		{name: "upstream with reason only", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort-reason", "x"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := McpCmd()
+			cmd.SilenceUsage = true
+			cmd.SetArgs(append([]string{"proxy"}, tt.args...))
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "cannot sandbox a remote server") {
+				t.Fatalf("mcp proxy %v error = %v, want remote-mode sandbox refusal", tt.args, err)
+			}
+		})
 	}
 }

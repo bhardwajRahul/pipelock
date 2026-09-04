@@ -1351,16 +1351,18 @@ func TestLoadRulesConfig_ExplicitPathError(t *testing.T) {
 	}
 }
 
-func TestRulesAllowUnversionedLoadFailsClosed(t *testing.T) {
+func TestRulesAllowUnversionedLoadReadsCompatibilitySetting(t *testing.T) {
 	t.Setenv("PIPELOCK_CONFIG", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 
 	if rulesAllowUnversionedLoad("/nonexistent/pipelock.yaml", io.Discard) {
-		t.Fatal("unreadable explicit config must not allow unversioned bundle load")
+		t.Fatal("unreadable explicit config must preserve the false compatibility value")
 	}
-	if rulesAllowUnversionedLoad("", io.Discard) {
-		t.Fatal("missing config must not allow unversioned bundle load")
+	// No configuration at all applies the shipped default, exactly as the
+	// runtime loader does, so install and update stage what the runtime loads.
+	if got, want := rulesAllowUnversionedLoad("", io.Discard), config.Defaults().Rules.AllowUnversionedBundleLoad; got != want {
+		t.Fatalf("missing config = %v, want the shipped default %v", got, want)
 	}
 
 	dir := t.TempDir()
@@ -1368,8 +1370,15 @@ func TestRulesAllowUnversionedLoadFailsClosed(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("rules:\n  allow_unversioned_bundle_load: true\n"), 0o600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
+	strictPath := filepath.Join(dir, "strict.yaml")
+	if err := os.WriteFile(strictPath, []byte("rules:\n  allow_unversioned_bundle_load: false\n"), 0o600); err != nil {
+		t.Fatalf("writing strict config: %v", err)
+	}
+	if rulesAllowUnversionedLoad(strictPath, io.Discard) {
+		t.Fatal("explicit false config must keep the strict refusal after defaults and normalization")
+	}
 	if !rulesAllowUnversionedLoad(cfgPath, io.Discard) {
-		t.Fatal("explicit true config should allow unversioned bundle load")
+		t.Fatal("explicit true config should preserve the accepted compatibility value")
 	}
 }
 
