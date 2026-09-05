@@ -1860,7 +1860,24 @@ func newInterceptHandler(
 				// terminate the stream. Generic SSE warn-mode findings are
 				// handled inline by GenericSSEScanOptions.OnFinding and
 				// return nil.
-				if IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn {
+				if IsSSEStreamScanError(streamErr) {
+					reason := "response scan failed: " + streamErr.Error()
+					ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+					ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+						ActionID:  actionID,
+						Verdict:   config.ActionBlock,
+						Layer:     "response_scan_error",
+						Pattern:   reason,
+						Transport: "intercept",
+						Method:    r.Method,
+						Target:    targetURL,
+						RequestID: ic.RequestID,
+						Agent:     ic.Agent,
+					}))
+				} else if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+					ic.Logger.LogError(actx, streamErr)
+				} else if IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn {
 					ic.Logger.LogAnomaly(actx, sseLayer, streamErr.Error(), 0)
 				} else {
 					ic.Logger.LogBlocked(actx, sseLayer, streamErr.Error())
@@ -1883,6 +1900,10 @@ func newInterceptHandler(
 			// still the upstream status and the close reason carries the block.
 			if streamErr == nil || (IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn) {
 				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionAllow, resp.StatusCode, -1, "sse_stream")
+			} else if IsSSEStreamScanError(streamErr) {
+				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionBlock, resp.StatusCode, -1, "response_scan_error")
+			} else if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionAllow, resp.StatusCode, -1, "sse_stream_cancelled")
 			} else {
 				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionBlock, resp.StatusCode, -1, sseLayer)
 			}
@@ -2203,6 +2224,20 @@ func newInterceptHandler(
 			} else {
 				a2aRespResult = mcp.ScanA2AResponseBody(r.Context(), respBody, ic.Scanner, &ic.Config.A2AScanning)
 			}
+			if a2aRespResult.ScanError != "" {
+				reason := "response scan failed: " + a2aRespResult.ScanError
+				ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+				ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+					Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent,
+				}))
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				emitBlockedPostRoundTripOutcome(http.StatusServiceUnavailable, "response_scan_error")
+				return
+			}
 			if !a2aRespResult.Clean {
 				// Consistency with URL-scan path: infrastructure errors are
 				// score-neutral and must not set the finding flag.
@@ -2271,6 +2306,8 @@ func newInterceptHandler(
 				}
 				if scanResult.Clean {
 					iRespAction = config.ActionAllow
+				} else if scanResult.Failed() {
+					iRespAction = config.ActionBlock
 				}
 				ic.Proxy.captureObs.ObserveResponseVerdict(r.Context(), &capture.ResponseVerdictRecord{
 					Subsurface:        "response_intercept",
@@ -2289,6 +2326,20 @@ func newInterceptHandler(
 					EffectiveAction:   iRespAction,
 					Outcome:           captureOutcome(iRespAction, scanResult.Clean),
 				})
+			}
+			if scanResult.Failed() {
+				reason := "response scan failed: " + scanResult.ScanError
+				ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+				ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+					Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent,
+				}))
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				emitBlockedPostRoundTripOutcome(http.StatusServiceUnavailable, "response_scan_error")
+				return
 			}
 			if !scanResult.Clean {
 				hasFinding = true
@@ -2310,7 +2361,7 @@ func newInterceptHandler(
 					if ic.Proxy != nil {
 						m = ic.Proxy.metrics
 					}
-					recordAdaptiveUpgrade(ic.Logger, m, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: originalAction, ToAction: action, Scanner: "response_scan", ClientIP: ic.ClientIP, RequestID: ic.RequestID})
+					recordAdaptiveUpgrade(ic.Logger, m, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: ic.ClientIP, RequestID: ic.RequestID})
 				}
 				patternNames := make([]string, len(scanResult.Matches))
 				for i, match := range scanResult.Matches {
@@ -2330,12 +2381,12 @@ func newInterceptHandler(
 					if !interceptRespExempt {
 						interceptRecordSignal(ic, session.SignalBlock)
 					}
-					ic.Logger.LogBlocked(actx, "response_scan", reason)
+					ic.Logger.LogBlocked(actx, responseScanLayer, reason)
 					ic.Metrics.RecordTLSResponseBlocked("injection")
 					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
-						Layer:     "response_scan",
+						Layer:     responseScanLayer,
 						Pattern:   reason,
 						Transport: "intercept",
 						Method:    r.Method,
@@ -2344,9 +2395,9 @@ func newInterceptHandler(
 						Agent:     ic.Agent,
 					}))
 					writeBlockedError(w,
-						blockInfoFor(blockreason.PromptInjection, "response_scan"),
+						blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 						"blocked: response contains injection", http.StatusForbidden)
-					emitBlockedPostRoundTripOutcome(http.StatusForbidden, "response_scan")
+					emitBlockedPostRoundTripOutcome(http.StatusForbidden, responseScanLayer)
 					return
 				case config.ActionStrip:
 					// Record SignalStrip for adaptive enforcement scoring.

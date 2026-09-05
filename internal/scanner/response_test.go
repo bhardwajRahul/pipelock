@@ -3392,7 +3392,8 @@ func TestScanResponse_SplitRunInnerLayer(t *testing.T) {
 	}
 }
 
-// TestScanResponse_CanceledContext ensures fail-closed on context cancellation.
+// TestScanResponse_CanceledContext ensures fail-closed scan errors are not
+// represented as prompt-injection matches.
 func TestScanResponse_CanceledContext(t *testing.T) {
 	s := MustNew(testResponseConfig())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3402,11 +3403,11 @@ func TestScanResponse_CanceledContext(t *testing.T) {
 	if result.Clean {
 		t.Error("expected fail-closed (not clean) when context is canceled")
 	}
-	if len(result.Matches) == 0 {
-		t.Fatal("expected at least one match for canceled context")
+	if !result.Failed() {
+		t.Fatal("expected scan error for canceled context")
 	}
-	if result.Matches[0].PatternName != "context_canceled" {
-		t.Errorf("expected pattern name 'context_canceled', got %q", result.Matches[0].PatternName)
+	if len(result.Matches) != 0 {
+		t.Fatalf("Matches = %v, want no injection matches for canceled context", result.Matches)
 	}
 }
 
@@ -3420,50 +3421,38 @@ func TestScanResponse_NilContext(t *testing.T) {
 	}
 }
 
-// TestScanResponse_PostScanContextExpired exercises the post-scan context check
-// (response.go line ~109). The context is valid when scanning starts but expires
-// during the scanning work. We use a goroutine to cancel after a brief delay.
+type responseScanCheckpointContext struct {
+	context.Context
+	cancel context.CancelFunc
+	checks int
+}
+
+func (c *responseScanCheckpointContext) Err() error {
+	c.checks++
+	if c.checks == 2 {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+// TestScanResponse_PostScanContextExpired exercises the post-scan context
+// check. The first check admits scanning; the second deterministically cancels
+// immediately before the post-scan check reads the context state.
 func TestScanResponse_PostScanContextExpired(t *testing.T) {
-	cfg := testResponseConfig()
-	// Add many patterns to make scanning take longer, increasing the chance
-	// the cancel fires during scanning rather than before.
-	for i := range 50 {
-		cfg.ResponseScanning.Patterns = append(cfg.ResponseScanning.Patterns,
-			config.ResponseScanPattern{
-				Name:  fmt.Sprintf("filler_%d", i),
-				Regex: fmt.Sprintf(`(?i)xyzzy_nonexistent_pattern_%d_[a-z]+`, i),
-			},
-		)
-	}
-	s := MustNew(cfg)
+	s := MustNew(testResponseConfig())
+	base, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctx := &responseScanCheckpointContext{Context: base, cancel: cancel}
 
-	// Build a large content string to make scanning take measurable time.
-	// This must be clean content (no injection matches) so scanning runs
-	// through all passes before the post-scan context check.
-	content := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 2000)
-
-	// Cancel context in a goroutine after a tiny delay.
-	// If the cancel happens before scanning starts, the pre-scan check catches it
-	// and we get context_canceled too - both paths produce fail-closed behavior.
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		cancel()
-	}()
-
-	result := s.ScanResponse(ctx, content)
-	// Either the pre-scan or post-scan context check should catch the cancellation.
-	// Both produce fail-closed (not clean) behavior.
-	if result.Clean {
-		// Context may not have been canceled in time on fast machines.
-		// That's acceptable - the test is probabilistic.
-		t.Log("context was not canceled during scan (race condition acceptable)")
-		return
+	result := s.ScanResponse(ctx, "The weather is pleasant today.")
+	if base.Err() == nil || ctx.checks < 2 {
+		t.Fatalf("post-scan checkpoint was not reached: checks=%d err=%v result=%+v", ctx.checks, base.Err(), result)
 	}
-	if len(result.Matches) == 0 {
-		t.Fatal("expected at least one match for canceled context")
+	if !result.Failed() {
+		t.Fatal("expected scan error for canceled context")
 	}
-	if result.Matches[0].PatternName != "context_canceled" {
-		t.Errorf("expected pattern name 'context_canceled', got %q", result.Matches[0].PatternName)
+	if len(result.Matches) != 0 {
+		t.Fatalf("Matches = %v, want no injection matches for canceled context", result.Matches)
 	}
 }
 

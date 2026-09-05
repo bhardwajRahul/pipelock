@@ -365,6 +365,25 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			emitMCPOutcomeReceipt(receiptEmitter, v2ReceiptEmitter, logW, trackedOutcome.Receipt, status, int64(len(outbound)), reason)
 		}
 
+		blockScanError := func(scanError string) error {
+			_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, scanError)
+			if frame.ID == nil && frame.Method != "" {
+				return nil // Notifications have no request awaiting a response.
+			}
+			resp := blockResponseReason(frame.ID, "upstream response scan failed")
+			if err := writer.WriteMessage(resp); err != nil {
+				return fmt.Errorf("writing scan-error block response: %w", err)
+			}
+			emitTrackedOutcome("error", "response_scan_error", resp)
+			return nil
+		}
+		if err := opts.warnContext().Err(); err != nil {
+			if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
+				return foundInjection, writeErr
+			}
+			continue
+		}
+
 		mediaResult := applyMCPResponseMediaPolicy(line, mediaPolicy, opts.Transport)
 		if len(mediaResult.Exposures) > 0 && opts.AuditLogger != nil {
 			rpcID := frame.ID
@@ -501,6 +520,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		toolPoisonDetected := false
 		if toolCfg != nil {
 			toolResult = tools.ScanTools(line, sc, toolCfg)
+			if err := opts.warnContext().Err(); err != nil {
+				if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
+					return foundInjection, writeErr
+				}
+				continue
+			}
 			isToolsList = toolResult.IsToolsList
 			// Provenance: verify tool signatures BEFORE updating session binding
 			// baseline. A blocked tools/list must not seed known tools.
@@ -659,11 +684,23 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// Still scan the error field: injection could hide in non-tool fields.
 		var verdict jsonrpc.ScanVerdict
 		if isToolsList {
-			verdict = scanToolsListNonToolFields(line, sc, respScanOpts)
+			verdict = scanToolsListNonToolFieldsContext(opts.warnContext(), line, sc, respScanOpts)
 		} else {
 			a2aOpts := opts.a2aResponseOpts(respScanOpts)
 			a2aOpts.Method = trackedMethod
 			verdict = ScanResponseA2A(line, sc, a2aOpts)
+		}
+
+		// The transport context owns cancellation even for legacy scanners that
+		// do not accept it. Never forward a result after its request was canceled.
+		if err := opts.warnContext().Err(); err != nil {
+			verdict = jsonrpc.ScanVerdict{ID: extractRPCID(line), Action: config.ActionBlock, Error: "response scan failed: " + err.Error()}
+		}
+		if verdict.Error != "" && verdict.Action == config.ActionBlock {
+			if err := blockScanError(verdict.Error); err != nil {
+				return foundInjection, err
+			}
+			continue
 		}
 
 		if verdict.Clean {

@@ -59,7 +59,8 @@ type SSEDispatchOptions struct {
 
 // DispatchSSEScan picks the appropriate streaming scanner and runs it.
 // Returns nil on clean EOF, a wrapped ErrA2AStreamFinding or
-// ErrSSEStreamFinding on detection, or a wrapped IO error otherwise.
+// ErrSSEStreamFinding on detection, a wrapped ErrSSEStreamScanError on an
+// incomplete scan, or a wrapped IO error otherwise.
 //
 // Caller MUST:
 //   - confirm the response is NOT compressed (use IsSSECompressed first);
@@ -89,6 +90,13 @@ func IsSSEStreamFinding(err error) bool {
 	return errors.Is(err, mcp.ErrA2AStreamFinding) || errors.Is(err, mcp.ErrSSEStreamFinding)
 }
 
+// IsSSEStreamScanError reports whether err represents an incomplete SSE
+// response scan. Unlike a stream finding, this is an enforcement failure and
+// must be recorded as response_scan_error by transport consumers.
+func IsSSEStreamScanError(err error) bool {
+	return errors.Is(err, mcp.ErrSSEStreamScanError)
+}
+
 // LayerA2AStream is the receipt layer label used for A2A streaming
 // findings on the forward proxy. Dashboards and alerts pivot on this
 // label; do not change without coordinating downstream consumers.
@@ -101,7 +109,7 @@ const LayerSSEStream = "sse_stream"
 // LayerReverseResponseBlocked is the receipt layer label used for
 // reverse-proxy fail-closed response blocks that are not finding-driven:
 // compressed bodies the regex pipeline cannot inspect, oversize bodies
-// that exceed the scanning limit, and read errors. The Pattern field
+// that exceed the scanning limit. The Pattern field
 // carries the specific reason. Forward and intercept currently emit the
 // equivalent shape under "tls_response_blocked" / inline pattern strings;
 // "reverse" is split out so dashboards can pivot per transport.
@@ -168,14 +176,17 @@ func HijackResponseForSSE(
 		// flushes per write to the client, so the per-event flush behavior
 		// happens downstream of this pipe write.
 		scanErr := DispatchSSEScan(ctx, upstream, pw, nil, sc, opts)
+		_ = upstream.Close()
+		// Reverse-proxy outcomes are emitted after the body copier observes
+		// the pipe close. Publish the final scan state first so an incomplete
+		// scan can replace the provisional streaming outcome before signing.
+		if onComplete != nil {
+			onComplete(scanErr)
+		}
 		if scanErr != nil {
 			_ = pw.CloseWithError(scanErr)
 		} else {
 			_ = pw.Close()
-		}
-		_ = upstream.Close()
-		if onComplete != nil {
-			onComplete(scanErr)
 		}
 	}()
 

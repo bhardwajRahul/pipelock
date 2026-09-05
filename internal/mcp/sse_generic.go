@@ -24,6 +24,11 @@ import (
 // with a receipt.
 var ErrSSEStreamFinding = errors.New("sse stream finding")
 
+// ErrSSEStreamScanError reports that an SSE response could not be completely
+// scanned. It is distinct from ErrSSEStreamFinding so callers never turn a
+// scanner failure into a prompt-injection finding or warn-mode pass-through.
+var ErrSSEStreamScanError = errors.New("sse stream scan error")
+
 // ErrSSEEventTooLarge is wrapped inside ErrSSEStreamFinding when a single
 // event's joined data: payload exceeds cfg.MaxEventBytes. The check
 // measures the data-payload bytes returned by transport.SSEReader, NOT
@@ -87,8 +92,9 @@ type GenericSSEScanOptions struct {
 //   - Block-mode detection returns an error wrapping ErrSSEStreamFinding;
 //     caller closes the connection.
 //   - Warn-mode detection calls opts.OnFinding and keeps forwarding.
-//   - IO or scanner errors return the underlying error wrapped with
-//     "sse stream read:"; caller closes the connection.
+//   - IO errors return the underlying error wrapped with "sse stream read:".
+//     Incomplete response scans wrap ErrSSEStreamScanError. Both close the
+//     connection without treating the failure as a content finding.
 //   - End of stream returns nil.
 //
 // When cfg is nil or cfg.Enabled is false the function falls through to
@@ -204,6 +210,9 @@ func ScanGenericSSEStreamWithOptions(
 			skipTailInjection := false
 			skipTailDLP := false
 			injectResult := sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+			if injectResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, injectResult.ScanError)
+			}
 			if !injectResult.Clean {
 				findingErr := fmt.Errorf("%w: injection: %s",
 					ErrSSEStreamFinding, sseInjectionNames(injectResult.Matches))
@@ -247,6 +256,9 @@ func ScanGenericSSEStreamWithOptions(
 			if !skipTailInjection && injectionTail != "" {
 				combined := injectionTail + " " + string(event)
 				tailInjectResult := sc.ScanResponseWithSuppress(ctx, combined, opts.Target, opts.Suppress)
+				if tailInjectResult.Failed() {
+					return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailInjectResult.ScanError)
+				}
 				if !tailInjectResult.Clean {
 					findingErr := fmt.Errorf("%w: cross-event injection: %s",
 						ErrSSEStreamFinding, sseInjectionNames(tailInjectResult.Matches))

@@ -187,6 +187,9 @@ func scanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions
 			}
 		}
 	}
+	if result.Failed() {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
 	if result.Clean && len(dlpMatches) == 0 {
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
 	}
@@ -263,6 +266,10 @@ func isToolsListResponse(line []byte) bool {
 // A malicious server can also inject into sibling fields like result.note or
 // result.cursor, so those remain in both scan inputs.
 func scanToolsListNonToolFields(line []byte, sc *scanner.Scanner, opts ResponseScanOptions) jsonrpc.ScanVerdict {
+	return scanToolsListNonToolFieldsContext(context.Background(), line, sc, opts)
+}
+
+func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *scanner.Scanner, opts ResponseScanOptions) jsonrpc.ScanVerdict {
 	trimmed := bytes.TrimSpace(line)
 	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
 		return jsonrpc.ScanVerdict{
@@ -376,7 +383,10 @@ func scanToolsListNonToolFields(line []byte, sc *scanner.Scanner, opts ResponseS
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
 	}
 
-	result := sc.ScanResponseWithSuppress(context.Background(), text, opts.Target, opts.Suppress)
+	result := sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+	if result.Failed() {
+		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
 	for _, match := range result.SuppressedMatches {
 		if opts.OnSuppressedResponse != nil {
 			opts.OnSuppressedResponse(match)
@@ -411,6 +421,13 @@ func scanBatch(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, inclu
 		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON batch: %v", err)}, false
 	}
 
+	return scanBatchElements(batch, func(elem []byte) jsonrpc.ScanVerdict {
+		return scanResponseOpts(elem, sc, opts, includeDLP)
+	})
+}
+
+// scanBatchElements preserves element scan outcomes while aggregating a batch.
+func scanBatchElements(batch []json.RawMessage, scan func([]byte) jsonrpc.ScanVerdict) (jsonrpc.ScanVerdict, bool) {
 	if len(batch) == 0 {
 		return jsonrpc.ScanVerdict{Clean: true}, false
 	}
@@ -421,14 +438,18 @@ func scanBatch(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, inclu
 	var action string
 	var hasError bool
 	var firstError string
+	var errorAction string
 
 	for _, elem := range batch {
-		v := scanResponseOpts(elem, sc, opts, includeDLP)
+		v := scan(elem)
 		if firstID == nil && len(v.ID) > 0 {
 			firstID = v.ID
 		}
 		if v.Error != "" {
 			hasError = true
+			if v.Action == config.ActionBlock {
+				errorAction = config.ActionBlock
+			}
 			if firstError == "" {
 				firstError = v.Error
 			}
@@ -443,7 +464,7 @@ func scanBatch(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, inclu
 	}
 
 	if hasError {
-		return jsonrpc.ScanVerdict{ID: firstID, Clean: false, Error: firstError}, len(allMatches) > 0 || len(allDLPMatches) > 0
+		return jsonrpc.ScanVerdict{ID: firstID, Clean: false, Action: errorAction, Error: firstError}, len(allMatches) > 0 || len(allDLPMatches) > 0
 	}
 	if len(allMatches) == 0 && len(allDLPMatches) == 0 {
 		return jsonrpc.ScanVerdict{ID: firstID, Clean: true}, false
@@ -805,6 +826,9 @@ func isAgentCardFields(resultFields map[string]json.RawMessage) bool {
 // a2aScanToVerdict converts an A2AScanResult into a jsonrpc.ScanVerdict
 // for use in the standard response forwarding pipeline.
 func a2aScanToVerdict(rpcID json.RawMessage, result A2AScanResult) jsonrpc.ScanVerdict {
+	if result.ScanError != "" {
+		return jsonrpc.ScanVerdict{ID: rpcID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
+	}
 	if result.Clean {
 		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
 	}
@@ -840,6 +864,10 @@ func a2aScanToVerdict(rpcID json.RawMessage, result A2AScanResult) jsonrpc.ScanV
 
 // agentCardToVerdict converts an AgentCardScanResult into a jsonrpc.ScanVerdict.
 func agentCardToVerdict(rpcID json.RawMessage, result AgentCardScanResult, cfg *config.A2AScanning) jsonrpc.ScanVerdict {
+	verdict := a2aScanToVerdict(rpcID, result.Findings)
+	if verdict.Error != "" {
+		return verdict
+	}
 	if result.Clean {
 		return jsonrpc.ScanVerdict{ID: rpcID, Clean: true}
 	}
@@ -861,7 +889,6 @@ func agentCardToVerdict(rpcID json.RawMessage, result AgentCardScanResult, cfg *
 		})
 	}
 	// Include field-level findings from the card scan.
-	verdict := a2aScanToVerdict(rpcID, result.Findings)
 	matches = append(matches, verdict.Matches...)
 
 	return jsonrpc.ScanVerdict{

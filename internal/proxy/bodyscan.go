@@ -749,6 +749,9 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	}
 	for _, text := range texts {
 		injectionResult := req.Scanner.ScanResponse(ctx, text)
+		if injectionResult.Failed() {
+			return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+		}
 		if !injectionResult.Clean {
 			result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
 		}
@@ -760,6 +763,9 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	// for deterministic split-secret detection.
 	joinedInOrder := strings.Join(texts, "\n")
 	injectionResult := req.Scanner.ScanResponse(ctx, joinedInOrder)
+	if injectionResult.Failed() {
+		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+	}
 	if !injectionResult.Clean {
 		result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
 	}
@@ -769,6 +775,9 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	sorted := sortedBodyTexts(texts)
 	joined := strings.Join(sorted, "\n")
 	injectionResult = req.Scanner.ScanResponse(ctx, joined)
+	if injectionResult.Failed() {
+		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+	}
 	if !injectionResult.Clean {
 		result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
 	}
@@ -1653,7 +1662,7 @@ func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, str
 		// params like Content-Disposition: form-data; x-data="<credential>".
 		for name, values := range part.Header {
 			canonical := textproto.CanonicalMIMEHeaderKey(name)
-			if canonical == "Content-Type" || canonical == "Content-Disposition" {
+			if canonical == headerContentType || canonical == "Content-Disposition" {
 				// Parse parameter values from structural headers.
 				// On parse failure, fall back to scanning raw value
 				// so malformed headers don't bypass inspection.

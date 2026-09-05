@@ -38,6 +38,8 @@ import (
 	plwsutil "github.com/luckyPipewrench/pipelock/internal/wsutil"
 )
 
+const responseScanLayer = "response_scan"
+
 // wsSemaphore limits concurrent WebSocket proxy connections.
 // Capacity is fixed on first use (sync.Once). Config reload changes to
 // max_concurrent_connections require a restart to take effect.
@@ -2431,8 +2433,6 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 // enforceUpstreamTextPayload applies response injection policy to any textual
 // WebSocket payload, including Ping and Pong application data.
 func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Logger, msg []byte, allowTransform bool) ([]byte, bool) {
-	const responseScanLayer = "response_scan"
-
 	if len(msg) == 0 {
 		return msg, false
 	}
@@ -2445,12 +2445,23 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 	// to warn with no adaptive scoring or action upgrade.
 	wsRespExempt := isResponseScanExempt(r.hostname, r.cfg.ResponseScanning.ExemptDomains)
 	scanResult := r.scanner.ScanResponseWithSuppress(ctx, string(msg), r.targetURL, r.cfg.Suppress)
-	r.observeUpstreamResponseTaint(!scanResult.Clean)
+	r.observeUpstreamResponseTaint(!scanResult.Clean && !scanResult.Failed())
 	recordSuppressedResponseScanExempts(r.proxy.metrics, scanResult.SuppressedMatches, TransportWS)
 	actx := newHTTPAuditContext(r.auditProvenanceCtx(), r.proxy.logger, httpAuditEvent{Method: "WS", TargetURL: r.targetURL, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent})
 	recordDroppedResponseScanMatches(r.proxy.metrics, r.proxy.logger, actx, scanResult.SuppressedMatches, TransportWS)
 	if scanResult.Clean {
 		return msg, false
+	}
+	if scanResult.Failed() {
+		reason := "response scan failed: " + scanResult.ScanError
+		log.LogError(newHTTPAuditContext(r.auditProvenanceCtx(), log, httpAuditEvent{Method: "WS", TargetURL: r.targetURL, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent}), fmt.Errorf("%s", reason))
+		_ = r.emitReceipt(receipt.EmitOpts{
+			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
+		})
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "response scan incomplete")
+		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "response scan incomplete")
+		return nil, true
 	}
 	if wsRespExempt {
 		r.proxy.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportWS)
