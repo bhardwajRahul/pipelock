@@ -202,6 +202,29 @@ environment_failure_reason() {
         fi
     fi
 
+    # An enterprise build without a license disables named agent profiles at
+    # load, so `check` refuses a setting that refers to one (for example
+    # containment.agent_listener). The refusal carries one fixed phrase from
+    # internal/config.LicenseDisabledProfileRefusal. The skip applies only when
+    # EVERY non-blank line of the check output is either that exact refusal or
+    # the license gate's fixed warning, so no other diagnostic, on its own line
+    # or on the refusal line, can ride along. Unlike the build gates above, no
+    # per-block opt-in is required: an OSS build never disables profiles, so
+    # the OSS run of this gate still checks and boots every block this covers.
+    local license_profile_phrase='named agent profiles require a Pro license with the agents feature'
+    local license_profile_refusal_line="^(Config validation FAILED: )?invalid config: containment\\.agent_listener \"[^\"]+\" is declared only by agents\\.[A-Za-z0-9_.-]+(, agents\\.[A-Za-z0-9_.-]+)*, which was disabled because [^;]+; ${license_profile_phrase}, and without it the listener is never bound\$"
+    local license_gate_boilerplate='^(WARNING: agents: section requires a license key\. Multi-agent profiles disabled\. Single-agent protection is active\.|Get a license key at https://pipelab\.org/pricing)$'
+    if [ "$phase" = "check" ] && grep -qE "$license_profile_refusal_line" "$out"; then
+        local unexplained
+        unexplained="$(grep -vE '^[[:space:]]*$' "$out" \
+            | grep -vE "$license_profile_refusal_line" \
+            | grep -cvE "$license_gate_boilerplate" || true)"
+        if [ "$unexplained" -eq 0 ]; then
+            echo "named agent profiles require a license"
+            return
+        fi
+    fi
+
     echo ""
 }
 
