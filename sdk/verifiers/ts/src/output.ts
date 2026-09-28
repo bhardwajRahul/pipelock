@@ -3,7 +3,13 @@
 
 import type { AuditPacketReport } from "./types.js";
 import type { ReceiptReport } from "./receipt.js";
-import type { ChainCommandReport } from "./cli.js";
+import type { ChainCommandReport, ChainSetReport } from "./cli.js";
+
+// reportFailure writes the one-line reason a verification failed to stderr,
+// in text and JSON mode alike, so no failing exit is silent.
+export function reportFailure(reason: string): void {
+  process.stderr.write(`verification failed: ${reason.replace(/[\r\n]+/gu, " ")}\n`);
+}
 
 export function writeJSON(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -80,6 +86,11 @@ export function emitChain(report: ChainCommandReport, json: boolean): void {
     process.stdout.write(`CHAIN ${report.unpinned ? "UNPINNED" : "VALID"}: ${report.path}\n`);
     if (report.unpinned && report.error) process.stdout.write(`  warning:    ${report.error}\n`);
     process.stdout.write(`  receipts:   ${report.receipt_count}\n`);
+    if (report.action_receipts !== undefined && report.evidence_receipts !== undefined) {
+      process.stdout.write(
+        `  by kind:    ${report.action_receipts} action_receipt, ${report.evidence_receipts} evidence_receipt\n`,
+      );
+    }
     process.stdout.write(`  final seq:  ${report.final_seq}\n`);
     process.stdout.write(`  root hash:  ${report.root_hash}\n`);
     return;
@@ -94,4 +105,33 @@ export function emitChain(report: ChainCommandReport, json: boolean): void {
   if ((report.broken_at_seq ?? 0) !== 0 || report.error) {
     process.stderr.write(`  broken at:  seq ${report.broken_at_seq ?? 0}\n`);
   }
+}
+
+// emitChainSet prints each run's chain report, then the base's restart
+// continuity in the same shape as the Go reference.
+export function emitChainSet(report: ChainSetReport, json: boolean): void {
+  if (json) {
+    writeJSON(report);
+    return;
+  }
+  for (const chain of report.chains) emitChain(chain, false);
+  const c = report.continuity;
+  const label = c.healthy ? "RESTART CONTINUITY OK" : "RESTART CONTINUITY FAILED";
+  process.stdout.write(
+    `${label}: base "${report.base}": ${c.chain_count} chain(s), ${c.linked.length} linked, ${c.unlinked.length} unlinked, ${c.findings.length} link finding(s)\n`,
+  );
+  for (const l of c.linked) {
+    process.stdout.write(
+      `  linked:   ${l.session} continues ${l.predecessor_session} at seq ${l.predecessor_tail_seq} (${l.trust})\n`,
+    );
+  }
+  for (const s of c.unlinked) process.stdout.write(`  unlinked: ${s}\n`);
+  for (const f of c.findings) process.stdout.write(`  - ${f.kind}: ${f.session}: ${f.detail}\n`);
+  process.stdout.write(
+    "  Note: an unlinked run claims no predecessor. That is normal for a first run or concurrent runs,\n",
+  );
+  process.stdout.write(
+    "  and it is also what a deleted link file looks like: this does not prove no run's evidence is missing.\n",
+  );
+  process.stdout.write(`  result:     ${report.valid ? "VALID" : "INVALID"}\n`);
 }

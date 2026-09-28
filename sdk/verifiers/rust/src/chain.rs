@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::canonical::{canonicalize_jcs_value, canonicalize_receipt};
-use crate::signing::{
-    normalize_evidence_receipt, verify_receipt, verify_receipt_with_options,
-    UNPINNED_RECEIPT_BANNER,
-};
+use crate::signing::{verify_receipt, verify_receipt_with_options, UNPINNED_RECEIPT_BANNER};
 use crate::types::{ChainResult, Receipt, Totals};
 use crate::util::sha256_hex;
 use sha2::{Digest, Sha256};
@@ -765,8 +762,12 @@ fn verify_evidence_chain(
         {
             return broken(seq, format!("seq {seq}: mixed receipt record_type"));
         }
+        // Without a pinned key every signature is still checked, against the
+        // chain's own declared signer, as the Go reference does: an edit after
+        // signing fails either way. That proves nothing about who signed, so
+        // the caller still reports the chain as unpinned.
         let verify_result = if key_hex.is_empty() {
-            normalize_evidence_receipt(receipt)
+            verify_receipt(receipt, &signer_id.to_ascii_lowercase())
         } else {
             verify_receipt(receipt, &key_hex)
         };
@@ -840,4 +841,33 @@ fn broken(seq: u64, error: String) -> ChainResult {
         error: Some(error),
         broken_at_seq: Some(seq),
     }
+}
+
+/// Picks the key an EvidenceReceipt v2 chain is verified against. A v2 chain
+/// has one signer and is verified against one key. Given a trusted set
+/// (directory mode passes each run its scoped trust, which includes an
+/// endorsed successor key), it is the trusted key equal to the chain's
+/// declared `signer_key_id`. The declared id only selects: every receipt is
+/// still verified against that key, and a signer outside the set gets the
+/// first trusted key, which then fails. A single key is returned unchanged.
+pub fn evidence_chain_key(key_hex: &str, receipts: &[Receipt]) -> String {
+    let keys: Vec<String> = key_hex
+        .split(',')
+        .map(|key| key.trim().to_ascii_lowercase())
+        .filter(|key| !key.is_empty())
+        .collect();
+    if keys.len() <= 1 {
+        return key_hex.to_string();
+    }
+    let declared = receipts
+        .first()
+        .and_then(|r| r.get("signature"))
+        .and_then(|sig| sig.get("signer_key_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    keys.iter()
+        .find(|key| **key == declared)
+        .unwrap_or(&keys[0])
+        .clone()
 }

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +17,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	auditpacket "github.com/luckyPipewrench/pipelock/sdk/audit-packet"
 )
 
@@ -269,6 +272,23 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 	return nil
 }
 
+// withoutClaimedTrust keeps a failed verification from repeating the
+// packet's own trust claim. The report starts with the packet's verdict and
+// trusted fields, so any failure after that point would otherwise print
+// "verdict: valid, trusted: true" beside an INVALID result. A report that is
+// not valid never claims trust, and a success verdict becomes invalid. A
+// successful report and the offline report are unchanged.
+func withoutClaimedTrust(r auditPacketReport) auditPacketReport {
+	if r.Valid {
+		return r
+	}
+	r.Trusted = false
+	if r.Verdict == auditpacket.VerdictValid || r.Verdict == auditpacket.VerdictSelfConsistentOnly {
+		r.Verdict = auditpacket.VerdictInvalid
+	}
+	return r
+}
+
 func populateReportFromPacket(r *auditPacketReport, p *auditpacket.Packet) {
 	totals := map[string]int{
 		"allow":    p.Summary.Totals.Allow,
@@ -369,7 +389,24 @@ func reverifyChain(baseDir string, packet *auditpacket.Packet, signerOverride st
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("evidence: %w", err)
 	}
-	receipts, err := receipt.ExtractReceipts(evidencePath)
+	// Classify and verify the same bounded snapshot. A second read could see a
+	// different file and let an action chain pass while v2 or recorder checks
+	// inspect different evidence.
+	bare, data, err := isBareActionReceiptJSONL(evidencePath)
+	if err != nil {
+		return receipt.ChainResult{}, nil, fmt.Errorf("read evidence: %w", err)
+	}
+	var receipts []receipt.Receipt
+	var evidenceReceipts []contractreceipt.EvidenceReceipt
+	if bare {
+		receipts, err = receipt.ExtractReceiptsBytes(data)
+	} else {
+		var entries []recorder.Entry
+		entries, err = recorder.ReadEntriesFromReader(bytes.NewReader(data))
+		if err == nil {
+			receipts, evidenceReceipts, _, err = receipt.RecorderFileChains(filepath.Base(evidencePath), entries)
+		}
+	}
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("extract receipts: %w", err)
 	}
@@ -377,6 +414,16 @@ func reverifyChain(baseDir string, packet *auditpacket.Packet, signerOverride st
 	resolvedKey, err := resolveSignerKey(keyHex)
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("resolve signer key: %w", err)
+	}
+	if len(evidenceReceipts) > 0 {
+		var trusted []string
+		if resolvedKey != "" {
+			trusted = []string{resolvedKey}
+		}
+		res := receipt.VerifyEvidenceChainTrusted(evidenceReceipts, trusted, contractreceipt.ChainVerifyOptions{})
+		if !res.Valid {
+			return receipt.ChainResult{}, nil, fmt.Errorf("evidence receipt chain rejected at seq %d: %s", res.BrokenAtSeq, res.Error)
+		}
 	}
 	if len(receipts) == 0 {
 		// Empty evidence is a completed, failed chain verification rather than

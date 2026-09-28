@@ -1,13 +1,14 @@
 // Copyright 2026 Pipelock contributors
 // SPDX-License-Identifier: Apache-2.0
 
-import { readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { Receipt, RecorderEntry } from "./types.js";
 import { validateV1Receipt } from "./strict.js";
 import { validateTimestamp } from "./aarp/numbers.js";
 import { parseJSONStrict, RawNumber } from "./aarp/strictjson.js";
 import { bindRecorderLineExtSource } from "./rawjson.js";
+import { readSessionReceipts } from "./chain-set.js";
+import type { RecorderLine } from "./recorder-chain.js";
 import {
   InvalidError,
   RuntimeError,
@@ -34,8 +35,18 @@ const skippableEntryTypes = new Set([
 ]);
 
 export function readEntries(file: string): RecorderEntry[] {
+  return readEntryLines(file).map((l) => l.entry);
+}
+
+// ParsedRecorderLine is one validated entry with its trimmed source line,
+// which the recorder hash chain check needs byte for byte.
+export interface ParsedRecorderLine extends RecorderLine {
+  entry: RecorderEntry;
+}
+
+export function readEntryLines(file: string): ParsedRecorderLine[] {
   const text = decodeUTF8(readVerifierBytes(path.normalize(file)), "evidence jsonl");
-  const entries: RecorderEntry[] = [];
+  const entries: ParsedRecorderLine[] = [];
   const lines = text.split(/\r?\n/u);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]?.trim() ?? "";
@@ -62,7 +73,7 @@ export function readEntries(file: string): RecorderEntry[] {
         `line ${i + 1}: legacy entry cannot carry v3 recorder namespace fields`,
       );
     }
-    entries.push(entry);
+    entries.push({ entry, line });
   }
   return entries;
 }
@@ -131,14 +142,20 @@ function legacyNamespaceFieldIsSet(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
 }
 
-interface ExtractedReceipts {
+export interface ExtractedReceipts {
   action: Receipt[];
   evidence: Receipt[];
 }
 
-function extractTypedReceipts(file: string): ExtractedReceipts {
+export function extractTypedReceipts(file: string): ExtractedReceipts {
+  return extractTypedFromEntries(readEntries(file));
+}
+
+// extractTypedFromEntries splits already-read recorder entries into the two
+// receipt chains, refusing any entry type it does not know.
+export function extractTypedFromEntries(entries: readonly RecorderEntry[]): ExtractedReceipts {
   const extracted: ExtractedReceipts = { action: [], evidence: [] };
-  for (const entry of readEntries(file)) {
+  for (const entry of entries) {
     const isReceipt = entry.type === actionReceiptType || entry.type === evidenceReceiptType;
     if (!isReceipt) {
       if (entry.type !== undefined && skippableEntryTypes.has(entry.type)) continue;
@@ -170,7 +187,7 @@ function extractTypedReceipts(file: string): ExtractedReceipts {
 // A default Pipelock run interleaves both types in one file, each on its own
 // chain. A file that carries only evidence_receipt entries is verified as an
 // evidence_receipt_v2 chain.
-function selectReceiptChain(extracted: ExtractedReceipts): Receipt[] {
+export function selectReceiptChain(extracted: ExtractedReceipts): Receipt[] {
   return extracted.action.length > 0 ? extracted.action : extracted.evidence;
 }
 
@@ -178,32 +195,10 @@ export function extractReceipts(file: string): Receipt[] {
   return selectReceiptChain(extractTypedReceipts(file));
 }
 
-function seqStart(file: string): number {
-  const base = path.basename(file, ".jsonl");
-  const dash = base.lastIndexOf("-");
-  const suffix = dash < 0 ? "" : base.slice(dash + 1);
-  const parsed = Number.parseInt(suffix, 10);
-  if (!/^\d+$/u.test(suffix) || !Number.isFinite(parsed)) {
-    throw new RuntimeError(`evidence file has non-numeric sequence suffix: ${file}`);
-  }
-  return parsed;
-}
-
+// extractReceiptsFromSessionDir returns one session's selected receipt chain.
+// Membership is Go's parsed-equality rule (evidencename.Parse), shared with the
+// chain-set reader: for session "s", "evidence-s-evil-0.jsonl" belongs to
+// session "s-evil" and is not read, although it starts with "evidence-s-".
 export function extractReceiptsFromSessionDir(dir: string, sessionId: string): Receipt[] {
-  const clean = path.normalize(dir);
-  const prefix = `evidence-${sessionId}-`;
-  const files = readdirSync(clean)
-    .filter((name) => {
-      const full = path.join(clean, name);
-      return !statSync(full).isDirectory() && name.startsWith(prefix) && name.endsWith(".jsonl");
-    })
-    .map((name) => path.join(clean, name))
-    .sort((a, b) => seqStart(a) - seqStart(b));
-  const combined: ExtractedReceipts = { action: [], evidence: [] };
-  for (const file of files) {
-    const extracted = extractTypedReceipts(file);
-    combined.action.push(...extracted.action);
-    combined.evidence.push(...extracted.evidence);
-  }
-  return selectReceiptChain(combined);
+  return selectReceiptChain(readSessionReceipts(path.normalize(dir), sessionId));
 }

@@ -33,8 +33,8 @@ The package exposes `pipelock-verifier-ts` after build.
 ## Usage
 
 ```bash
-pipelock-verifier-ts audit-packet PATH [--json] [--key HEX_OR_FILE] [--offline]
-pipelock-verifier-ts chain PATH [--json] [--key HEX_OR_FILE] [--rotation-endorsement FILE]... [--dir] [--session-id ID]
+pipelock-verifier-ts audit-packet PATH [--json] [--key HEX_OR_FILE]... [--offline]
+pipelock-verifier-ts chain PATH [--json] [--key HEX_OR_FILE]... [--rotation-endorsement FILE]... [--dir] [--session-id ID]
 pipelock-verifier-ts receipt PATH [--json] [--key HEX_OR_FILE]
 ```
 
@@ -48,6 +48,8 @@ Exit codes match the Go verifier:
 | 64   | CLI usage error |
 
 `audit-packet` validates `packet.json` against `sdk/audit-packet/v0.json`, applies the structural v0 checks, and re-verifies the referenced receipt chain unless `--offline` is set. `chain` accepts either an `evidence.jsonl` file or a recorder session directory with `--dir`. `receipt` verifies one receipt JSON file. For EvidenceReceipt v2, `receipt` requires a pinned `--key`, verifies the JCS preimage, and enforces strict validation for supported v2 payload kinds, including source-span rules for `proxy_decision_with_spans`.
+
+Every Pipelock process run writes its own receipt chain, named `<base>.run.<id>`, and a restart can leave a signed `chain-link-<predecessor>.json` file naming the exact tail it continues. With `--dir` and no `--session-id`, `pipelock-verifier-ts chain DIR --dir --key KEY` verifies every run chain of the `proxy` base, then checks each link file: its signature, that it names the predecessor's exact last receipt, that no predecessor has two successors, and that a signing-key change across a restart is covered by `--key` or a `--rotation-endorsement` signed by the retiring key. The report lists each run, then a `RESTART CONTINUITY` summary with linked and unlinked runs. An unlinked run is not a failure, because a first run, concurrent runs, and runs by older binaries are all unlinked, but it's also what a deleted link file looks like, so a passing result doesn't prove no run's evidence is missing. With `--session-id S`, run S is verified and S's whole base is still checked, so the result fails when any run in that base has a finding, and the finding names that run. A directory with no run chains keeps single-session verification. A file belongs to a session only when its parsed name matches exactly, so session `s` doesn't read `evidence-s-evil-0.jsonl`, and every entry in it must carry that session's `session_id`: a file named for one run that holds another run's entries is refused. Inside the directory, a symlinked evidence or link file is refused; a file you name on the command line is read as given, symlink or not. A current run writes an ActionReceipt v1 chain and an EvidenceReceipt v2 chain into the same files; when a file or session holds both, it's valid only when both verify, and a failure names the chain it came from. A file or shard holding only v2 receipts is verified as a v2 chain. The recorder's own entry hash chain is checked in every mode and reported as `outer_chain_broken`. That chain is unkeyed, so it catches an edit made without recomputing the hashes and nothing more; the receipt signatures are what authenticate the content. Read alone, a shard after a session's first fails that check, because its first entry doesn't start the chain. Two runs whose signed action records carry the same `run_nonce` are reported as `duplicate_run_nonce`, because one process run writes one chain. These checks match the Go reference `pipelock verify-receipt --chain DIR`. Every failing run prints a one-line `verification failed:` reason on stderr, in JSON mode too.
 
 For an ActionReceipt v1 chain that rotated signing keys, pin the original root
 and pass one `--rotation-endorsement` for each rotation boundary:
@@ -64,12 +66,16 @@ prior sequence, tail hash, recorder session, and successor key. Missing,
 altered, duplicate, replayed, cross-session, and unused endorsements fail
 closed.
 
+`--key` repeats to pin a set of trusted keys, as it does for the Go reference. `audit-packet` verifies both receipt chains its evidence file holds, so a forged EvidenceReceipt v2 fails the packet even though the packet's counts and root describe the ActionReceipt v1 chain.
+
 Trusted Audit Packet verification requires an external `--key` or an
 out-of-band `--expect-sha256` packet digest. A packet's embedded signer key
 cannot establish its own provenance. The explicitly weaker
 `--allow-self-consistent-only` and `--no-trust-required` modes retain their
 documented opt-in behavior. `--offline` is schema-only and deliberately skips
 receipt-chain verification.
+
+When full verification fails, the report never repeats the packet's own trust claim: a packet that claimed `verdict: valid` or `self_consistent_only` is reported as `verdict: invalid` with `trusted: false` and `valid: false`. A successful report is unchanged.
 
 ## Development
 

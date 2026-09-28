@@ -149,7 +149,7 @@ func TestTranscriptRootRunDirectoryResolution(t *testing.T) {
 func TestCleanReportRejectsNoReceipts(t *testing.T) {
 	t.Parallel()
 	pub, _ := continuityKey(t)
-	err := verifyCleanReport(io.Discard, "empty run", nil, []string{pub}, false, filepath.Join(t.TempDir(), "clean.json"))
+	err := verifyCleanReport(io.Discard, "empty run", nil, nil, []string{pub}, false, filepath.Join(t.TempDir(), "clean.json"))
 	if err == nil || !strings.Contains(err.Error(), "no receipts") {
 		t.Fatalf("empty clean report must fail closed: %v", err)
 	}
@@ -283,6 +283,13 @@ func TestVerifyReceiptChainDirEndorsedRotationAcrossRestart(t *testing.T) {
 	}
 	if strings.Count(out, "CHAIN VALID") != 2 || !strings.Contains(out, "linked:   "+b+" continues "+a) || !strings.Contains(out, "(endorsed)") {
 		t.Fatalf("both chains valid and the link endorsed:\n%s", out)
+	}
+	out, err = runVerifyReceipt(t, "--chain", dir, "--session", b, "--allow-unpinned", "--rotation-endorsement", endorsement)
+	if err == nil || !strings.Contains(err.Error(), "requires --key") {
+		t.Fatalf("an unpinned predecessor must not confer trust on its successor: err=%v\n%s", err, out)
+	}
+	if strings.Contains(out, "CHAIN VALID") {
+		t.Fatalf("an unpinned successor was presented as trusted:\n%s", out)
 	}
 }
 

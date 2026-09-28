@@ -5,7 +5,6 @@ use crate::types::Receipt;
 use crate::util::{
     parse_json_line, read_verifier_text, reject_duplicate_keys, Result, VerifierError,
 };
-use std::fs;
 use std::path::Path;
 
 const ACTION_RECEIPT_TYPE: &str = "action_receipt";
@@ -27,15 +26,21 @@ const SKIPPABLE_ENTRY_TYPES: &[&str] = &[
 pub fn read_entries(path: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(read_entry_lines(path)?
         .into_iter()
-        .map(|(entry, _)| entry)
+        .map(|line| line.entry)
         .collect())
 }
 
-// read_entry_lines returns each validated entry together with the Go-encoded
-// source bytes of an action receipt's ext bag, when it has one. Only that span
-// is kept, never the whole untrusted line, so memory stays proportional to the
-// parsed entries.
-fn read_entry_lines(path: &Path) -> Result<Vec<(serde_json::Value, Option<String>)>> {
+/// One validated recorder entry, the Go-encoded source bytes of an action
+/// receipt's ext bag when it has one, and the trimmed source line, which the
+/// recorder hash chain check needs byte for byte. The input file is bounded
+/// by the verifier's read limit, so keeping the lines is bounded too.
+pub(crate) struct RecorderLine {
+    pub(crate) entry: serde_json::Value,
+    pub(crate) ext: Option<String>,
+    pub(crate) line: String,
+}
+
+pub(crate) fn read_entry_lines(path: &Path) -> Result<Vec<RecorderLine>> {
     let text = read_verifier_text(path)?;
     let mut entries = Vec::new();
     for (index, raw_line) in text.lines().enumerate() {
@@ -77,7 +82,11 @@ fn read_entry_lines(path: &Path) -> Result<Vec<(serde_json::Value, Option<String
             } else {
                 None
             };
-        entries.push((entry, ext_bytes));
+        entries.push(RecorderLine {
+            entry,
+            ext: ext_bytes,
+            line: line.to_string(),
+        });
     }
     Ok(entries)
 }
@@ -91,9 +100,9 @@ fn legacy_namespace_field_is_set(entry: &serde_json::Value, field: &str) -> bool
 }
 
 #[derive(Default)]
-struct ExtractedReceipts {
-    action: Vec<Receipt>,
-    evidence: Vec<Receipt>,
+pub(crate) struct ExtractedReceipts {
+    pub(crate) action: Vec<Receipt>,
+    pub(crate) evidence: Vec<Receipt>,
 }
 
 impl ExtractedReceipts {
@@ -102,7 +111,7 @@ impl ExtractedReceipts {
     // default Pipelock run interleaves both types in one file, each on its own
     // chain. A file that carries only evidence_receipt entries is verified as
     // an evidence_receipt_v2 chain.
-    fn select_chain(self) -> Vec<Receipt> {
+    pub(crate) fn select_chain(self) -> Vec<Receipt> {
         if self.action.is_empty() {
             self.evidence
         } else {
@@ -115,9 +124,20 @@ pub fn extract_receipts(path: &Path) -> Result<Vec<Receipt>> {
     Ok(extract_typed_receipts(path)?.select_chain())
 }
 
-fn extract_typed_receipts(path: &Path) -> Result<ExtractedReceipts> {
+pub(crate) fn extract_typed_receipts(path: &Path) -> Result<ExtractedReceipts> {
+    extract_typed_from_lines(read_entry_lines(path)?)
+}
+
+/// Splits already-read recorder entries into the two receipt chains, refusing
+/// any entry type it does not know.
+pub(crate) fn extract_typed_from_lines(lines: Vec<RecorderLine>) -> Result<ExtractedReceipts> {
     let mut extracted = ExtractedReceipts::default();
-    for (entry, ext_bytes) in read_entry_lines(path)? {
+    for RecorderLine {
+        entry,
+        ext: ext_bytes,
+        ..
+    } in lines
+    {
         let entry_type = entry.get("type").and_then(serde_json::Value::as_str);
         let is_receipt =
             entry_type == Some(ACTION_RECEIPT_TYPE) || entry_type == Some(EVIDENCE_RECEIPT_TYPE);
@@ -178,61 +198,22 @@ fn extract_typed_receipts(path: &Path) -> Result<ExtractedReceipts> {
     Ok(extracted)
 }
 
+/// Returns one session's selected receipt chain. Membership is Go's
+/// parsed-equality rule (`evidencename.Parse`), shared with the chain-set
+/// reader: for session `s`, `evidence-s-evil-0.jsonl` belongs to session
+/// `s-evil` and is not read, although it starts with `evidence-s-`.
 pub fn extract_receipts_from_session_dir(dir: &Path, session_id: &str) -> Result<Vec<Receipt>> {
-    let prefix = format!("evidence-{session_id}-");
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir)
-        .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", dir.display())))?
-    {
-        let entry =
-            entry.map_err(|err| VerifierError::Runtime(format!("read dir entry: {err}")))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry
-            .file_type()
-            .map_err(|err| VerifierError::Runtime(format!("stat {}: {err}", name)))?
-            .is_dir()
-            || !name.starts_with(&prefix)
-            || !name.ends_with(".jsonl")
-        {
-            continue;
-        }
-        files.push(entry.path());
-    }
-    let mut files = files
-        .into_iter()
-        .map(|path| seq_start(&path).map(|seq| (seq, path)))
-        .collect::<Result<Vec<_>>>()?;
-    files.sort_by_key(|(seq, _)| *seq);
-    let mut combined = ExtractedReceipts::default();
-    for (_, file) in files {
-        let extracted = extract_typed_receipts(&file)?;
-        combined.action.extend(extracted.action);
-        combined.evidence.extend(extracted.evidence);
-    }
-    Ok(combined.select_chain())
+    Ok(extract_typed_receipts_from_session_dir(dir, session_id)?.select_chain())
 }
 
-fn seq_start(path: &Path) -> Result<u64> {
-    let name = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    let suffix = name
-        .rsplit_once('-')
-        .map(|(_, suffix)| suffix)
-        .unwrap_or("");
-    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(VerifierError::Runtime(format!(
-            "evidence file has non-numeric sequence suffix: {}",
-            display_path(path)
-        )));
-    }
-    suffix.parse::<u64>().map_err(|_| {
-        VerifierError::Runtime(format!(
-            "evidence file has non-numeric sequence suffix: {}",
-            display_path(path)
-        ))
-    })
+/// Returns one session's action-receipt and evidence-receipt chains.
+pub(crate) fn extract_typed_receipts_from_session_dir(
+    dir: &Path,
+    session_id: &str,
+) -> Result<ExtractedReceipts> {
+    let (action, evidence) =
+        crate::chain_set::read_session_receipts(dir, session_id).map_err(VerifierError::Runtime)?;
+    Ok(ExtractedReceipts { action, evidence })
 }
 
 fn errors_unsupported(line: usize, version: Option<u64>) -> Result<()> {
@@ -299,8 +280,4 @@ fn validate_projected_strings(entry: &serde_json::Value, line: usize, version: u
         }
     }
     Ok(())
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }

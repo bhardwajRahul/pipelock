@@ -162,7 +162,7 @@ pub struct ReceiptReport {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ChainCommandReport {
     pub path: String,
     pub valid: bool,
@@ -176,4 +176,49 @@ pub struct ChainCommandReport {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broken_at_seq: Option<u64>,
+    /// Receipts of each kind the session or file holds. Both chains present
+    /// must verify for the report to be valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_receipts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_receipts: Option<usize>,
+}
+
+/// Directory-mode report when the evidence directory holds per-run receipt
+/// chains: one chain report per run, then the base's restart continuity.
+/// Unlinked runs are always listed, because a passing result is not proof
+/// that no run's evidence is missing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetReport {
+    pub path: String,
+    pub base: String,
+    pub valid: bool,
+    pub chains: Vec<ChainSetEntry>,
+    pub continuity: ChainSetContinuity,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetEntry {
+    pub session: String,
+    #[serde(flatten)]
+    pub report: ChainCommandReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetContinuity {
+    pub healthy: bool,
+    /// Every chain of the base, which a named run's report lists alongside
+    /// the one chain it verifies.
+    pub chain_count: usize,
+    pub linked: Vec<ChainSetLink>,
+    pub unlinked: Vec<String>,
+    pub findings: Vec<crate::chain_set::BaseFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetLink {
+    pub session: String,
+    pub predecessor_session: String,
+    pub predecessor_tail_seq: u64,
+    pub trust: String,
 }
