@@ -1082,6 +1082,15 @@ Key-free evidence capture:
 			var policyCfg *policy.Config
 			if cfg.MCPToolPolicy.Enabled {
 				policyCfg = policy.New(cfg.MCPToolPolicy)
+				// A subprocess server shares this host's filesystem, so a submitted
+				// path is also matched by the file it resolves to here. A remote
+				// upstream resolves paths on its own host, which Pipelock cannot see.
+				// A server commonly resolves relative names against the directories
+				// it was given, so those join the working directory as bases.
+				if hasSubprocess && !hasUpstream {
+					cwd, _ := os.Getwd()
+					policyCfg.EnableLocalPathIdentity(localPathBasesFromArgs(cwd, args[dashIdx+1:])...)
+				}
 			}
 
 			// Initialize chain matcher if tool chain detection is configured.
@@ -1652,6 +1661,9 @@ Key-free evidence capture:
 					workspace, _ = os.Getwd()
 				}
 				workspace, _ = filepath.Abs(workspace)
+				// The sandboxed child runs in the workspace, so relative names it
+				// receives, including its own directory arguments, resolve there.
+				policyCfg.AddLocalPathBases(append([]string{workspace}, localPathBasesFromArgs(workspace, serverCmd[1:])...)...)
 
 				ctx, cancel := signal.NotifyContext(heartbeatCtx, syscall.SIGINT, syscall.SIGTERM)
 				defer cancel()
