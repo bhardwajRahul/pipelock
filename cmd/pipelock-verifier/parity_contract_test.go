@@ -5,6 +5,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -272,6 +274,103 @@ func TestChain_DirectorySymlinkRefusedAsVerificationFailure(t *testing.T) {
 	}
 }
 
+func TestChain_ExplicitPathResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	dir := physicalTempDir(t)
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	for _, path := range []string{a, filepath.Join(b, "sub")} {
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := filepath.Base(runFileIn("", parityRun1))
+	valid, err := os.ReadFile(filepath.Join(runChainFixtures, "valid", name)) // #nosec G304 -- name comes from a test fixture constant.
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathA := filepath.Join(a, name)
+	pathB := filepath.Join(b, name)
+	link := filepath.Join(a, "link")
+	if err := os.Symlink(filepath.Join(b, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	input := link + string(filepath.Separator) + ".." + string(filepath.Separator) + name
+	for _, tc := range []struct {
+		name   string
+		aData  []byte
+		bData  []byte
+		wantOK bool
+	}{
+		{name: "invalid reached target", aData: valid, bData: []byte("not-json\n")},
+		{name: "valid reached target", aData: []byte("not-json\n"), bData: valid, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pathA, tc.aData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(pathB, tc.bData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := filepath.EvalSymlinks(input)
+			if err != nil || resolved != pathB {
+				t.Fatalf("path resolves to %q, want %q: %v", resolved, pathB, err)
+			}
+			stdout, stderr, code := runRoot(t, "chain", input, "--key", key, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestReceipt_ExplicitPathResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	fix := newFixture(t, 1)
+	valid, err := receipt.Marshal(fix.receipts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	for _, path := range []string{a, filepath.Join(b, "sub")} {
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pathA := filepath.Join(a, "receipt.json")
+	pathB := filepath.Join(b, "receipt.json")
+	link := filepath.Join(a, "link")
+	if err := os.Symlink(filepath.Join(b, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	input := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "receipt.json"
+	for _, tc := range []struct {
+		name   string
+		aData  []byte
+		bData  []byte
+		wantOK bool
+	}{
+		{name: "invalid reached target", aData: valid, bData: []byte("not-json\n")},
+		{name: "valid reached target", aData: []byte("not-json\n"), bData: valid, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pathA, tc.aData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(pathB, tc.bData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runRoot(t, "receipt", input, "--key", fix.keyHex, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
 // writeRunPacket wraps one run's evidence file in a v0 Audit Packet whose
 // claims match its action chain.
 func writeRunPacket(t *testing.T, evidence []byte, keyHex string) string {
@@ -373,6 +472,137 @@ func TestExecute_EveryFailurePrintsReason(t *testing.T) {
 		}
 		if n := strings.Count(stderr, "pipelock-verifier: "); n != 1 {
 			t.Fatalf("%v: want exactly one reason line on stderr, got %d\nstdout: %s\nstderr: %s", args, n, stdout, stderr)
+		}
+	}
+}
+
+func TestChain_DirectoryRootSymlinkRefusedAlongWalkedPath(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	base := physicalTempDir(t)
+	valid := copyFixtureDir(t, "valid")
+	tampered := copyFixtureDir(t, "tampered-predecessor")
+	realEv := filepath.Join(base, "a", "ev")
+	otherEv := filepath.Join(base, "b", "ev")
+	for _, pair := range [][2]string{{valid, realEv}, {tampered, otherEv}} {
+		if err := os.MkdirAll(filepath.Dir(pair[1]), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(base, "b", "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "sub"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(realEv, filepath.Join(base, "evlink")); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(filepath.Separator)
+	hidden := filepath.Join(base, "a", "link") + sep + ".." + sep + "ev"
+	for _, tc := range []struct {
+		name    string
+		target  string
+		code    int
+		wantOut string
+	}{
+		{name: "real directory", target: realEv, code: 0, wantOut: "CHAIN VALID"},
+		{name: "directory the hidden path opens", target: otherEv, code: 1, wantOut: "CHAIN BROKEN"},
+		{name: "symlinked root", target: filepath.Join(base, "evlink"), code: 1, wantOut: "refuse symlink in evidence root path"},
+		{name: "symlink hidden by dot-dot", target: hidden, code: 1, wantOut: "refuse symlink in evidence root path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, code := runRoot(t, "chain", tc.target, "--dir", "--key", key)
+			if code != tc.code || !strings.Contains(stdout+stderr, tc.wantOut) {
+				t.Fatalf("exit %d, want %d with %q\n%s%s", code, tc.code, tc.wantOut, stdout, stderr)
+			}
+		})
+	}
+}
+
+// A --key file path is read as the operating system opens it, as every
+// receipt verifier reads it: "link/../keys/k.hex" names the key under the
+// link's target, not the lexical keys/k.hex.
+// physicalTempDir returns t.TempDir() with symlinks resolved. An evidence root
+// may not pass through a symlink, and the system temp directory does on some
+// platforms (macOS /var is a symlink to /private/var).
+func physicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestChain_KeyFileResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	signer := readRunChainFixture(t, "signer-key.hex")
+	other, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherHex := hex.EncodeToString(other)
+	dir := t.TempDir()
+	for _, sub := range []string{filepath.Join("a", "keys"), filepath.Join("b", "keys"), filepath.Join("b", "sub")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "b", "sub"), filepath.Join(dir, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	sep := string(filepath.Separator)
+	input := filepath.Join(dir, "a", "link") + sep + ".." + sep + "keys" + sep + "k.hex"
+	lexical := filepath.Join(dir, "a", "keys", "k.hex")
+	opened := filepath.Join(dir, "b", "keys", "k.hex")
+	evidence := filepath.Join(runChainFixtures, "valid")
+	for _, tc := range []struct {
+		name            string
+		lexKey, openKey string
+		wantOK          bool
+	}{
+		{name: "signer at the opened path", lexKey: otherHex, openKey: signer, wantOK: true},
+		{name: "signer only at the lexical path", lexKey: signer, openKey: otherHex},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(lexical, []byte(tc.lexKey+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(opened, []byte(tc.openKey+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runRoot(t, "chain", evidence, "--dir", "--key", input, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
+// A file named as a directory ("receipt.json/", "receipt.json/.") is refused,
+// as the operating system refuses to open it and as every verifier refuses it.
+func TestReceipt_FileNamedAsDirectoryRefused(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(physicalTempDir(t), "receipt.json")
+	data, err := os.ReadFile(filepath.Join("..", "..", "sdk", "conformance", "testdata", "valid-single.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stdout, stderr, code := runRoot(t, "receipt", file, "--allow-unpinned"); code != 0 {
+		t.Fatalf("positive control: exit %d\n%s%s", code, stdout, stderr)
+	}
+	sep := string(filepath.Separator)
+	for _, input := range []string{file + sep, file + sep + "."} {
+		stdout, stderr, code := runRoot(t, "receipt", input, "--allow-unpinned")
+		if code != 2 || !strings.Contains(stdout+stderr, "not a directory") {
+			t.Fatalf("%q: exit %d, want 2 not-a-directory\n%s%s", input, code, stdout, stderr)
 		}
 	}
 }

@@ -13,6 +13,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The system temp directory with symlinks resolved. An evidence root may not
+/// pass through a symlink, and the temp directory does on some platforms
+/// (macOS /var is a symlink to /private/var).
+fn physical_temp_dir() -> PathBuf {
+    fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir")
+}
+
 fn parity_root() -> PathBuf {
     common::repo_root().join("sdk/conformance/testdata/parity")
 }
@@ -60,6 +67,173 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_file_path_resolves_symlink_before_parent_traversal() {
+    use std::os::unix::fs::symlink;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = TempDir(physical_temp_dir().join(format!(
+        "parity-operator-path-{}-{unique}",
+        std::process::id()
+    )));
+    let a = dir.0.join("a");
+    let b = dir.0.join("b");
+    fs::create_dir_all(&a).expect("mkdir a");
+    fs::create_dir_all(b.join("sub")).expect("mkdir b/sub");
+    let name = "evidence-proxy.run.03b13ee13e01e7f770480f62ea42f1fe-0.jsonl";
+    let source = common::repo_root().join("sdk/conformance/testdata/run-chains");
+    let valid = fs::read(source.join("valid").join(name)).expect("signed fixture");
+    let key = source.join("signer-key.hex").display().to_string();
+    let path_a = a.join(name);
+    let path_b = b.join(name);
+    let link = a.join("link");
+    symlink(b.join("sub"), &link).expect("symlink");
+    let input = format!("{}/../{name}", link.display());
+
+    for (a_data, b_data, valid_target) in [
+        (valid.as_slice(), b"not-json\n".as_slice(), false),
+        (b"not-json\n".as_slice(), valid.as_slice(), true),
+    ] {
+        fs::write(&path_a, a_data).expect("write a");
+        fs::write(&path_b, b_data).expect("write b");
+        let (code, stdout, stderr) = run_cli(&[
+            "chain".to_string(),
+            input.clone(),
+            "--key".to_string(),
+            key.clone(),
+            "--json".to_string(),
+        ]);
+        if valid_target {
+            assert_eq!(code, 0, "{stdout}{stderr}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout).unwrap()["valid"],
+                true
+            );
+        } else {
+            assert_ne!(code, 0, "{stdout}{stderr}");
+            assert!(!stdout.contains("\"valid\":true"), "{stdout}{stderr}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_mode_refuses_symlink_anywhere_on_walked_root_path() {
+    use std::os::unix::fs::symlink;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = TempDir(
+        physical_temp_dir().join(format!("parity-root-path-{}-{unique}", std::process::id())),
+    );
+    let source = common::repo_root().join("sdk/conformance/testdata/run-chains");
+    let key = source.join("signer-key.hex").display().to_string();
+    let real_ev = dir.0.join("a").join("ev");
+    let other_ev = dir.0.join("b").join("ev");
+    fs::create_dir_all(&real_ev).expect("mkdir a/ev");
+    fs::create_dir_all(&other_ev).expect("mkdir b/ev");
+    fs::create_dir_all(dir.0.join("b").join("sub")).expect("mkdir b/sub");
+    copy_dir(&source.join("valid"), &real_ev);
+    copy_dir(&source.join("tampered-predecessor"), &other_ev);
+    symlink(dir.0.join("b").join("sub"), dir.0.join("a").join("link")).expect("symlink");
+    symlink(&real_ev, dir.0.join("evlink")).expect("symlink");
+    let run = |target: String| {
+        run_cli(&[
+            "chain".to_string(),
+            target,
+            "--dir".to_string(),
+            "--key".to_string(),
+            key.clone(),
+            "--json".to_string(),
+        ])
+    };
+    let (code, stdout, stderr) = run(real_ev.display().to_string());
+    assert_eq!(code, 0, "positive control: {stdout}{stderr}");
+    let (code, stdout, stderr) = run(other_ev.display().to_string());
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    for target in [
+        dir.0.join("evlink").display().to_string(),
+        format!("{}/../ev", dir.0.join("a").join("link").display()),
+    ] {
+        let (code, stdout, stderr) = run(target.clone());
+        assert_eq!(code, 1, "{target}: {stdout}{stderr}");
+        let report: Value = serde_json::from_str(&stdout).expect("json report");
+        assert_eq!(report["valid"], false, "{target}");
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("refuse symlink in evidence root path"),
+            "{target}: {stdout}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_mode_walk_matches_the_operating_system() {
+    use std::os::unix::fs::symlink;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = TempDir(
+        physical_temp_dir().join(format!("parity-root-walk-{}-{unique}", std::process::id())),
+    );
+    let source = common::repo_root().join("sdk/conformance/testdata/run-chains");
+    let key = source.join("signer-key.hex").display().to_string();
+    fs::create_dir_all(dir.0.join("s")).expect("mkdir s");
+    fs::create_dir_all(dir.0.join("ev")).expect("mkdir ev");
+    fs::create_dir_all(dir.0.join("elsewhere").join("ev")).expect("mkdir elsewhere/ev");
+    copy_dir(&source.join("valid"), &dir.0.join("ev"));
+    copy_dir(
+        &source.join("tampered-predecessor"),
+        &dir.0.join("elsewhere").join("ev"),
+    );
+    fs::write(dir.0.join("afile"), b"").expect("write afile");
+    // One entry named `s\..` on POSIX, a symlink the open follows.
+    symlink("elsewhere", dir.0.join("s\\..")).expect("symlink");
+    let run = |target: String| {
+        run_cli(&[
+            "chain".to_string(),
+            target,
+            "--dir".to_string(),
+            "--key".to_string(),
+            key.clone(),
+            "--json".to_string(),
+        ])
+    };
+    let (code, stdout, stderr) = run(dir.0.join("ev").display().to_string());
+    assert_eq!(code, 0, "positive control: {stdout}{stderr}");
+
+    let target = format!("{}/s\\../ev", dir.0.display());
+    let (code, stdout, stderr) = run(target.clone());
+    assert_eq!(code, 1, "{target}: {stdout}{stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("json report");
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refuse symlink in evidence root path"),
+        "{target}: {stdout}"
+    );
+
+    let target = format!("{}/afile/../ev", dir.0.display());
+    let (code, stdout, stderr) = run(target.clone());
+    assert_eq!(code, 2, "{target}: {stdout}{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("is not a directory"),
+        "{target}: {stdout}{stderr}"
+    );
 }
 
 fn pairs(list: &Value) -> Vec<String> {
@@ -114,7 +288,7 @@ fn every_parity_cell_reaches_the_contract_verdict() {
             &fs::read_to_string(parity_root().join(&name).join("expect.json")).expect("expect"),
         )
         .expect("parse expect");
-        let dir = TempDir(std::env::temp_dir().join(format!(
+        let dir = TempDir(physical_temp_dir().join(format!(
             "parity-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -268,7 +442,7 @@ fn run_b_evidence_receipt(class: &str, index: isize, dir: &Path) -> PathBuf {
 /// --allow-unpinned rather than being reported self-consistent.
 #[test]
 fn unpinned_edited_evidence_receipt_fails() {
-    let dir = std::env::temp_dir().join(format!("parity-receipt-{}", std::process::id()));
+    let dir = physical_temp_dir().join(format!("parity-receipt-{}", std::process::id()));
     fs::create_dir_all(&dir).expect("mkdir");
     let honest = run_b_evidence_receipt("v2-drop-rehash", 0, &dir);
     let (code, out, err) = run_cli(&[
@@ -284,4 +458,44 @@ fn unpinned_edited_evidence_receipt_fails() {
         "--allow-unpinned".to_string(),
     ]);
     assert_eq!(code, 1, "forged receipt: {out}{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn receipt_mode_refuses_a_file_named_as_a_directory() {
+    let dir = TempDir(physical_temp_dir().join(format!(
+        "parity-receipt-trailing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    )));
+    fs::create_dir_all(&dir.0).expect("mkdir");
+    let file = dir.0.join("receipt.json");
+    fs::copy(
+        common::repo_root().join("sdk/conformance/testdata/valid-single.json"),
+        &file,
+    )
+    .expect("copy receipt");
+    let run = |target: String| {
+        run_cli(&[
+            "receipt".to_string(),
+            target,
+            "--allow-unpinned".to_string(),
+        ])
+    };
+    let (code, stdout, stderr) = run(file.display().to_string());
+    assert_eq!(code, 0, "positive control: {stdout}{stderr}");
+    for target in [
+        format!("{}/", file.display()),
+        format!("{}/.", file.display()),
+    ] {
+        let (code, stdout, stderr) = run(target.clone());
+        assert_eq!(code, 2, "{target}: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("Not a directory"),
+            "{target}: {stdout}{stderr}"
+        );
+    }
 }

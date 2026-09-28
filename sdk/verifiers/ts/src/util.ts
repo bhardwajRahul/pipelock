@@ -7,6 +7,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  lstatSync,
   openSync,
   readSync,
   realpathSync,
@@ -32,12 +33,59 @@ export function sha256Hex(data: Buffer | string): string {
 
 export const maxVerifierInputBytes = 8 << 20;
 
-export function readVerifierBytes(file: string): Buffer {
-  const clean = path.normalize(file);
-  const fd = openSync(clean, constants.O_RDONLY | constants.O_NONBLOCK);
+// Node normalizes "symlink/.." before realpathSync sees it. Walk each path
+// component so a parent traversal applies to the symlink's target, as it does
+// when the operating system opens the path supplied by the operator.
+export function resolveOperatorFilePath(file: string): string {
+  const root = path.parse(file).root;
+  // On Windows, "C:name" starts at C's working directory, which need not be
+  // the process working directory. Resolve the volume before walking.
+  let current = root ? path.resolve(root) : process.cwd();
+  const components = file.slice(root.length).split(path.sep === "\\" ? /[\\/]/u : /\//u);
+  for (const component of components) {
+    if (component === "" || component === ".") {
+      // "file/" and "file/." name the file as a directory, which the
+      // operating system refuses to open (ENOTDIR). The root or working
+      // directory the walk starts from is always a directory.
+      if (!statSync(current).isDirectory()) {
+        throw new RuntimeError(`path component is not a directory: ${current}`);
+      }
+      continue;
+    }
+    if (component === "..") {
+      if (!statSync(current).isDirectory()) {
+        throw new RuntimeError(`path component is not a directory: ${current}`);
+      }
+      current = path.dirname(current);
+    } else {
+      current = realpathSync(path.join(current, component));
+    }
+  }
+  return current;
+}
+
+export function readVerifierBytes(file: string, directoryChild = false): Buffer {
+  // Directory children are opened relative to the pinned working directory.
+  // Never resolve them by pathname: that would follow a replacement symlink.
+  if (directoryChild && (path.basename(file) !== file || file === "." || file === "..")) {
+    throw new RuntimeError("evidence filename must be a base name");
+  }
+  const clean = directoryChild ? file : resolveOperatorFilePath(file);
+  const before = directoryChild ? lstatSync(clean, { bigint: true }) : undefined;
+  if (before?.isSymbolicLink()) throw new RuntimeError("refuse symlink in evidence directory");
+  const fd = openSync(
+    clean,
+    constants.O_RDONLY | constants.O_NONBLOCK | (directoryChild ? (constants.O_NOFOLLOW ?? 0) : 0),
+  );
   try {
     const info = fstatSync(fd);
     if (!info.isFile()) throw new RuntimeError("input must be a regular file");
+    if (before !== undefined) {
+      const opened = fstatSync(fd, { bigint: true });
+      if (opened.dev !== before.dev || opened.ino !== before.ino || opened.ino === 0n) {
+        throw new RuntimeError("evidence file changed while opening");
+      }
+    }
     if (info.size > maxVerifierInputBytes) {
       throw new RuntimeError(`input exceeds ${maxVerifierInputBytes} bytes`);
     }
@@ -239,9 +287,10 @@ function parseSignerKeyValue(value: string): string {
 }
 
 export function resolvePacketPath(target: string): { packetPath: string; baseDir: string } {
-  const clean = path.normalize(target);
+  let clean: string;
   let info;
   try {
+    clean = resolveOperatorFilePath(target);
     info = statSync(clean);
   } catch (err) {
     throw new RuntimeError(`stat ${target}: ${(err as Error).message}`);

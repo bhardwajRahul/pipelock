@@ -40,7 +40,7 @@ func parityKey(t *testing.T) string {
 func parityFixture(t *testing.T) string {
 	t.Helper()
 	src := filepath.Join(parityFixtureDir, "valid")
-	dst := t.TempDir()
+	dst := physicalTempDir(t)
 	des, err := os.ReadDir(src)
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +58,18 @@ func parityFixture(t *testing.T) string {
 		}
 	}
 	return dst
+}
+
+// physicalTempDir returns t.TempDir() with symlinks resolved. An evidence root
+// may not pass through a symlink, and the system temp directory does on some
+// platforms (macOS /var is a symlink to /private/var).
+func physicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func parityFile(dir, session string) string {
@@ -356,6 +368,56 @@ func TestVerifyReceipt_SymlinkPolicy(t *testing.T) {
 	}
 }
 
+func TestVerifyReceipt_ExplicitPathResolvesSymlinkBeforeDotDot(t *testing.T) {
+	key := parityKey(t)
+	dir := physicalTempDir(t)
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	for _, path := range []string{a, filepath.Join(b, "sub")} {
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := filepath.Base(parityFile("", parityRun1))
+	valid, err := os.ReadFile(filepath.Join(parityFixtureDir, "valid", name)) // #nosec G304 -- name comes from a test fixture constant.
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathA := filepath.Join(a, name)
+	pathB := filepath.Join(b, name)
+	link := filepath.Join(a, "link")
+	if err := os.Symlink(filepath.Join(b, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	input := link + string(filepath.Separator) + ".." + string(filepath.Separator) + name
+	for _, tc := range []struct {
+		name   string
+		aData  []byte
+		bData  []byte
+		wantOK bool
+	}{
+		{name: "invalid reached target", aData: valid, bData: []byte("not-json\n")},
+		{name: "valid reached target", aData: []byte("not-json\n"), bData: valid, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pathA, tc.aData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(pathB, tc.bData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := filepath.EvalSymlinks(input)
+			if err != nil || resolved != pathB {
+				t.Fatalf("path resolves to %q, want %q: %v", resolved, pathB, err)
+			}
+			out, err := runParityVerify(t, input, "--key", key)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("want valid=%t, got %v\n%s", tc.wantOK, err, out)
+			}
+		})
+	}
+}
+
 func TestVerifyReceipt_ConfigErrorsExitTwo(t *testing.T) {
 	dir := parityFixture(t)
 	for name, args := range map[string][]string{
@@ -369,5 +431,103 @@ func TestVerifyReceipt_ConfigErrorsExitTwo(t *testing.T) {
 				t.Fatalf("want exit 2, got err=%v code=%d", err, cliutil.ExitCodeOf(err))
 			}
 		})
+	}
+}
+
+func TestVerifyReceipt_ChainRootSymlinkRefusedAlongWalkedPath(t *testing.T) {
+	key := parityKey(t)
+	base := physicalTempDir(t)
+	realEv := filepath.Join(base, "a", "ev")
+	if err := os.MkdirAll(filepath.Dir(realEv), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(parityFixture(t), realEv); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "b", "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "b", "ev"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "sub"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(realEv, filepath.Join(base, "evlink")); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runParityVerify(t, "--chain", realEv, "--key", key); err != nil {
+		t.Fatalf("positive control: real directory failed: %v\n%s", err, out)
+	}
+	sep := string(filepath.Separator)
+	for name, target := range map[string]string{
+		"symlinked root":            filepath.Join(base, "evlink"),
+		"symlink hidden by dot-dot": filepath.Join(base, "a", "link") + sep + ".." + sep + "ev",
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := runParityVerify(t, "--chain", target, "--key", key)
+			if err == nil || !strings.Contains(out+err.Error(), "refuse symlink in evidence root path") {
+				t.Fatalf("want refusal, got %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// A symlink the operator names is read at its target, but the recorder file
+// is bound to the session the operator's filename claims. A link named for
+// one run that points at another run's file is refused in every file mode.
+func TestVerifyReceipt_SymlinkNamedForOtherRunRefused(t *testing.T) {
+	key := parityKey(t)
+	dir := parityFixture(t)
+	links := t.TempDir()
+	misnamed := filepath.Join(links, filepath.Base(parityFile("", parityRun1)))
+	named := filepath.Join(links, filepath.Base(parityFile("", parityRun2)))
+	if err := os.Symlink(parityFile(dir, parityRun2), misnamed); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(parityFile(dir, parityRun2), named); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []struct {
+		name  string
+		extra func(t *testing.T) []string
+	}{
+		{name: "plain", extra: func(*testing.T) []string { return nil }},
+		{name: "clean report", extra: func(t *testing.T) []string {
+			return []string{"--clean-report", filepath.Join(t.TempDir(), "report.json")}
+		}},
+		{name: "whole recorder", extra: func(*testing.T) []string { return []string{"--whole-recorder"} }},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			args := append([]string{named, "--key", key}, mode.extra(t)...)
+			if out, err := runParityVerify(t, args...); err != nil {
+				t.Fatalf("positive control: link named for its target's run failed: %v\n%s", err, out)
+			}
+			args = append([]string{misnamed, "--key", key}, mode.extra(t)...)
+			out, err := runParityVerify(t, args...)
+			if err == nil || !errors.Is(err, recorder.ErrEvidenceRefused) || !strings.Contains(err.Error(), parityRun1) {
+				t.Fatalf("want refusal naming %s, got %v\n%s", parityRun1, err, out)
+			}
+			if strings.Contains(out, "VALID") && !strings.Contains(out, "INVALID") {
+				t.Fatalf("refused file reported valid:\n%s", out)
+			}
+		})
+	}
+}
+
+// A file named as a directory ("receipt.json/", "receipt.json/.") is refused,
+// as the operating system refuses to open it and as every verifier refuses it.
+func TestVerifyReceipt_FileNamedAsDirectoryRefused(t *testing.T) {
+	file := filepath.Join(physicalTempDir(t), "receipt.json")
+	copyParityFile(t, filepath.Join("..", "..", "..", "sdk", "conformance", "testdata", "valid-single.json"), file)
+	if out, err := runParityVerify(t, file, "--allow-unpinned"); err != nil {
+		t.Fatalf("positive control: %v\n%s", err, out)
+	}
+	sep := string(filepath.Separator)
+	for _, input := range []string{file + sep, file + sep + "."} {
+		out, err := runParityVerify(t, input, "--allow-unpinned")
+		if err == nil || cliutil.ExitCodeOf(err) != cliutil.ExitConfig || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("%q: want exit 2 not-a-directory, got %v (code %d)\n%s", input, err, cliutil.ExitCodeOf(err), out)
+		}
 	}
 }

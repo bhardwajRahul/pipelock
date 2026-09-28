@@ -1,7 +1,6 @@
 // Copyright 2026 Pipelock contributors
 // SPDX-License-Identifier: Apache-2.0
 
-import * as path from "node:path";
 import type { Receipt } from "./types.js";
 import { unpinnedReceiptBanner, verifyReceipt } from "./signing.js";
 import { validateV1Receipt } from "./strict.js";
@@ -10,6 +9,7 @@ import {
   parseJSON,
   readVerifierBytes,
   rejectDuplicateKeys,
+  resolveOperatorFilePath,
   resolveSignerKey,
 } from "./util.js";
 
@@ -31,14 +31,17 @@ export async function runReceipt(
   signerKey: string,
   allowUnpinned = false,
 ): Promise<ReceiptReport> {
-  const clean = path.normalize(pathname);
   const keyHex = resolveSignerKey(signerKey);
   const report: ReceiptReport = {
-    path: clean,
+    path: pathname,
     valid: false,
   };
   let text: string;
   try {
+    // A path that cannot be resolved is a failed verification with a report,
+    // like a file that cannot be read, not an exception out of the verifier.
+    const clean = resolveOperatorFilePath(pathname);
+    report.path = clean;
     text = decodeUTF8(readVerifierBytes(clean), "receipt json");
   } catch (err) {
     report.error = (err as Error).message;

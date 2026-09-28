@@ -1,13 +1,12 @@
 // Copyright 2026 Pipelock contributors
 // SPDX-License-Identifier: Apache-2.0
 
-import * as path from "node:path";
 import type { Receipt, RecorderEntry } from "./types.js";
 import { validateV1Receipt } from "./strict.js";
 import { validateTimestamp } from "./aarp/numbers.js";
 import { parseJSONStrict, RawNumber } from "./aarp/strictjson.js";
 import { bindRecorderLineExtSource } from "./rawjson.js";
-import { readSessionReceipts } from "./chain-set.js";
+import { readSessionReceipts, withPinnedEvidenceDirectorySync } from "./chain-set.js";
 import type { RecorderLine } from "./recorder-chain.js";
 import {
   InvalidError,
@@ -44,8 +43,8 @@ export interface ParsedRecorderLine extends RecorderLine {
   entry: RecorderEntry;
 }
 
-export function readEntryLines(file: string): ParsedRecorderLine[] {
-  const text = decodeUTF8(readVerifierBytes(path.normalize(file)), "evidence jsonl");
+export function readEntryLines(file: string, directoryChild = false): ParsedRecorderLine[] {
+  const text = decodeUTF8(readVerifierBytes(file, directoryChild), "evidence jsonl");
   const entries: ParsedRecorderLine[] = [];
   const lines = text.split(/\r?\n/u);
   for (let i = 0; i < lines.length; i++) {
@@ -200,5 +199,7 @@ export function extractReceipts(file: string): Receipt[] {
 // chain-set reader: for session "s", "evidence-s-evil-0.jsonl" belongs to
 // session "s-evil" and is not read, although it starts with "evidence-s-".
 export function extractReceiptsFromSessionDir(dir: string, sessionId: string): Receipt[] {
-  return selectReceiptChain(readSessionReceipts(path.normalize(dir), sessionId));
+  return withPinnedEvidenceDirectorySync(dir, () =>
+    selectReceiptChain(readSessionReceipts(".", sessionId)),
+  );
 }

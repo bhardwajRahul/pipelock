@@ -15,7 +15,7 @@
 // records carry the same run_nonce are reported (finding duplicate_run_nonce),
 // because a process run writes exactly one chain.
 
-import { lstatSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import * as ed25519 from "@noble/ed25519";
 import { parseJSONStrict, RawNumber } from "./aarp/strictjson.js";
@@ -156,6 +156,183 @@ interface EvidenceIndex {
   symlinks: Map<string, string[]>;
 }
 
+// refuseSymlinkInEvidenceRootPath applies Go's no-symlink evidence-root rule
+// (recorder.refuseSymlinkInWalkedRootPath) to the path the operating system
+// walks, before path.normalize turns "link/../ev" into "ev" and hides the
+// symlink the open would follow.
+export function refuseSymlinkInEvidenceRootPath(root: string): void {
+  const volumeRoot = path.parse(root).root;
+  const raw = path.isAbsolute(root)
+    ? root
+    : volumeRoot
+      ? `${path.resolve(volumeRoot)}${path.sep}${root.slice(volumeRoot.length)}`
+      : `${process.cwd()}${path.sep}${root}`;
+  const parsedRoot = path.parse(raw).root;
+  let current = path.resolve(parsedRoot);
+  // Only the platform's separators split a path: on POSIX a backslash is an
+  // ordinary filename character, so "s\.." names one entry, not "s" and "..".
+  const separators = path.sep === "\\" ? /[\\/]/u : /\//u;
+  for (const component of raw.slice(parsedRoot.length).split(separators)) {
+    if (component === "" || component === ".") continue;
+    if (component === "..") {
+      // Every component walked so far is not a symlink, so the lexical parent
+      // is the physical parent. The operating system climbs out of a
+      // directory only: "file/.." fails with ENOTDIR, so it fails here too.
+      if (!lstatSync(current).isDirectory()) {
+        throw new Error(`evidence root component "${current}" is not a directory`);
+      }
+      current = path.dirname(current);
+      continue;
+    }
+    current = path.join(current, component);
+    if (lstatSync(current).isSymbolicLink()) {
+      throw new EvidenceRefusedError(`refuse symlink in evidence root path: "${current}"`);
+    }
+  }
+}
+
+// Directory mode runs in one CLI process. Enter each component from the
+// kernel-held working directory, then compare its identity and physical path
+// with the selected child. A renamed parent cannot redirect later reads.
+// A search-only ancestor need not grant read access to open a directory handle.
+let evidenceDirectoryActive = false;
+function samePhysicalPath(actual: string, expected: string): boolean {
+  if (process.platform === "win32") {
+    return (
+      path.win32.normalize(actual).toLowerCase() === path.win32.normalize(expected).toLowerCase()
+    );
+  }
+  return actual === expected;
+}
+
+function enterPinnedEvidenceDirectory(root: string): () => void {
+  if (evidenceDirectoryActive)
+    throw new Error("concurrent evidence directory reads are unsupported");
+  const original = process.cwd();
+  evidenceDirectoryActive = true;
+  const parents: { dev: bigint; ino: bigint; physical: string }[] = [];
+  try {
+    const parsed = path.parse(root);
+    if (parsed.root !== "") process.chdir(parsed.root);
+    const anchor = statSync(".", { bigint: true });
+    parents.push({ dev: anchor.dev, ino: anchor.ino, physical: realpathSync.native(".") });
+    const separators = path.sep === "\\" ? /[\\/]/u : /\//u;
+    for (const component of root.slice(parsed.root.length).split(separators)) {
+      if (component === "" || component === ".") continue;
+      if (component === "..") {
+        // Compare the selected parent after climbing. A rename can move the
+        // current child under a different parent between these two steps.
+        const initialParent = parents.length === 1;
+        const expected = initialParent
+          ? {
+              ...statSync("..", { bigint: true }),
+              physical: realpathSync.native(".."),
+            }
+          : (parents[parents.length - 2] as { dev: bigint; ino: bigint; physical: string });
+        process.chdir("..");
+        const entered = statSync(".", { bigint: true });
+        const physical = realpathSync.native(".");
+        if (
+          !entered.isDirectory() ||
+          entered.dev !== expected.dev ||
+          entered.ino !== expected.ino ||
+          entered.ino === 0n ||
+          !samePhysicalPath(physical, expected.physical)
+        ) {
+          throw new EvidenceRefusedError("evidence root parent changed while entering");
+        }
+        if (initialParent) {
+          parents[0] = { dev: entered.dev, ino: entered.ino, physical };
+        } else {
+          parents.pop();
+        }
+        continue;
+      }
+      const expectedPath = path.join(parents[parents.length - 1]!.physical, component);
+      // Capture the filesystem's canonical spelling before pinning the entry.
+      // A case-insensitive volume may accept a spelling that differs from the
+      // stored name; resolving after entry would reopen the replacement race.
+      const expectedPhysical = realpathSync.native(expectedPath);
+      const before = lstatSync(component, { bigint: true });
+      if (before.isSymbolicLink()) {
+        throw new EvidenceRefusedError(`refuse symlink in evidence root path: "${component}"`);
+      }
+      if (!before.isDirectory())
+        throw new Error(`evidence root component "${component}" is not a directory`);
+      const canonical = lstatSync(expectedPhysical, { bigint: true });
+      const parentPhysical = parents[parents.length - 1]!.physical;
+      const sameName =
+        process.platform === "darwin"
+          ? path.basename(expectedPhysical).toLowerCase() === component.toLowerCase()
+          : samePhysicalPath(expectedPhysical, expectedPath);
+      if (
+        !samePhysicalPath(path.dirname(expectedPhysical), parentPhysical) ||
+        !sameName ||
+        canonical.isSymbolicLink() ||
+        !canonical.isDirectory() ||
+        canonical.dev !== before.dev ||
+        canonical.ino !== before.ino
+      ) {
+        throw new EvidenceRefusedError(
+          `evidence root component changed while entering: "${component}"`,
+        );
+      }
+      process.chdir(component);
+      const entered = statSync(".", { bigint: true });
+      const physical = realpathSync.native(".");
+      if (
+        !entered.isDirectory() ||
+        entered.dev !== before.dev ||
+        entered.ino !== before.ino ||
+        entered.ino === 0n ||
+        !samePhysicalPath(physical, expectedPhysical)
+      ) {
+        throw new EvidenceRefusedError(
+          `evidence root component changed while entering: "${component}"`,
+        );
+      }
+      parents.push({ dev: entered.dev, ino: entered.ino, physical });
+    }
+  } catch (err) {
+    try {
+      process.chdir(original);
+    } finally {
+      evidenceDirectoryActive = false;
+    }
+    throw err;
+  }
+  return () => {
+    try {
+      process.chdir(original);
+    } finally {
+      evidenceDirectoryActive = false;
+    }
+  };
+}
+
+// The one-shot CLI owns its process while verification awaits. A caller that
+// shares a process with other filesystem work must use the synchronous form.
+export async function withPinnedEvidenceDirectory<T>(
+  root: string,
+  read: () => Promise<T>,
+): Promise<T> {
+  const leave = enterPinnedEvidenceDirectory(root);
+  try {
+    return await read();
+  } finally {
+    leave();
+  }
+}
+
+export function withPinnedEvidenceDirectorySync<T>(root: string, read: () => T): T {
+  const leave = enterPinnedEvidenceDirectory(root);
+  try {
+    return read();
+  } finally {
+    leave();
+  }
+}
+
 function indexRecorderFiles(dir: string): EvidenceIndex {
   const shards = new Map<string, { file: string; name: string; seq: bigint }[]>();
   const symlinks = new Map<string, string[]>();
@@ -248,7 +425,7 @@ export class EvidenceRefusedError extends Error {}
 function readSessionLines(ix: EvidenceIndex, session: string): ParsedRecorderLine[] {
   const out: ParsedRecorderLine[] = [];
   for (const file of indexFiles(ix, session)) {
-    for (const l of readEntryLines(file)) {
+    for (const l of readEntryLines(file, evidenceDirectoryActive)) {
       if (l.entry.session_id !== session) {
         throw new EvidenceRefusedError(
           `reading ${path.basename(file)}: entry seq ${String(l.entry.seq)} session_id ${JSON.stringify(l.entry.session_id ?? null)} does not match requested session ${JSON.stringify(session)}`,
@@ -549,7 +726,7 @@ async function readChainLinkFile(file: string): Promise<ChainLink> {
   if (info.size > maxChainLinkFileBytes) {
     throw new Error(`chain link file exceeds ${maxChainLinkFileBytes} bytes`);
   }
-  const bytes = readVerifierBytes(file);
+  const bytes = readVerifierBytes(file, evidenceDirectoryActive);
   if (bytes.length > maxChainLinkFileBytes) {
     throw new Error(`chain link file exceeds ${maxChainLinkFileBytes} bytes`);
   }
