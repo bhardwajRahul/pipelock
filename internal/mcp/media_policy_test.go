@@ -1207,3 +1207,32 @@ func TestSetMCPMediaMimeTypeRejectsUnparseableResource(t *testing.T) {
 		t.Fatalf("resource mimeType not relabeled: %s", good["resource"])
 	}
 }
+
+func TestApplyMCPMediaPolicy_RelabeledDisallowedBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg"}
+	body := append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+	v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", body, testMCPMediaTransport)
+	if !v.Blocked || !strings.Contains(v.BlockReason, "image/webp") {
+		t.Fatalf("MCP disallowed WebP labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
+	}
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	if v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", body, testMCPMediaTransport); v.Blocked {
+		t.Fatalf("positive control: allowed WebP labeled PNG blocked: %s", v.BlockReason)
+	}
+}
+
+func TestApplyMCPMediaPolicy_ICOUnderPNGLabelBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/x-icon"}
+	ico := append([]byte{0, 0, 1, 0, 1, 0}, make([]byte, 32)...)
+	if v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", ico, testMCPMediaTransport); !v.Blocked || !strings.Contains(v.BlockReason, "image/x-icon") {
+		t.Fatalf("ICO labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
+	}
+}

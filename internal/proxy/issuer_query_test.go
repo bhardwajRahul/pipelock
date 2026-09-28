@@ -454,9 +454,9 @@ func TestIssuerQueryStaleRuntimeAndNestedDocument(t *testing.T) {
 			}
 		})
 	}
-	p.recordIssuerQueryAllow(audit.LogContext{}, "%zz", "", "", http.MethodGet)
+	p.recordIssuerQueryAllow(audit.LogContext{}, "%zz", "", "", http.MethodGet, issuerQueryObserved)
 	var nilProxy *Proxy
-	nilProxy.recordIssuerQueryAllow(audit.LogContext{}, "https://api.vendor.example/page", "", "", http.MethodGet)
+	nilProxy.recordIssuerQueryAllow(audit.LogContext{}, "https://api.vendor.example/page", "", "", http.MethodGet, issuerQueryObserved)
 
 	// Only the first bounded set of links can grant an allowance.
 	links := make([]string, issuerCookieMaxSetCookies+1)
@@ -566,5 +566,47 @@ func TestIssuerQueryDigestIsByteExact(t *testing.T) {
 	}
 	if s.digest("https", "api.vendor.example", "443", "/page", "cursorx", "y") == s.digest("https", "api.vendor.example", "443", "/page", "cursor", "xy") {
 		t.Fatal("moving bytes across the name/value boundary kept the digest")
+	}
+}
+
+// An authorization server issues its state value in a redirect's Location
+// header with an empty body. Only a same-origin redirect from a delivered
+// 3xx response issues it.
+func TestIssuerQueryRedirectLocation(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.TLSInterception.Enabled = true
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	p, err := New(cfg, audit.NewNop(), sc, metrics.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	ic := &InterceptContext{Proxy: p, Config: cfg, Agent: "agent-one", ActorAuth: envelope.ActorAuthBound}
+	request := &http.Request{URL: mustIssuerQueryURL(t, "https://login.vendor.example/authorize")}
+	session := sessionKeyFor(ic.Agent, ic.ClientIP, ic.ActorAuth)
+	value := issuedTestToken()
+	target := mustIssuerQueryURL(t, "https://login.vendor.example/u/login")
+	for _, tc := range []struct {
+		name      string
+		status    int
+		location  string
+		delivered bool
+		want      bool
+	}{
+		{"same-origin 302", http.StatusFound, "/u/login?state=" + value, true, true},
+		{"absolute same-origin 303", http.StatusSeeOther, "https://login.vendor.example/u/login?state=" + value, true, true},
+		{"foreign redirect", http.StatusFound, "https://other.vendor.example/u/login?state=" + value, true, false},
+		{"not delivered", http.StatusFound, "/u/login?state=" + value, false, false},
+		{"non-redirect status", http.StatusOK, "/u/login?state=" + value, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p.issuerCookieRuntime.Load().query = newIssuerQueryStore()
+			response := &http.Response{Request: request, StatusCode: tc.status, Header: http.Header{"Location": {tc.location}}}
+			recordDeliveredIssuerQuery(ic, response, nil, tc.delivered)
+			if got := ic.issuerQueryStore().allows(session, target, "state", value); got != tc.want {
+				t.Fatalf("allowed=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }

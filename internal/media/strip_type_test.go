@@ -58,3 +58,31 @@ func TestStripMetadataOfRelabeledWebPPassesThrough(t *testing.T) {
 		t.Fatal("relabeled WebP body changed")
 	}
 }
+
+func TestMislabeledDisallowed(t *testing.T) {
+	webp := append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+	ico := append([]byte{0, 0, 1, 0, 1, 0}, make([]byte, 32)...)
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...)
+	onlyPNG := func(mt string) bool { return mt == "image/png" }
+	all := func(string) bool { return true }
+	for name, tc := range map[string]struct {
+		declared string
+		body     []byte
+		allowed  func(string) bool
+		wantBad  bool
+	}{
+		"disallowed WebP labeled PNG": {"image/png", webp, onlyPNG, true},
+		"ICO labeled PNG":             {"image/png", ico, all, true},
+		"markup labeled PNG":          {"image/png", []byte("<html></html>"), all, true},
+		"WebM labeled JPEG":           {"image/jpeg", []byte{0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0}, all, true},
+		"nil allow func, WebP":        {"image/png", webp, nil, true},
+		"allowed WebP labeled PNG":    {"image/png", webp, all, false},
+		"honest PNG":                  {"image/png", png, onlyPNG, false},
+		"declared type not stripped":  {"image/gif", webp, onlyPNG, false},
+		"empty body":                  {"image/png", nil, onlyPNG, false},
+	} {
+		if _, bad := MislabeledDisallowed(tc.declared, tc.body, tc.allowed); bad != tc.wantBad {
+			t.Errorf("%s: bad=%v, want %v", name, bad, tc.wantBad)
+		}
+	}
+}
