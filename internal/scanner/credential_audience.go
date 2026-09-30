@@ -4,13 +4,18 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/destination"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 )
 
 // CredentialAudienceAllow records a DLP match deliberately allowed because a
@@ -53,6 +58,11 @@ const (
 	credentialAudienceAuthorizationOtherSurface = "authorization_header_other"
 	credentialAudiencePrivateTokenSurface       = "header_private_token"
 	credentialAudienceJobTokenSurface           = "header_job_token"
+	// credentialAudienceURLQuerySurface is the decision surface for a match
+	// that lives only in the URL query. It reports as the existing "url"
+	// telemetry surface. The scanner earns it per match (see
+	// urlDLPAudienceSurface); a bare "url" match never carries it.
+	credentialAudienceURLQuerySurface = "url_query"
 )
 
 // CredentialAudienceHeaderSurface classifies the header that carried a match.
@@ -101,6 +111,8 @@ func audienceSurfacePermitted(surface string, authorizationOnly bool, mask uint8
 		return mask&config.CredentialAudienceCarrierPrivateToken != 0
 	case credentialAudienceJobTokenSurface:
 		return mask&config.CredentialAudienceCarrierJobToken != 0
+	case credentialAudienceURLQuerySurface:
+		return mask&config.CredentialAudienceCarrierURLQuery != 0
 	default:
 		return false
 	}
@@ -122,6 +134,14 @@ func filterCredentialAudience(candidates []credentialAudienceCandidate, target, 
 	if !ok {
 		return keep, nil
 	}
+	// Signed download grants use HTTPS query carriage. The shared host
+	// canonicalizer also accepts WSS for other credential carriers.
+	if surface == credentialAudienceURLQuerySurface {
+		parsed, err := url.Parse(target)
+		if err != nil || !strings.EqualFold(parsed.Scheme, "https") {
+			return keep, nil
+		}
+	}
 
 	var allows []CredentialAudienceAllow
 	for i, candidate := range candidates {
@@ -135,6 +155,8 @@ func filterCredentialAudience(candidates []credentialAudienceCandidate, target, 
 		switch surface {
 		case CredentialAudienceAuthorizationHeaderSurface, credentialAudienceAuthorizationTokenSurface, credentialAudienceAuthorizationBasicSurface, credentialAudiencePrivateTokenSurface, credentialAudienceJobTokenSurface:
 			recordSurface = "header"
+		case credentialAudienceURLQuerySurface:
+			recordSurface = "url"
 		}
 		allows = append(allows, CredentialAudienceAllow{
 			PatternName: candidate.patternName,
@@ -434,9 +456,259 @@ func (s *Scanner) queryValueIsAudienceCredential(target, value string) bool {
 		if !ok || start != 0 || end != len(value) {
 			continue
 		}
-		if _, allowed := s.credentialAudienceAllows(p, target, "url"); allowed {
+		if _, allowed := s.credentialAudienceAllows(p, target, credentialAudienceURLQuerySurface); allowed {
 			return true
 		}
 	}
 	return false
+}
+
+// urlDLPAudienceSurfaceForTarget is urlDLPAudienceSurface for a target held as
+// a string. An unparseable target keeps the bare "url" surface.
+func (s *Scanner) urlDLPAudienceSurfaceForTarget(p *compiledPattern, target string, memo *queryLessDLPMemo) string {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return "url"
+	}
+	return s.urlDLPAudienceSurface(p, parsed, memo)
+}
+
+// queryLessURLScansClean reports whether the URL without its query passes DLP,
+// computing it at most once per memo.
+func (s *Scanner) queryLessURLScansClean(parsed *url.URL, memo *queryLessDLPMemo) bool {
+	if memo != nil && memo.done {
+		return memo.clean
+	}
+	withoutQuery := *parsed
+	withoutQuery.RawQuery = ""
+	withoutQuery.ForceQuery = false
+	result, _ := s.checkDLP(&withoutQuery)
+	if memo != nil {
+		memo.done, memo.clean = true, result.Allowed
+	}
+	return result.Allowed
+}
+
+// queryLessDLPMemo holds the query-less rescan result for one outer URL scan,
+// so several URL-query audience matches in that scan share one rescan.
+type queryLessDLPMemo struct {
+	done  bool
+	clean bool
+}
+
+// urlDLPAudienceSurface picks the decision surface for a URL DLP match. It is
+// "url_query" only for a pattern with the URL-query carrier when the credential
+// sits in the query and nowhere else in the URL: the query-less URL must scan
+// clean, and the pattern must match a query-only view. Everything else,
+// including a credential in the path, the host, a userinfo section or a
+// fragment, and one split across the path and query, stays "url", which no
+// query-carrier audience accepts. Any parse or scan uncertainty stays "url".
+func (s *Scanner) urlDLPAudienceSurface(p *compiledPattern, parsed *url.URL, memo *queryLessDLPMemo) string {
+	const bareURLSurface = "url"
+	if p == nil || p.credentialAudienceCarrierMask&config.CredentialAudienceCarrierURLQuery == 0 ||
+		parsed == nil || parsed.RawQuery == "" {
+		return bareURLSurface
+	}
+	// Only an audience host can ever earn url_query, so every other destination
+	// skips the query-less rescan below.
+	if _, allowed := s.credentialAudienceAllows(p, parsed.String(), credentialAudienceURLQuerySurface); !allowed {
+		return bareURLSurface
+	}
+	if !s.queryLessURLScansClean(parsed, memo) {
+		return bareURLSurface
+	}
+	// The views mirror every query view checkDLP scans, keys included, so a
+	// token checkDLP can find is one this check also sees and validates.
+	// Joined views concatenate several values, so a match there may run into
+	// the next value's text. Every other view comes from one key or value, where
+	// a match must be exactly a grant.
+	joined := []string{IterativeDecode(parsed.RawQuery), orderedQueryConcat(parsed.RawQuery)}
+	var views []string
+	for key, values := range parsed.Query() {
+		decodedKey := IterativeDecode(key)
+		views = append(views, decodedKey, stripURLNoise(decodedKey))
+		for _, d := range decodeEncodingsRecursive(decodedKey) {
+			views = append(views, d.text)
+		}
+		for _, v := range values {
+			decoded := IterativeDecode(v)
+			views = append(views, decoded, stripURLNoise(decoded))
+			for _, t := range queryValueDecodedTargets(decoded) {
+				views = append(views, t.text)
+			}
+		}
+	}
+	// Every credential match in the query must be a download grant issued for
+	// this host. One unrelated or undecodable token keeps the whole URL on the
+	// bare surface, so a real grant cannot carry a second token past DLP.
+	grants := validatedQueryGrants(parsed)
+	found := false
+	check := func(view string, prefixOK bool) bool {
+		if view == "" {
+			return true
+		}
+		cleaned := normalize.ForDLP(view)
+		if _, _, ok := p.matchSpanInView(cleaned, view); !ok {
+			return true
+		}
+		for _, loc := range p.re.FindAllStringIndex(cleaned, -1) {
+			m := cleaned[loc[0]:loc[1]]
+			if !isGrant(m, grants) && (!prefixOK || !startsWithGrant(m, grants)) {
+				return false
+			}
+			found = true
+		}
+		return true
+	}
+	for _, view := range joined {
+		if !check(view, true) {
+			return bareURLSurface
+		}
+	}
+	for _, view := range views {
+		if !check(view, false) {
+			return bareURLSurface
+		}
+	}
+	if found {
+		return credentialAudienceURLQuerySurface
+	}
+	return bareURLSurface
+}
+
+// candidateTokensAreGrants reports whether every match of p in text is a
+// download grant for target's host. A target that does not parse, or text
+// with no match, is false.
+func candidateTokensAreGrants(p *compiledPattern, text, target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	grants := validatedQueryGrants(parsed)
+	locs := p.re.FindAllStringIndex(text, -1)
+	if len(locs) == 0 {
+		return false
+	}
+	for _, loc := range locs {
+		if !startsWithGrant(text[loc[0]:loc[1]], grants) {
+			return false
+		}
+	}
+	return true
+}
+
+// validatedQueryGrants returns the query values that are, whole and on their
+// own, a download grant for the URL's host. GitHub sends the grant as one
+// query value; a grant reassembled from several values is not one.
+func validatedQueryGrants(parsed *url.URL) []string {
+	host := canonicalAudienceHost(parsed.Hostname())
+	var grants []string
+	for _, values := range parsed.Query() {
+		for _, v := range values {
+			if downloadGrantClaimsMatch(v, host) {
+				grants = append(grants, v)
+			}
+		}
+	}
+	return grants
+}
+
+func isGrant(match string, grants []string) bool {
+	for _, g := range grants {
+		if match == g {
+			return true
+		}
+	}
+	return false
+}
+
+// startsWithGrant reports whether a pattern match is a validated grant. A
+// view that joins query values lets the match run into the next value's
+// text; that tail is scanned on its own, so the match qualifies when it
+// begins with the whole grant.
+func startsWithGrant(match string, grants []string) bool {
+	for _, g := range grants {
+		if strings.HasPrefix(match, g) {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalAudienceHost lowercases a hostname and drops a trailing dot, the
+// same spelling the audience host list uses.
+func canonicalAudienceHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// downloadGrantClaimsMatch reports whether token is a JWT whose payload names
+// GitHub as issuer and host as audience. Any decode or shape failure is false.
+// The signature is not verified: GitHub signs the grant with HS256 under a key
+// only GitHub holds, so no proxy can check it. The check binds the token to
+// its stated purpose rather than authenticating it. A forged token that
+// passes can only deliver its bytes to GitHub's own download storage, which
+// the sender cannot read back; the destination check is what stops a leak.
+func downloadGrantClaimsMatch(token, host string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	// Header: exactly the two fields GitHub sends.
+	var header map[string]string
+	if !decodeJWTSegment(parts[0], &header) || len(header) != 2 || header["typ"] != "JWT" || header["alg"] != "HS256" {
+		return false
+	}
+	// Signature: an HS256 MAC is exactly 32 bytes, so it has no room to carry
+	// anything else.
+	if sig, err := base64.RawURLEncoding.DecodeString(parts[2]); err != nil || len(sig) != sha256.Size {
+		return false
+	}
+	var claims map[string]json.RawMessage
+	if !decodeJWTSegment(parts[1], &claims) {
+		return false
+	}
+	for name := range claims {
+		if !downloadGrantClaimNames[name] {
+			return false
+		}
+	}
+	var iss, aud, key, grantPath string
+	var exp, nbf int64
+	if !jsonField(claims, "iss", &iss) || iss != config.GitHubDownloadGrantIssuer ||
+		!jsonField(claims, "aud", &aud) || canonicalAudienceHost(aud) != host ||
+		!jsonField(claims, "exp", &exp) || !jsonField(claims, "nbf", &nbf) ||
+		exp <= nbf || exp-nbf > downloadGrantMaxLifetimeSeconds {
+		return false
+	}
+	// key and path are optional in shape but must be plain strings when set.
+	if _, ok := claims["key"]; ok && !jsonField(claims, "key", &key) {
+		return false
+	}
+	if _, ok := claims["path"]; ok && !jsonField(claims, "path", &grantPath) {
+		return false
+	}
+	return true
+}
+
+// downloadGrantClaimNames is the complete claim set of GitHub's release
+// download grant. A token carrying any other claim is not that grant.
+var downloadGrantClaimNames = map[string]bool{"aud": true, "exp": true, "iss": true, "key": true, "nbf": true, "path": true}
+
+// downloadGrantMaxLifetimeSeconds bounds exp minus nbf. GitHub's grant lives
+// five minutes.
+const downloadGrantMaxLifetimeSeconds = 300
+
+func decodeJWTSegment(segment string, v any) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		return false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	return dec.Decode(v) == nil && !dec.More()
+}
+
+func jsonField(claims map[string]json.RawMessage, name string, v any) bool {
+	raw, ok := claims[name]
+	return ok && json.Unmarshal(raw, v) == nil
 }
